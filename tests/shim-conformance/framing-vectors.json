@@ -1,0 +1,116 @@
+{
+  "_note": "§A.8 #1 framing conformance vectors for the MCP-over-UDS shim wire. GENERATED from the real uds_frame.ts encodeFrame + FrameDecoder (NOT hand-computed). Feed input_hex (or chunks_hex in order) to a FRESH decoder per case and assert the outcome. A frame = u32 LE frameLength (counts the type byte + payload) | type byte | payload. type 0x01=MCP, 0x02=CTRL. Length must be >=1 and <= cap. Errors: FRAME_LENGTH_TOO_LARGE / FRAME_LENGTH_TOO_SMALL / FRAME_UNKNOWN_TYPE. Partial input buffers (0 frames, need-more) until the wire completes.",
+  "frame_layout": {
+    "length": "u32 little-endian",
+    "length_counts": "type_byte(1) + payload",
+    "type_byte": {
+      "mcp": 1,
+      "ctrl": 2
+    },
+    "cap_bytes": 16777216,
+    "min_frame_length": 1
+  },
+  "error_codes": [
+    "FRAME_LENGTH_TOO_LARGE",
+    "FRAME_LENGTH_TOO_SMALL",
+    "FRAME_UNKNOWN_TYPE"
+  ],
+  "cases": [
+    {
+      "name": "valid_ctrl_empty_obj",
+      "desc": "CTRL 0x02 frame, payload = {} (2 bytes)",
+      "input_hex": "03000000027b7d",
+      "expect": {
+        "frames": [
+          {
+            "type": "ctrl",
+            "payload_hex": "7b7d"
+          }
+        ],
+        "buffered": 0
+      }
+    },
+    {
+      "name": "valid_mcp_tools_list",
+      "desc": "MCP 0x01 frame, payload = a JSON-RPC tools/list request",
+      "input_hex": "2f000000017b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a22746f6f6c732f6c697374227d",
+      "expect": {
+        "frames": [
+          {
+            "type": "mcp",
+            "payload_hex": "7b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a22746f6f6c732f6c697374227d"
+          }
+        ],
+        "buffered": 0
+      }
+    },
+    {
+      "name": "two_frames_one_chunk",
+      "desc": "CTRL then MCP concatenated; both decode from one push",
+      "input_hex": "03000000027b7d2f000000017b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a22746f6f6c732f6c697374227d",
+      "expect": {
+        "frames": [
+          {
+            "type": "ctrl",
+            "payload_hex": "7b7d"
+          },
+          {
+            "type": "mcp",
+            "payload_hex": "7b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a22746f6f6c732f6c697374227d"
+          }
+        ],
+        "buffered": 0
+      }
+    },
+    {
+      "name": "partial_then_complete",
+      "desc": "a valid MCP frame split mid-wire across two chunks; chunk1 buffers (need-more, 0 frames), chunk2 completes it",
+      "chunks_hex": [
+        "2f000000017b226a736f6e727063223a22322e30222c226964",
+        "223a312c226d6574686f64223a22746f6f6c732f6c697374227d"
+      ],
+      "expect_per_chunk": [
+        {
+          "frames": 0,
+          "buffered": 25
+        },
+        {
+          "frames": [
+            {
+              "type": "mcp",
+              "payload_hex": "7b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a22746f6f6c732f6c697374227d"
+            }
+          ],
+          "buffered": 0
+        }
+      ]
+    },
+    {
+      "name": "oversize_length",
+      "desc": "header declares frameLength=16777217 (> 16777216 cap); rejected from the 4-byte header alone (no payload buffering)",
+      "input_hex": "01000001",
+      "expect": {
+        "error": "FRAME_LENGTH_TOO_LARGE",
+        "frameLength": 16777217
+      }
+    },
+    {
+      "name": "length_too_small_zero",
+      "desc": "header declares frameLength=0 (< 1; a frame must carry at least the type byte)",
+      "input_hex": "00000000",
+      "expect": {
+        "error": "FRAME_LENGTH_TOO_SMALL",
+        "frameLength": 0
+      }
+    },
+    {
+      "name": "unknown_type_byte",
+      "desc": "valid length=3 but type byte 0x03 (not 0x01 MCP / 0x02 CTRL); rejected as soon as the type byte is readable",
+      "input_hex": "03000000037b7d",
+      "expect": {
+        "error": "FRAME_UNKNOWN_TYPE",
+        "typeByte": 3
+      }
+    }
+  ]
+}

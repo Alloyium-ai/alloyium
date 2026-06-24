@@ -1,0 +1,19 @@
+[package]
+name = "a2a-shim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "io-std", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = "2"
+base64 = "0.22"
+thiserror = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,22 @@
+{
+  "name": "alloyium",
+  "version": "0.1.0",
+  "scripts": {
+    "start": "bun ./webhook.ts",
+    "test": "bun test",
+    "test:gate": "A2A_TEST_REQUIRE_BUS=1 bun test",
+    "selftest": "bun run selftest.ts",
+    "onboard": "bun ./onboard.ts",
+    "taskboard:bridge": "bun ./taskboard_event_bridge.ts",
+    "taskboard:dispatcher": "bun ./taskboard_event_dispatcher.ts"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.2.0",
+    "@langchain/openai": "^1.5.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "langchain": "^1.5.0",
+    "nats": "^2.29.3",
+    "playwright": "^1.60.0",
+    "zod": "^4.4.3"
+  }
+}

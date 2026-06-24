@@ -1,0 +1,19 @@
+node_modules/
+.env
+.env.*
+!.env.example
+logs/
+*.log
+# runtime state created by `docker compose up` (default bind-mount targets)
+data/
+secrets/
+# agent keys/identities minted by `bun run onboard` — NEVER commit
+a2a/
+*.seed
+*.nk
+*.a2a.env
+a2a-shim/target/
+dist/
+build/
+*.tsbuildinfo
+.DS_Store

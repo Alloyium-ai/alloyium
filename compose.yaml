@@ -1,0 +1,929 @@
+name: alloyium
+
+x-cc-env: &cc-env
+  NATS_URL: ${NATS_URL:-nats://nats:4222}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-a2a-core-run-bind: &a2a-core-run-bind
+  type: bind
+  source: ${A2A_CORE_RUN_HOST_PATH:-/run/a2a-core}
+  target: /run/a2a-core
+  bind:
+    create_host_path: true
+
+# ── Keyless demo-fleet building blocks (shared by the core/PM/worker roster) ────
+# One image (built once, reused by every demo service + the onboarding one-shots)
+# so the launcher's `${PROJECT}-demo-agent:latest` resolves to exactly this build.
+x-demo-build: &demo-build
+  context: .
+  dockerfile: docker/demo-agent/Dockerfile
+
+x-demo-image: &demo-image "alloyium-demo-agent:latest"
+
+# Common env for every demo peer: keyless (transport none + ed25519 signing on),
+# with generous send-rate headroom so the scripted fabric never self-throttles.
+x-demo-env: &demo-env
+  <<: *cc-env
+  A2A_ENABLED: "1"
+  A2A_SIG_ALG: ed25519
+  A2A_TRANSPORT_AUTH: none
+  A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+  A2A_SEND_RATE_PER_MIN: ${DEMO_SEND_RATE_PER_MIN:-240}
+  A2A_SEND_RATE_PER_PEER_PER_MIN: ${DEMO_SEND_RATE_PER_PEER_PER_MIN:-120}
+  DEMO_TICK_MS: ${DEMO_TICK_MS:-25000}
+  DEMO_WORK_MS: ${DEMO_WORK_MS:-3000}
+  DEMO_BEAT_MS: ${DEMO_BEAT_MS:-15000}
+
+# A demo peer is "up" once it holds its Redis presence key (claimed by A2AChannel).
+x-demo-presence-health: &demo-presence-health
+  test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+  interval: 10s
+  timeout: 3s
+  retries: 18
+  start_period: 20s
+
+# One-shot that mints a demo peer's ed25519 signing key (reuses the onboard pattern;
+# id comes from A2A_AGENT_ID so the body stays identical across the whole roster).
+x-demo-onboard: &demo-onboard
+  image: *demo-image
+  build: *demo-build
+  user: root
+  networks:
+    - a2a-net
+  volumes:
+    - a2a_secrets:/run/secrets/a2a
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: "no"
+  command:
+    - sh
+    - -lc
+    - |
+      mkdir -p /run/secrets/a2a
+      chown -R bun:bun /run/secrets/a2a
+      exec su bun -s /bin/sh -c 'bun onboard.ts "$${A2A_AGENT_ID}" --transport none --dir /run/secrets/a2a --redis "$${REDIS_URL}" --nats "$${NATS_URL}"'
+
+x-demo-agent: &demo-agent
+  image: *demo-image
+  build: *demo-build
+  networks:
+    - a2a-net
+  volumes:
+    - a2a_secrets:/run/secrets/a2a:ro
+  restart: unless-stopped
+  command: ["bun", "demo_agent.ts"]
+
+services:
+  nats:
+    # Core path (no profile = started by a plain `docker compose up`).
+    image: nats:2.11-alpine
+    command:
+      - --jetstream
+      - --store_dir
+      - /data
+      - --http_port
+      - "8222"
+    networks:
+      - a2a-net
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null 'http://127.0.0.1:8222/healthz?js-enabled-only=true'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1"
+    networks:
+      - a2a-net
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  nats-lan-proxy:
+    profiles: ["legacy-nats-proxy"]
+    build:
+      context: .
+      dockerfile: docker/socat/Dockerfile
+    command: ["socat", "-d", "-d", "TCP-LISTEN:4222,fork,reuseaddr", "TCP:nats:4222"]
+    networks:
+      - a2a-net
+    ports:
+      - "${A2A_REMOTE_BUS_BIND:-127.0.0.1}:${A2A_REMOTE_NATS_PORT:-4222}:4222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4222"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  redis-lan-proxy:
+    profiles: ["remote-bus"]
+    build:
+      context: .
+      dockerfile: docker/socat/Dockerfile
+    command: ["socat", "-d", "-d", "TCP-LISTEN:6379,fork,reuseaddr", "TCP:redis:6379"]
+    networks:
+      - a2a-net
+    ports:
+      - "${A2A_REMOTE_BUS_BIND:-127.0.0.1}:${A2A_REMOTE_REDIS_PORT:-16379}:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6379"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  onboard-a2a-portal:
+    # Core path: the one-shot that mints the portal's signing key before a2a-portal starts.
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts ${A2A_PORTAL_AGENT_ID:-a2a-portal} --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  a2a-portal:
+    # Core path (no profile = up by default).
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+      A2A_PORTAL_PORT: "8900"
+      A2A_PORTAL_STORE: /var/lib/alloyium/portal/a2a_portal.jsonl
+      A2A_PORTAL_SEND_ENABLED: ${A2A_PORTAL_SEND_ENABLED:-1}
+      A2A_PORTAL_AGENT_ID: ${A2A_PORTAL_AGENT_ID:-a2a-portal}
+      A2A_PORTAL_HOST_OPS_CHAT_CWD: ${A2A_PORTAL_HOST_OPS_CHAT_CWD:-/app}
+      A2A_PORTAL_CODEX_CHAT_CWD: ${A2A_PORTAL_CODEX_CHAT_CWD:-/app}
+      A2A_PORTAL_ONE_OFF_CWD: ${A2A_PORTAL_ONE_OFF_CWD:-/tmp}
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${A2A_PORTAL_AGENT_ID:-a2a-portal}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${A2A_PORTAL_AGENT_ID:-a2a-portal}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+    networks:
+      - a2a-net
+    ports:
+      - "${A2A_PORTAL_BIND:-127.0.0.1}:${A2A_PORTAL_HOST_PORT:-8901}:8900"
+    volumes:
+      - portal_logs:/var/lib/alloyium/portal
+      - a2a_secrets:/run/secrets/a2a:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      onboard-a2a-portal:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8900/api/channels >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /var/lib/alloyium/portal
+        chown -R bun:bun /var/lib/alloyium/portal
+        exec gosu bun:bun bun a2a_portal.ts
+
+  onboard-codex-gw:
+    profiles: ["gateways"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts codex-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  onboard-claude-gw:
+    profiles: ["gateways"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts claude-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  materialize-kai-token:
+    # Opt-in only (kai integration). Requires the excluded `materialize_kai_token.ts` and a
+    # host vault-tokens file; NOT part of the core path. a2a-core degrades gracefully without it.
+    profiles: ["gateways", "launcher", "kai"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      CC_UID: ${CC_UID:-1000}
+      CC_GID: ${CC_GID:-1000}
+    volumes:
+      - kai_token_secret:/run/secrets
+      - ${KAI_VAULT_TOKENS_FILE:-./secrets/vault-tokens.json}:/run/bootstrap-vault-tokens.json:ro
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        bun materialize_kai_token.ts \
+          --tokens /run/bootstrap-vault-tokens.json \
+          --out /run/secrets/kai-token \
+          --uid "$${CC_UID}" \
+          --gid "$${CC_GID}"
+
+  a2a-core:
+    # Core path (no profile = up by default).
+    build:
+      context: .
+      dockerfile: docker/a2a-core/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+      A2A_TRANSPORT_AUTH: none
+      A2A_UDS_SOCKET_PATH: /run/a2a-core/core.sock
+      A2A_INBOX_DB: ${A2A_INBOX_DB:-/app/data/a2a-inbox.sqlite3}
+      A2A_CORE_BEAT_MS: ${A2A_CORE_BEAT_MS:-0}
+      BRAIN_URL: ${BRAIN_URL:-}
+      KAI_HTTP_URL: ${KAI_HTTP_URL:-}
+      KAI_WS_URL: ${KAI_WS_URL:-}
+      KAI_TOKEN_PATH: /run/secrets/kai-token
+      A2A_AGENT_LAUNCH_ALLOWED_IDS: ${A2A_AGENT_LAUNCH_ALLOWED_IDS:-codex-gw}
+      A2A_AGENT_LAUNCH_MODE: ${A2A_AGENT_LAUNCH_MODE:-shim}
+      A2A_LAUNCHER_URL: ${A2A_LAUNCHER_URL:-}
+    networks:
+      - a2a-net
+    volumes:
+      - *a2a-core-run-bind
+      - type: bind
+        source: ${A2A_INBOX_HOST_PATH:-./data/a2a-inbox}
+        target: /app/data
+        bind:
+          create_host_path: true
+      - kai_token_secret:/run/secrets:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # NOTE: a2a-core deliberately does NOT hard-gate on materialize-kai-token
+      # (no `condition: service_completed_successfully`) — P1 decouple (agent-1
+      # mandate): the bus MUST start regardless of vault/materialize success.
+      # Kai degrades, never the core. Materialize retry/backoff folds in later.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/a2a-core/core.sock && a2a-shim --ping /run/a2a-core/core.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 18
+      start_period: 10s
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/a2a-core
+        chown -R bun:bun /run/a2a-core
+        exec gosu bun:bun bun a2a_core.ts
+
+  a2a-launcher:
+    profiles: ["launcher"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+      A2A_LAUNCH_PROVIDER: docker
+      A2A_LAUNCHER_PORT: "8910"
+      # Bind all interfaces so codex-gw / a2a-core can reach the launcher cross-container.
+      # a2a_launcher.ts defaults HOSTNAME to 127.0.0.1 (loopback) since 7dbaf00 ("launcher auth"),
+      # which made the launch endpoint unreachable from other containers -> launch failures.
+      A2A_LAUNCHER_HOST: ${A2A_LAUNCHER_HOST:-0.0.0.0}
+      A2A_LAUNCH_ALLOWED_IDS: ${A2A_LAUNCH_ALLOWED_IDS:-codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops}
+      A2A_LAUNCH_CODEX_IMAGE: ${A2A_LAUNCH_CODEX_IMAGE:-alloyium-codex-gw:latest}
+      A2A_LAUNCH_CLAUDE_IMAGE: ${A2A_LAUNCH_CLAUDE_IMAGE:-alloyium-claude-gw:latest}
+      A2A_LAUNCH_DEMO_IMAGE: ${A2A_LAUNCH_DEMO_IMAGE:-alloyium-demo-agent:latest}
+      A2A_LAUNCH_NETWORK: ${A2A_LAUNCH_NETWORK:-alloyium_a2a-net}
+      A2A_LAUNCH_SECRETS_VOLUME: ${A2A_LAUNCH_SECRETS_VOLUME:-alloyium_a2a_secrets}
+      A2A_LAUNCH_CORE_SOURCE: ${A2A_CORE_RUN_HOST_PATH:-/run/a2a-core}
+      A2A_LAUNCH_WORKSPACES_VOLUME: ${A2A_LAUNCH_WORKSPACES_VOLUME:-alloyium_codex_workspaces}
+      A2A_LAUNCH_PRESENCE_WAIT_MS: ${A2A_LAUNCH_PRESENCE_WAIT_MS:-15000}
+      CODEX_HOST_HOME: ${CODEX_HOST_HOME:-${HOME}/.codex}
+      CODEX_WORKSPACE_ROOT: ${CODEX_WORKSPACE_ROOT:-${HOME}/git}
+      CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
+      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
+      CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-${HOME}/git}
+      # Spawned kind=claude workers need the HOST paths of the logged-in `claude` session
+      # to bind in (mirrors CODEX_HOST_HOME). Claude's login is split across a dir and a
+      # file, so pass BOTH: ~/.claude (dir) and ~/.claude.json (file). Default to ${HOME}.
+      CLAUDE_HOST_HOME: ${CLAUDE_HOST_HOME:-${HOME}/.claude}
+      CLAUDE_HOST_CONFIG: ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}
+      CLAUDE_GW_MODEL: ${CLAUDE_GW_MODEL:-opus}
+      CLAUDE_GW_EFFORT: ${CLAUDE_GW_EFFORT:-high}
+      BRAIN_URL: ${BRAIN_URL:-}
+      KAI_HTTP_URL: ${KAI_HTTP_URL:-}
+      KAI_WS_URL: ${KAI_WS_URL:-}
+      KAI_TOKEN_PATH: ${KAI_TOKEN_PATH:-}
+      CC_UID: ${CC_UID:-1000}
+      CC_GID: ${CC_GID:-1000}
+    networks:
+      - a2a-net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8910/readyz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    command: ["bun", "a2a_launcher.ts"]
+
+  taskboard-event-bridge:
+    profiles: ["taskboard"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    environment:
+      <<: *cc-env
+      TASKBOARD_URL: ${TASKBOARD_URL:-}
+      TASKBOARD_EVENT_BRIDGE_PORT: "18889"
+      TASKBOARD_EVENT_BRIDGE_HMAC_SECRET: ${TASKBOARD_EVENT_BRIDGE_HMAC_SECRET:-}
+      TASKBOARD_EVENT_BRIDGE_HMAC_SECRET_FILE: ${TASKBOARD_EVENT_BRIDGE_HMAC_SECRET_FILE:-}
+      TASKBOARD_EVENT_PUBLISH_TIMEOUT_MS: ${TASKBOARD_EVENT_PUBLISH_TIMEOUT_MS:-10000}
+    networks:
+      - a2a-net
+    ports:
+      - "${TASKBOARD_EVENT_BRIDGE_BIND:-127.0.0.1}:${TASKBOARD_EVENT_BRIDGE_HOST_PORT:-18889}:18889"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18889/readyz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    command: ["bun", "taskboard_event_bridge.ts"]
+
+  onboard-taskboard-dispatcher:
+    profiles: ["taskboard"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts ${TASKBOARD_DISPATCH_AGENT_ID:-taskboard-dispatcher} --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  a2a-taskboard-dispatcher:
+    profiles: ["taskboard"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    # Optional review-token overrides; absent file is fine (service reads tokens from env instead).
+    env_file:
+      - path: ${TASKBOARD_REVIEW_TOKENS_ENV:-./secrets/taskboard-review-tokens.env}
+        required: false
+    environment:
+      <<: *cc-env
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${TASKBOARD_DISPATCH_AGENT_ID:-taskboard-dispatcher}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${TASKBOARD_DISPATCH_AGENT_ID:-taskboard-dispatcher}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      TASKBOARD_URL: ${TASKBOARD_URL:-}
+      TASKBOARD_API_TOKEN: ${TASKBOARD_API_TOKEN:-}
+      TASKBOARD_DISPATCH_DEFAULT_AGENT_ID: ${TASKBOARD_DISPATCH_DEFAULT_AGENT_ID:-host-ops-gw}
+      TASKBOARD_DISPATCH_DEFAULT_CWD: ${TASKBOARD_DISPATCH_DEFAULT_CWD:-/app}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-taskboard-dispatcher:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 20s
+    command: ["bun", "taskboard_event_dispatcher.ts"]
+
+  codex-gw:
+    profiles: ["gateways"]
+    build:
+      context: .
+      dockerfile: docker/gateway-codex/Dockerfile
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.141.0}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${CODEX_GW_AGENT_ID:-codex-gw}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${CODEX_GW_AGENT_ID:-codex-gw}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      CODEX_GW_EFFORT: ${CODEX_GW_EFFORT:-xhigh}
+      CODEX_GW_MODEL: ${CODEX_GW_MODEL:-}
+      CODEX_GW_BUDGET_MAX_PCT: ${CODEX_GW_BUDGET_MAX_PCT:-92}
+      CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
+      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
+      CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-${HOME}/git}
+      CODEX_GW_ENABLE_A2A_TOOLS: ${CODEX_GW_ENABLE_A2A_TOOLS:-1}
+      CODEX_GW_A2A_TOOLS_MODE: ${CODEX_GW_A2A_TOOLS_MODE:-shim}
+      CODEX_GW_A2A_SHIM_BIN: /usr/local/bin/a2a-shim
+      CODEX_GW_A2A_TOOLS_REQUIRED: ${CODEX_GW_A2A_TOOLS_REQUIRED:-1}
+      A2A_CORE_SOCK: /run/a2a-core/core.sock
+      # codex-gw's launch tool (agent_launcher_tools) needs the launcher URL to spawn A2A peers;
+      # without it codex-gw can't forward a2a.launch.request -> launch failures.
+      A2A_LAUNCHER_URL: ${A2A_LAUNCHER_URL:-http://a2a-launcher:8910}
+      BRAIN_URL: ${BRAIN_URL:-}
+      KAI_HTTP_URL: ${KAI_HTTP_URL:-}
+      KAI_WS_URL: ${KAI_WS_URL:-}
+      KAI_TOKEN_PATH: ${KAI_TOKEN_PATH:-}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      - *a2a-core-run-bind
+      - ${CODEX_HOST_HOME:-${HOME}/.codex}:/home/bun/.codex
+      # Optional: mount the user's own SSH keys so codex can push to their git remotes.
+      # Override CODEX_SSH_DIR in .env; defaults to the host user's ~/.ssh.
+      - ${CODEX_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+      - ${CODEX_WORKSPACE_ROOT:-${HOME}/git}:${CODEX_WORKSPACE_ROOT:-${HOME}/git}
+      - codex_workspaces:/workspaces
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-codex-gw:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 20s
+    command: ["bun", "codex_gateway.ts"]
+
+  claude-gw:
+    profiles: ["gateways"]
+    build:
+      context: .
+      dockerfile: docker/gateway-claude/Dockerfile
+      args:
+        CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.177}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${CLAUDE_GW_AGENT_ID:-claude-gw}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${CLAUDE_GW_AGENT_ID:-claude-gw}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      # claude_gateway.ts knobs (drives the logged-in `claude` CLI; advisory-only, --tools "").
+      # Never pass an empty model: `${VAR:-default}` substitutes the default when unset OR empty.
+      CLAUDE_GW_MODEL: ${CLAUDE_GW_MODEL:-opus}
+      CLAUDE_GW_EFFORT: ${CLAUDE_GW_EFFORT:-high}
+      CLAUDE_GW_CWD: ${CLAUDE_GW_CWD:-/tmp}
+      CLAUDE_GW_POOL: ${CLAUDE_GW_POOL:-2}
+      CLAUDE_GW_SESSION_MAX_TURNS: ${CLAUDE_GW_SESSION_MAX_TURNS:-1}
+      CLAUDE_GW_THREAD_MAX_TURNS: ${CLAUDE_GW_THREAD_MAX_TURNS:-200}
+      CLAUDE_GW_TURN_TIMEOUT_MS: ${CLAUDE_GW_TURN_TIMEOUT_MS:-28800000}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      # The user's logged-in `claude` session: the CLI keeps its login under ~/.claude
+      # (dir) plus ~/.claude.json (file) — mount BOTH read-write so OAuth tokens refresh.
+      # Override CLAUDE_HOST_HOME / CLAUDE_HOST_CONFIG in .env; default to the host user's home.
+      - ${CLAUDE_HOST_HOME:-${HOME}/.claude}:/home/bun/.claude
+      - ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}:/home/bun/.claude.json
+      # Optional: mount the user's own SSH keys (read-only), mirroring the codex gateway.
+      - ${CLAUDE_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-claude-gw:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 20s
+    command: ["bun", "claude_gateway.ts"]
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/test/Dockerfile
+    environment:
+      <<: *cc-env
+      A2A_TEST_REQUIRE_BUS: ${A2A_TEST_REQUIRE_BUS:-}
+    networks:
+      - a2a-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["bun", "run", "selftest"]
+
+  # ── Keyless demo fleet (CORE PATH — no profile, up on a plain `docker compose up`) ──
+  # A deterministic a2a peer fabric: 1 Core + 3 Project-Managers (design/dev/ops) +
+  # 6 Workers (2 per PM). No API keys, no login. The Core dispatches direction to the
+  # PMs, each PM fans the work out to its workers, the workers report completion back
+  # up, and a worker broadcasts a learned skill — all visible in the portal (presence,
+  # plane traffic, skills). The real gateways (codex-gw, launcher, …) stay behind their
+  # existing profiles, untouched.
+
+  seed-planes:
+    # One-shot: seed the six product topic planes into Redis membership (core in all
+    # planes; each PM + its workers in their own plane). Demo peers also self-join at
+    # boot, so this is the authoritative pre-seed and a guard against the join race.
+    image: *demo-image
+    build: *demo-build
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        rc() { redis-cli -u "$${REDIS_URL}" "$@" >/dev/null; }
+        rc SET alloyium:a2a:topics:core '["design","research","data","dev","qa","ops"]'
+        rc SET alloyium:a2a:topics:pm-design '["design"]'
+        rc SET alloyium:a2a:topics:pm-dev '["dev"]'
+        rc SET alloyium:a2a:topics:pm-ops '["ops"]'
+        rc SET alloyium:a2a:topics:worker-design-1 '["design"]'
+        rc SET alloyium:a2a:topics:worker-design-2 '["design"]'
+        rc SET alloyium:a2a:topics:worker-dev-1 '["dev"]'
+        rc SET alloyium:a2a:topics:worker-dev-2 '["dev"]'
+        rc SET alloyium:a2a:topics:worker-ops-1 '["ops"]'
+        rc SET alloyium:a2a:topics:worker-ops-2 '["ops"]'
+        echo "seeded six topic planes (design research data dev qa ops)"
+
+  # ---- Core ------------------------------------------------------------------------
+  onboard-demo-core:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: core
+  demo-core:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: core
+      A2A_SIGNING_KEY: /run/secrets/a2a/core.seed
+      DEMO_ROLE: core
+      DEMO_PEERS: pm-design,pm-dev,pm-ops
+      DEMO_TOPICS: design,research,data,dev,qa,ops
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-core:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  # ---- Project-Managers (design / dev / ops) ---------------------------------------
+  onboard-demo-pm-design:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: pm-design
+  demo-pm-design:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: pm-design
+      A2A_SIGNING_KEY: /run/secrets/a2a/pm-design.seed
+      DEMO_ROLE: pm
+      DEMO_PLANE: design
+      DEMO_WORKERS: worker-design-1,worker-design-2
+      DEMO_CORE: core
+      DEMO_TOPICS: design
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-pm-design:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-pm-dev:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: pm-dev
+  demo-pm-dev:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: pm-dev
+      A2A_SIGNING_KEY: /run/secrets/a2a/pm-dev.seed
+      DEMO_ROLE: pm
+      DEMO_PLANE: dev
+      DEMO_WORKERS: worker-dev-1,worker-dev-2
+      DEMO_CORE: core
+      DEMO_TOPICS: dev
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-pm-dev:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-pm-ops:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: pm-ops
+  demo-pm-ops:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: pm-ops
+      A2A_SIGNING_KEY: /run/secrets/a2a/pm-ops.seed
+      DEMO_ROLE: pm
+      DEMO_PLANE: ops
+      DEMO_WORKERS: worker-ops-1,worker-ops-2
+      DEMO_CORE: core
+      DEMO_TOPICS: ops
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-pm-ops:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  # ---- Workers (2 per PM) ----------------------------------------------------------
+  onboard-demo-worker-design-1:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-design-1
+  demo-worker-design-1:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-design-1
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-design-1.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: design
+      DEMO_PM: pm-design
+      DEMO_TOPICS: design
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-design-1:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-worker-design-2:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-design-2
+  demo-worker-design-2:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-design-2
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-design-2.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: design
+      DEMO_PM: pm-design
+      DEMO_TOPICS: design
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-design-2:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-worker-dev-1:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-dev-1
+  demo-worker-dev-1:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-dev-1
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-dev-1.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: dev
+      DEMO_PM: pm-dev
+      DEMO_TOPICS: dev
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-dev-1:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-worker-dev-2:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-dev-2
+  demo-worker-dev-2:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-dev-2
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-dev-2.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: dev
+      DEMO_PM: pm-dev
+      DEMO_TOPICS: dev
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-dev-2:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-worker-ops-1:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-ops-1
+  demo-worker-ops-1:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-ops-1
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-ops-1.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: ops
+      DEMO_PM: pm-ops
+      DEMO_TOPICS: ops
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-ops-1:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+  onboard-demo-worker-ops-2:
+    <<: *demo-onboard
+    environment:
+      <<: *cc-env
+      A2A_AGENT_ID: worker-ops-2
+  demo-worker-ops-2:
+    <<: *demo-agent
+    environment:
+      <<: *demo-env
+      A2A_AGENT_ID: worker-ops-2
+      A2A_SIGNING_KEY: /run/secrets/a2a/worker-ops-2.seed
+      DEMO_ROLE: worker
+      DEMO_PLANE: ops
+      DEMO_PM: pm-ops
+      DEMO_TOPICS: ops
+    depends_on:
+      a2a-core:
+        condition: service_healthy
+      seed-planes:
+        condition: service_completed_successfully
+      onboard-demo-worker-ops-2:
+        condition: service_completed_successfully
+    healthcheck: *demo-presence-health
+
+networks:
+  # Docker auto-assigns a free subnet so the stack can run standalone alongside
+  # other compose projects without address-pool overlap.
+  a2a-net:
+
+volumes:
+  nats_data:
+  redis_data:
+  a2a_secrets:
+  kai_token_secret:
+  portal_logs:
+  codex_workspaces:

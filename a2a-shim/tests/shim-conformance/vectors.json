@@ -1,0 +1,46 @@
+{
+  "_note": "Conformance vectors for the MCP-over-UDS shim (#15 §A.8). canonical_utf8_hex is the BYTE-EXACT form — decode hex -> UTF-8 bytes -> ed25519 sign -> must equal expected_sig_b64. Generated from the real a2a-channel.ts canonical()+signCanonical (TEST seed; NOT a real identity).",
+  "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "pubkey_raw_b64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "pubkey_raw_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "pop": {
+    "_spec": "sign the base64-DECODED 32 nonce bytes (NOT the base64 string)",
+    "nonce_b64": "//79/Pv6+fj39vX08/Lx8O/u7ezr6uno5+bl5OPi4eA=",
+    "nonce_hex": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
+    "expected_sig_b64": "FKJzdLTgP9ZC137K+bnUbp5CfXVzFN6Y5yy691hrJFv+sCzOcFTkPauJLld7gD7z5zWD25KFbuRuSPCB6zX6Aw=="
+  },
+  "canon_4a": {
+    "envelope": {
+      "v": 1,
+      "id": "a2a-shim-vec-0001",
+      "from": "a2a-shim-test",
+      "to": "topic:agent-beat",
+      "type": "msg",
+      "ts": "2026-06-17T00:00:00.000Z",
+      "body": "pipe|backslash\\quote\"unicode ünï 🎯\nnl"
+    },
+    "canonical_string": "1|a2a-shim-vec-0001|a2a-shim-test|topic:agent-beat|msg||2026-06-17T00:00:00.000Z||pipe\\|backslash\\\\quote\"unicode ünï 🎯\nnl",
+    "canonical_utf8_hex": "317c6132612d7368696d2d7665632d303030317c6132612d7368696d2d746573747c746f7069633a6167656e742d626561747c6d73677c7c323032362d30362d31375430303a30303a30302e3030305a7c7c706970655c7c6261636b736c6173685c5c71756f746522756e69636f646520c3bc6ec3af20f09f8eaf0a6e6c",
+    "expected_sig_b64": "EkrVgMA4FSlu/Qto+xcYiWB5Y9unXHzeLVpLT7BtnH24SLHAgxmaGBafF6HwA4r23SYRrjCyaZu0iQMpU6xPDQ=="
+  },
+  "canon_4b": {
+    "_spec": "reply+corr+ttl_ms set; attrs EXCLUDED from canonical(); empty body",
+    "envelope": {
+      "v": 1,
+      "id": "a2a-shim-vec-0002",
+      "from": "a2a-shim-test",
+      "to": "agent-x",
+      "type": "reply",
+      "corr": "a2a-shim-vec-0001",
+      "ttl_ms": 60000,
+      "ts": "2026-06-17T00:00:00.000Z",
+      "body": "",
+      "attrs": {
+        "k": "v"
+      }
+    },
+    "canonical_string": "1|a2a-shim-vec-0002|a2a-shim-test|agent-x|reply|a2a-shim-vec-0001|2026-06-17T00:00:00.000Z|60000|",
+    "canonical_utf8_hex": "317c6132612d7368696d2d7665632d303030327c6132612d7368696d2d746573747c6167656e742d787c7265706c797c6132612d7368696d2d7665632d303030317c323032362d30362d31375430303a30303a30302e3030305a7c36303030307c",
+    "expected_sig_b64": "9I84hXpfAsG2OVJHHeU4IsRgQEy5q1Arq+tLN49XfQ2Tt9Sz11Swq2yvR/peSEvoHS59ORxdqlcfKy5KcO8HBg=="
+  }
+}
