@@ -129,6 +129,7 @@ image on that host, and set the remote core's `A2A_LAUNCHER_URL`,
 `A2A_LAUNCHER_TOKEN`, and `A2A_AGENT_LAUNCH_ALLOWED_IDS`. Keep launcher network,
 secrets, workspace, image tags, and tmux sessions separate from any legacy stack. See
 `docs/host-codex-peer.md#remote-host-launcher`.
+
 ## Host-Layer Claude Peer
 
 The Claude counterpart of the codex host peer — a real `claude` session on the host with
@@ -211,6 +212,13 @@ external agent-brain service:
 ```bash
 BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace
 ```
+
+The effective brain URL for MCP tools is the `BRAIN_URL` on `a2a-core`, because
+`a2a-shim` connects to the shared `/run/a2a-core/core.sock` server and the core owns
+the `BrainTools` instance. A gateway or host peer may also pass `BRAIN_URL` into its
+shim env, but that does not override a running core. If `BRAIN_URL` changes on a live
+stack, restart `a2a-core` during an idle window so existing shim sessions reconnect to
+the core with the new brain configuration.
 
 Use `--replace` when changing `BRAIN_URL` because launcher-spawned containers inherit
 that value only when they are created.
