@@ -76,3 +76,11 @@ bin/alloyium down full-codex
 `down full-codex` removes the launcher-spawned `cc-agent-codex-a2a-full-1` container
 before running Compose down. This avoids leaving a dynamic container attached to the
 Compose network.
+
+## Host-Layer Peer
+
+For host operations, you can run a Codex gateway directly on the machine in tmux while
+joining the Docker e2e bus. This is separate from launcher-spawned container peers and
+uses a host identity such as `host-ops-gw-e2e-gpubox`.
+
+See [`docs/host-codex-peer.md`](host-codex-peer.md).

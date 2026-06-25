@@ -10,6 +10,7 @@ and verify a fully A2A-enabled Codex peer without reconstructing Compose profile
 - `compose.yaml` - base Docker Compose stack.
 - `compose.presets/full-codex.yaml` - preset for launcher + fleet + fusion + full Codex node.
 - `docs/full-codex-node.md` - user-facing full-node setup notes.
+- `docs/host-codex-peer.md` - host-level Codex peer setup for e2e bus access.
 - `docs/shared-workspace.md` - `/workspace` mount behavior.
 - `GETTING_STARTED.md` - longer product walkthrough.
 - `a2a_portal.ts` - web portal and send surface.
@@ -99,6 +100,22 @@ To recreate the dynamic node after changing launcher-provided environment:
 ```bash
 bin/alloyium launch full-codex --replace
 ```
+
+## Host-Layer Codex Peer
+
+Use a host-layer peer only when the agent needs direct host access for Docker, tmux,
+filesystem, or LAN diagnostics. It should use a distinct identity such as
+`host-ops-gw-e2e-gpubox`, not an identity from another LAN mesh.
+
+The host peer has two A2A paths that must point at the same e2e stack:
+
+- outer `codex_gateway.ts`: connects to the e2e NATS/Redis container bridge IPs.
+- inner `codex app-server`: gets A2A tools through the e2e `/run/a2a-core/core.sock`.
+
+Follow `docs/host-codex-peer.md`. Generated host identity files live under
+`a2a-host/` and must never be committed. To run multiple host peers, repeat onboarding
+with a unique `AGENT` value, for example `host-ops-gw-e2e-gpubox-2`, and launch it in
+a separate tmux session.
 
 ## Profiles
 
