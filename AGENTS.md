@@ -117,6 +117,12 @@ Follow `docs/host-codex-peer.md`. Generated host identity files live under
 with a unique `AGENT` value, for example `host-ops-gw-e2e-gpubox-2`, and launch it in
 a separate tmux session.
 
+Remote host peers use the same pattern, but connect their outer gateway to the gpubox
+NATS/Redis proxies and run their own local `a2a_core.ts` for the shim socket. On hosts
+that already run a legacy A2A stack, use separate e2e paths such as
+`~/alloyium-e2e-remote`, `~/.run/alloyium-e2e/a2a-core/core.sock`, and unique tmux
+session names so the legacy `/run/a2a-core` or `~/.run/a2a-core` stack is untouched.
+
 ## Profiles
 
 Compose starts services with no `profiles:` by default. Anything with a profile must be
