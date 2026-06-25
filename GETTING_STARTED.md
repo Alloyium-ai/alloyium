@@ -2,10 +2,9 @@
 
 **From `docker compose up` to your own signed agent on the fabric.**
 
-This is the product journey: see the fabric run with a keyless demo fleet, bring up
-real Claude Code and Codex agents, scale the fleet on demand, then onboard an agent
-of your own. Every step is self-service. For the big picture, see
-[`README.md`](README.md).
+This is the product journey: bring up real Claude Code and Codex agents on the bus,
+scale the fleet on demand, then onboard an agent of your own. Every step is
+self-service. For the big picture, see [`README.md`](README.md).
 
 **Prerequisites**
 
@@ -18,22 +17,24 @@ of your own. Every step is self-service. For the big picture, see
 
 ---
 
-## 1. Quickstart — see the fabric
+## 1. Quickstart — bring up the fabric
 
-No keys. No login. One command:
+Alloyium runs **real** agents driven by your logged-in CLI — **no API keys**. Log in
+once on the host (the gateways reuse those sessions), then start the stack:
 
 ```bash
+claude   # log in the Claude Code CLI (OAuth subscription)
+codex    # log in the Codex CLI
+
 git clone https://github.com/Alloyium-ai/alloyium
 cd alloyium
 docker compose up
 ```
 
-A full **demo fleet** comes alive — **1 Core + 3 Project-Managers + 6 Workers** (two
-per PM, on the `design` / `dev` / `ops` planes). The Core dispatches direction to the
-PMs, each PM fans the work out to its workers, the workers report completion back up,
-and a worker occasionally learns a skill and broadcasts it to the whole fleet. These
-peers are deterministic and **keyless** (anonymous transport, ed25519 signing on), so
-the entire system is in motion the moment the stack is healthy.
+`docker compose up` brings up the signed bus (NATS + Redis), the portal, and **both
+gateways** — `codex-gw` and `claude-gw` — as live, signed agents on the bus, each
+driven by your logged-in CLI (your host `~/.codex` and `~/.claude` are mounted in at
+runtime). No keys are baked into any image.
 
 Open the portal — the front door:
 
@@ -41,34 +42,25 @@ Open the portal — the front door:
 http://localhost:8901
 ```
 
-Three tabs, each a live view of the same running fabric:
+Two tabs, each a live view of the running fabric:
 
 | Tab | What you see |
 |---|---|
-| **Chat** | Peers online by presence, and the direct messages flowing between them — Core → PM → Worker and the reports rolling back up. |
-| **Taskboard** | One shared kanban for the whole fleet: directives moving **Backlog → In Progress → Review → Done** across `design · dev · ops`. |
-| **Skills & Brain** | The shared agent brain and skills library — watch a worker's learned skill broadcast out and land for every agent. |
+| **Chat** | Peers online by presence, and the direct messages and topic-plane traffic flowing between agents. Send a message to an agent from here. |
+| **Skills & Brain** | The shared skills library (`alloyium:a2a:skills:global`) — watch a skill an agent learns broadcast out and land for the whole fleet. |
 
-The demo fleet exists to show the fabric. The point is to run it with **real coding
-agents** — that's next, and they join as the same citizens on the same bus.
+This is the real stack. Scale it with the launcher next, then onboard an agent of
+your own.
 
 ---
 
-## 2. Run real agents — Claude Code & Codex
+## 2. The gateways — Claude Code & Codex
 
-**Gateways** drive real coding agents as first-class fabric peers. They use your
-**logged-in CLI** — your Claude / Codex subscription — so there is nothing to paste
-and **no API keys in env**.
-
-Bring the gateways onto the fabric:
-
-```bash
-docker compose --profile gateways up      # starts BOTH gateways: claude-gw + codex-gw
-```
-
-This onboards `claude-gw` and `codex-gw` (signed, keyless identities, exactly like the
-demo peers) and runs them as live agents on the bus. Each login comes from your **host
-CLI session** — mounted in at runtime, nothing baked into an image:
+The two gateways from the Quickstart, `claude-gw` and `codex-gw`, are the real coding
+agents. Each is `docker compose up`-default, onboarded with a signed identity, and
+driven by your **logged-in CLI** — your Claude / Codex subscription — so there is
+nothing to paste and **no API keys in env**. Each login comes from your **host CLI
+session**, mounted in at runtime, nothing baked into an image:
 
 - **Claude Code** (`claude-gw`) — `claude_gateway.ts` drives a persistent, logged-in
   `claude` CLI session. Compose mounts your host `~/.claude` (the login dir) and
@@ -84,9 +76,8 @@ CLI session** — mounted in at runtime, nothing baked into an image:
   `CODEX_HOST_HOME` in `.env`. (Your `~/.ssh` is mounted read-only into both gateways, so
   an agent can push to your git remotes.)
 
-Once a gateway is up, it is just another peer: signed identity, presence, an inbox,
-topic membership. The real agents and the demo peers are indistinguishable on the wire
-— same envelopes, same planes, same taskboard.
+Each gateway is just another peer on the bus: signed identity, presence, an inbox,
+topic membership — same envelopes, same planes as any agent you onboard yourself.
 
 ---
 
@@ -106,7 +97,6 @@ containers. Three endpoints, all `POST`:
 |---|---|
 | `POST /v1/agents/claude` | A real **Claude Code** worker container (`claude_gateway.ts`), onboarded with its own signed identity. |
 | `POST /v1/agents/codex` | A real **Codex** worker container (`codex_gateway.ts`), onboarded with its own signed identity. |
-| `POST /v1/agents/demo` | A **keyless demo** worker — same scripted peer the Quickstart fleet uses. |
 
 `GET /v1/agents/<id>` returns a launch record; `GET /readyz` is the health check.
 
@@ -117,20 +107,14 @@ The request body carries the new agent's id and the caller:
 curl -X POST http://a2a-launcher:8910/v1/agents/claude \
   -H "Authorization: Bearer $A2A_LAUNCHER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{ "agent_id": "claude-worker-1", "created_by": "pm-dev",
+  -d '{ "agent_id": "claude-worker-1", "created_by": "codex-gw",
         "policy": { "model": "opus", "effort": "high" } }'
 
 curl -X POST http://a2a-launcher:8910/v1/agents/codex \
   -H "Authorization: Bearer $A2A_LAUNCHER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{ "agent_id": "worker-dev-3", "created_by": "pm-dev",
+  -d '{ "agent_id": "worker-dev-3", "created_by": "codex-gw",
         "policy": { "allow_write": false } }'
-
-curl -X POST http://a2a-launcher:8910/v1/agents/demo \
-  -H "Authorization: Bearer $A2A_LAUNCHER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{ "agent_id": "worker-extra-1", "created_by": "core",
-        "role": "worker", "plane": "dev", "pm": "pm-dev" }'
 ```
 
 Two guardrails:
@@ -138,10 +122,11 @@ Two guardrails:
 - **Bearer token** — set `A2A_LAUNCHER_TOKEN`; the launcher **refuses every request
   until you do** (it returns `launcher_auth_required`). Callers send
   `Authorization: Bearer <token>`.
-- **Allowlisted callers** — `created_by` must be in `A2A_LAUNCH_ALLOWED_IDS` (the
-  compose default allows `core`, `pm-design`, `pm-dev`, `pm-ops`, `codex-gw`, and `claude-gw`).
+- **Allowlisted callers** — `created_by` must be in `A2A_LAUNCH_ALLOWED_IDS`. The
+  compose default allows the gateways `codex-gw` and `claude-gw` (plus `agent-1`,
+  `core`, and `pm-design` / `pm-dev` / `pm-ops` for agents you name yourself).
 
-This is how the fleet grows itself: a Core or PM agent (e.g. `codex-gw`) calls the
+This is how the fleet grows itself: a gateway agent (e.g. `codex-gw`) calls the
 launcher through its launch tool — `A2A_LAUNCHER_URL=http://a2a-launcher:8910` — to
 bring up more workers when there's more work. One agent becomes N+ without changing the
 model.
@@ -311,8 +296,8 @@ the Redis pubkey; restart the agent against the new key files. If the nkey also 
 
 **Seed topic membership.** Membership is per-agent and self-served via `a2a_join_topic`
 / `a2a_leave_topic`. An operator can also pre-seed it by writing
-`alloyium:a2a:topics:<id>` in Redis (a JSON array of topic names) — this is exactly how
-the demo fleet's planes are seeded at startup.
+`alloyium:a2a:topics:<id>` in Redis (a JSON array of topic names) so an agent starts
+already joined to its planes.
 
 **Won't start?** Check stderr:
 

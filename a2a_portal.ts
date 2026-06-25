@@ -190,7 +190,7 @@ async function onMessage(subject: string, data: Uint8Array) {
   if (existing && existing.msgs.some((x) => x.id === m.id)) return
   record(m, false)
   append(JSON.stringify(m))
-  projectFabric(m)
+  projectSkillEvent(m)
 }
 
 let redis: RedisClient
@@ -320,53 +320,23 @@ async function publishPortalSend(built: Extract<PortalSendBuildResult, { ok: tru
   return { ...out, serialized: true, delivery_wait: deliveryWait, settle_ms: settleMs }
 }
 
-// ── demo views: taskboard + skills/brain (read-only projections over the bus) ───
+// ── skills panel: read-only projection of real skill broadcasts over the bus ────
 //
-// The portal already captures every fabric.* plane announce and skill.created.v1
-// event on alloyium.a2a.>, so the board and the skills/memory feed are just views
-// folded out of that stream — no extra services. The board is mirrored to Redis so
-// it survives a restart, and every change is pushed to the SPA over the SSE stream.
-const BOARD_KEY = process.env.A2A_PORTAL_BOARD_KEY ?? 'alloyium:demo:board'
-const DEMO_SKILLS_KEY = process.env.A2A_PORTAL_DEMO_SKILLS_KEY ?? 'alloyium:demo:skills'
+// Real agents broadcast skill.created.v1 on the skills-global plane; the channel
+// persists every GLOBAL skill into the shared registry (alloyium:a2a:skills:global).
+// The portal reads that registry for the Skills Library and folds each live
+// broadcast into an activity feed, pushed to the SPA over the SSE stream.
 const SKILLS_REGISTRY_KEY = process.env.A2A_SKILLS_GLOBAL_KEY ?? 'alloyium:a2a:skills:global'
 const BRAIN_CAP = 60
-const BOARD_DONE_CAP = 48
 
-type BoardColumn = 'backlog' | 'in_progress' | 'review' | 'done'
-type BoardCard = { id: string; plane: string; directive: string; round: number; parts: number; done: number; column: BoardColumn; openedT: number; updatedT: number }
-type FeedItem = { id: string; kind: 'decision' | 'delivered' | 'learned'; plane: string; directive: string; source?: string; t: number }
+type FeedItem = { id: string; kind: 'learned'; plane: string; directive: string; source?: string; t: number }
 
-// One card per (plane, directive) — the Core cycles a fixed directive set across the
-// design/dev/ops planes, so this keeps the board bounded while cards re-flow each round.
-const board = new Map<string, BoardCard>()
 const brainFeed: FeedItem[] = []
 
 function sseSend(obj: unknown): void {
   const frame = enc.encode(`data: ${JSON.stringify(obj)}\n\n`)
   for (const c of sse) { try { c.enqueue(frame) } catch {} }
 }
-
-function boardCard(plane: string, directive: string): BoardCard {
-  const id = `${plane}|${directive}`
-  let c = board.get(id)
-  if (!c) { c = { id, plane, directive, round: 0, parts: 0, done: 0, column: 'backlog', openedT: Date.now(), updatedT: Date.now() }; board.set(id, c) }
-  return c
-}
-
-function boardSnapshot(): Record<BoardColumn, BoardCard[]> {
-  const cols: Record<BoardColumn, BoardCard[]> = { backlog: [], in_progress: [], review: [], done: [] }
-  for (const c of board.values()) cols[c.column].push(c)
-  for (const k of Object.keys(cols) as BoardColumn[]) cols[k].sort((a, b) => b.updatedT - a.updatedT)
-  cols.done = cols.done.slice(0, BOARD_DONE_CAP)
-  return cols
-}
-
-function persistBoard(): void {
-  const payload = JSON.stringify({ v: 1, cards: [...board.values()], t: Date.now() })
-  void (async () => { try { await redis.send('SET', [BOARD_KEY, payload]) } catch {} })()
-}
-
-function pushBoard(): void { sseSend({ kind: 'board', board: boardSnapshot() }) }
 
 function feedItem(kind: FeedItem['kind'], plane: string, directive: string, t: number, source?: string): FeedItem {
   return { id: randomUUID(), kind, plane, directive, source, t: t || Date.now() }
@@ -375,48 +345,6 @@ function pushFeed(item: FeedItem): void {
   brainFeed.unshift(item)
   if (brainFeed.length > BRAIN_CAP) brainFeed.length = BRAIN_CAP
   sseSend({ kind: 'brain', item })
-}
-
-// Worker subresults carry plane+part but no directive, so attribute them to the one
-// card currently mid-flight on that plane (timing keeps this unambiguous in the demo).
-function currentPlaneWipCard(plane: string): BoardCard | null {
-  let best: BoardCard | null = null
-  for (const c of board.values()) {
-    if (c.plane !== plane) continue
-    if (c.column !== 'in_progress' && c.column !== 'review') continue
-    if (!best || c.updatedT > best.updatedT) best = c
-  }
-  return best
-}
-
-function onFabricDirective(plane: string, directive: string, round: number, t: number): void {
-  const c = boardCard(plane, directive)
-  if (round) c.round = round
-  c.parts = 0; c.done = 0; c.column = 'backlog'; c.updatedT = t
-  pushFeed(feedItem('decision', plane, directive, t))
-  persistBoard(); pushBoard()
-}
-function onFabricPlan(plane: string, directive: string, parts: number, t: number): void {
-  const c = boardCard(plane, directive)
-  if (parts) c.parts = parts
-  c.done = 0; c.column = 'in_progress'; c.updatedT = t
-  persistBoard(); pushBoard()
-}
-function onFabricSubresult(plane: string, t: number): void {
-  const c = currentPlaneWipCard(plane)
-  if (!c) return
-  c.done += 1
-  if (c.parts > 0 && c.done >= c.parts && c.column === 'in_progress') c.column = 'review'
-  c.updatedT = t
-  persistBoard(); pushBoard()
-}
-function onFabricReport(plane: string, directive: string, t: number): void {
-  const c = boardCard(plane, directive)
-  const wasDone = c.column === 'done'
-  if (c.parts > 0) c.done = c.parts
-  c.column = 'done'; c.updatedT = t
-  if (!wasDone) pushFeed(feedItem('delivered', plane, directive, t))
-  persistBoard(); pushBoard()
 }
 
 async function onSkillCreated(ev: any, t: number): Promise<void> {
@@ -430,37 +358,18 @@ async function onSkillCreated(ev: any, t: number): Promise<void> {
     ts: String(ev.ts ?? new Date(t || Date.now()).toISOString()),
   }
   if (!rec.name) return
-  // Mirror bus-announced skills into a portal-owned registry so the grid survives a
-  // restart (the demo's tagged skills never land in the channel's global HSET).
-  try { await redis.send('HSET', [DEMO_SKILLS_KEY, rec.name, JSON.stringify(rec)]) } catch {}
   sseSend({ kind: 'skill', skill: rec })
   pushFeed(feedItem('learned', rec.tags[0] ?? '', rec.name, t, rec.source))
 }
 
-function projectFabric(m: Msg): void {
-  if (m.body.length < 12 || (m.body.indexOf('fabric.') < 0 && m.body.indexOf('skill.created') < 0)) return
+function projectSkillEvent(m: Msg): void {
+  if (m.body.indexOf('skill.created') < 0) return
   let body: any
   try { body = JSON.parse(m.body) } catch { return }
   if (!body || typeof body !== 'object') return
   const t = m.t || Date.now()
   try {
-    switch (body.schema) {
-      case 'fabric.directive.v1':
-        if (body.plane && body.directive) onFabricDirective(String(body.plane), String(body.directive), Number(body.round) || 0, t)
-        break
-      case 'fabric.plan.v1':
-        if (body.plane && body.directive) onFabricPlan(String(body.plane), String(body.directive), Number(body.parts) || 0, t)
-        break
-      case 'fabric.subresult.v1':
-        if (body.plane) onFabricSubresult(String(body.plane), t)
-        break
-      case 'fabric.report.v1':
-        if (body.status === 'complete' && body.plane && body.directive) onFabricReport(String(body.plane), String(body.directive), t)
-        break
-      case 'skill.created.v1':
-        if (body.name) void onSkillCreated(body, t)
-        break
-    }
+    if (body.schema === 'skill.created.v1' && body.name) void onSkillCreated(body, t)
   } catch {}
 }
 
@@ -477,8 +386,7 @@ async function hgetallSafe(key: string): Promise<Record<string, string>> {
   return out
 }
 
-// Skills Library = the documented global registry merged with the bus-seen skills the
-// portal mirrored (covers the demo's tagged skills, which the registry never stores).
+// Skills Library = the shared global skills registry (real agents broadcast there).
 async function readSkills(): Promise<any[]> {
   const merged = new Map<string, any>()
   const ingest = (h: Record<string, string>, fallbackScope: string) => {
@@ -498,30 +406,7 @@ async function readSkills(): Promise<any[]> {
     }
   }
   ingest(await hgetallSafe(SKILLS_REGISTRY_KEY), 'global')
-  ingest(await hgetallSafe(DEMO_SKILLS_KEY), 'tagged')
   return [...merged.values()].sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
-}
-
-async function hydrateBoard(): Promise<void> {
-  try {
-    const raw = await redis.get(BOARD_KEY)
-    if (!raw) return
-    const o = JSON.parse(raw)
-    const cards: any[] = Array.isArray(o?.cards) ? o.cards : []
-    for (const c of cards) {
-      if (!c || typeof c.id !== 'string') continue
-      board.set(c.id, {
-        id: c.id, plane: String(c.plane ?? ''), directive: String(c.directive ?? ''),
-        round: Number(c.round) || 0, parts: Number(c.parts) || 0, done: Number(c.done) || 0,
-        column: (['backlog', 'in_progress', 'review', 'done'].includes(c.column) ? c.column : 'backlog') as BoardColumn,
-        openedT: Number(c.openedT) || Date.now(), updatedT: Number(c.updatedT) || Date.now(),
-      })
-    }
-    for (const c of [...board.values()].sort((a, b) => a.updatedT - b.updatedT)) {
-      pushFeed(feedItem(c.column === 'done' ? 'delivered' : 'decision', c.plane, c.directive, c.updatedT))
-    }
-    console.error(`[portal] hydrated ${board.size} board cards from ${BOARD_KEY}`)
-  } catch {}
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -570,7 +455,6 @@ Bun.serve({
       return json({ channels: listChannels() })
     }
     if (p === '/api/presence') return json({ presence: await presence() })
-    if (p === '/api/board') return json({ board: boardSnapshot() })
     if (p === '/api/skills') return json({ skills: await readSkills(), feed: brainFeed })
     const mc = p.match(/^\/api\/channels\/(.+)$/)
     if (mc) {
@@ -695,30 +579,17 @@ body.nav-open .scrim{opacity:1;pointer-events:auto}
 .composer input,.composer textarea{grid-column:1/-1}.composer input,.composer textarea,.composer select{font-size:16px}.composer textarea{min-height:84px}.composer select,.composer button{height:42px}.sendstate{grid-column:1/-1;font-size:12px;overflow-wrap:anywhere}
 }
 @media(max-width:420px){.top .meta{display:none}.viewtoggle{margin-left:52px}.msgs{padding-left:10px;padding-right:10px}.composer{padding-left:10px;padding-right:10px}}
-/* ── tabs + taskboard + skills/brain panels ─────────────────────────────────── */
+/* ── tabs + skills/brain panel ─────────────────────────────────── */
 .tabs{display:flex;gap:4px}
 .tab{background:transparent;border:1px solid var(--line);color:var(--mut);border-radius:7px;padding:6px 12px;font:13px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;cursor:pointer;white-space:nowrap}
 .tab:hover{color:var(--tx);background:var(--bg3)}
 .tab.active{color:var(--tx);background:var(--bg3);border-color:var(--acc)}
 .tabpanel{display:none;flex:1;min-height:0;overflow:auto}
 body:not(.tab-chat) #msgs,body:not(.tab-chat) .composer,body:not(.tab-chat) .chat-only{display:none}
-body.tab-board #boardPanel{display:flex;flex-direction:column;overflow:hidden}
 body.tab-brain #brainPanel{display:block;overflow:auto}
-#boardPanel{padding:14px 18px}
-.board-head,.brain-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex:0 0 auto}
-.board-head h2,.brain-head h2{font-size:16px}
-.board-sub{color:var(--mut);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;flex:1;min-height:0}
-.col{background:var(--bg2);border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
-.col-h{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px}
-.col-h .swatch{width:9px;height:9px;border-radius:50%;flex:0 0 9px}
-.col-h .cnt{margin-left:auto;background:var(--bg);color:var(--mut);border-radius:9px;padding:0 8px;font-size:11px}
-.col-body{overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px;flex:1}
-.card{background:var(--bg3);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:10px}
-.card .dir{font-weight:600;color:var(--tx);margin-bottom:6px;line-height:1.3;word-break:break-word}
-.card .row{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--mut)}
-.card .plane{padding:1px 7px;border-radius:6px;background:var(--bg);text-transform:uppercase;letter-spacing:.04em;font-size:10px}
-.card .prog{margin-left:auto}
+.brain-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex:0 0 auto}
+.brain-head h2{font-size:16px}
+.panel-sub{color:var(--mut);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .col-empty{color:var(--mut);font-size:12px;text-align:center;padding:18px 0}
 #brainPanel{padding:14px 18px}
 .brain-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:start}
@@ -738,7 +609,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 .fi .ic{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:0 0 8px}
 .fi .ft{flex:1;min-width:0}.fi .ft .h{font-size:12px;color:var(--tx)}.fi .ft .s{font-size:11px;color:var(--mut);margin-top:2px;word-break:break-word}
 .fi .ts2{color:var(--mut);font-size:10px;white-space:nowrap}
-@media(max-width:760px){.tab{padding:8px 12px}.board{grid-template-columns:repeat(4,80vw);overflow-x:auto}.brain-grid{grid-template-columns:1fr}#boardPanel,#brainPanel{padding:10px 12px}}
+@media(max-width:760px){.tab{padding:8px 12px}.brain-grid{grid-template-columns:1fr}#brainPanel{padding:10px 12px}}
 </style></head><body class="tab-chat">
 <div class="side">
   <div class="brand"><span class="dot"></span> A2A Portal</div>
@@ -748,7 +619,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 <div class="resizer" id="sideResizer" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" tabindex="0"></div>
 <div class="scrim" id="scrim"></div>
 <div class="main">
-  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="board">Taskboard</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
+  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
   <div class="msgs" id="msgs"><div class="empty">Select a channel</div></div>
   <div class="composer">
     <input id="sendTo" autocomplete="off" spellcheck="false" aria-label="Recipient" placeholder="@agent or #topic">
@@ -759,12 +630,8 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
     <button id="sendBtn">Send</button>
     <div id="sendState" class="sendstate"></div>
   </div>
-  <div class="tabpanel" id="boardPanel">
-    <div class="board-head"><h2>Taskboard</h2><span class="board-sub">live fabric directives flowing across design · dev · ops</span></div>
-    <div class="board" id="board"></div>
-  </div>
   <div class="tabpanel" id="brainPanel">
-    <div class="brain-head"><h2>Skills &amp; Brain</h2><span class="board-sub">shared memory and the skill library the fabric learns and broadcasts</span></div>
+    <div class="brain-head"><h2>Skills &amp; Brain</h2><span class="panel-sub">the shared skills library — learned once by an agent, broadcast to the whole fleet</span></div>
     <div class="brain-grid">
       <div><div class="sec2">Skills Library <span class="cnt2" id="skillCount">0</span></div><div class="skills" id="skills"></div></div>
       <div><div class="sec2">Memory &amp; Activity</div><div class="feed" id="feed"></div></div>
@@ -775,7 +642,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
   const $=s=>document.querySelector(s)
   const LANGCHAIN_CHANNEL='${PORTAL_LANGCHAIN_CHANNEL}'
   let active=null, chans=[], presenceList=[], sendReady=false, portalAgent='', currentMsgs=[]
-  let activeTab='chat', boardData={backlog:[],in_progress:[],review:[],done:[]}, skillsData=[], feedData=[], freshSkills={}
+  let activeTab='chat', skillsData=[], feedData=[], freshSkills={}
   let langchainReady=false, langchainError='', langchainModel=''
   let renderOutput=localStorage.getItem('a2a.portal.renderOutput')==='1'
   let sendMode=localStorage.getItem('a2a.portal.sendMode')||'chat'
@@ -910,18 +777,10 @@ $('#resetContextBtn').onclick=resetChatContext
 $('#sendBody').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendNow()}})
   function activePath(){return isLangChainChannel()?'/api/langchain/messages':(active&&active[0]==='@'?'/api/dm/'+encodeURIComponent(active.slice(1)):'/api/channels/'+encodeURIComponent(active))}
   function messageTouchesActive(d){if(!active)return false;if(d.channel===active)return true;if(active[0]!=='@')return false;const peer=active.slice(1);const m=d.message||{};return d.channel==='@'+portalAgent&&m.from===peer}
-  var BOARD_COLS=[['backlog','Backlog','#7b8494'],['in_progress','In Progress','#5b8cff'],['review','Review','#f6c453'],['done','Done','#36d399']]
   function setupTabs(){document.body.classList.add('tab-chat');var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++){(function(b){b.onclick=function(){setTab(b.dataset.tab)}})(bs[i])}}
-  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-board','tab-brain');document.body.classList.add('tab-'+name);
+  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain');document.body.classList.add('tab-'+name);
     var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++)bs[i].classList.toggle('active',bs[i].dataset.tab===name);
-    closeNavOnMobile();if(name==='board')loadBoard();else if(name==='brain')loadBrain()}
-  async function loadBoard(){try{var r=await(await fetch('/api/board')).json();if(r&&r.board)boardData=r.board}catch(e){}renderBoard()}
-  function cardHtml(c){var pc=color(c.plane||'core');var prog=(c.parts>0)?(c.done+'/'+c.parts+' parts'):(c.round?'round '+c.round:'');
-    return '<div class="card" style="border-left-color:'+pc+'"><div class="dir">'+esc(c.directive||'(directive)')+'</div>'+
-      '<div class="row"><span class="plane" style="color:'+pc+'">'+esc(c.plane||'—')+'</span>'+(c.round?'<span>r'+esc(c.round)+'</span>':'')+'<span class="prog">'+esc(prog)+'</span></div></div>'}
-  function renderBoard(){var el=$('#board');if(!el)return;el.innerHTML=BOARD_COLS.map(function(col){var key=col[0],cards=boardData[key]||[];
-    var body=cards.length?cards.map(cardHtml).join(''):'<div class="col-empty">—</div>';
-    return '<div class="col"><div class="col-h"><span class="swatch" style="background:'+col[2]+'"></span>'+col[1]+'<span class="cnt">'+cards.length+'</span></div><div class="col-body">'+body+'</div></div>'}).join('')}
+    closeNavOnMobile();if(name==='brain')loadBrain()}
   async function loadBrain(){try{var r=await(await fetch('/api/skills')).json();if(r){skillsData=r.skills||[];feedData=r.feed||[]}}catch(e){}renderSkills();renderFeed()}
   function renderSkills(){var el=$('#skills');if(!el)return;var cnt=$('#skillCount');if(cnt)cnt.textContent=skillsData.length;
     if(!skillsData.length){el.innerHTML='<div class="col-empty">No skills learned yet</div>';return}
@@ -933,15 +792,12 @@ $('#sendBody').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==
   function upsertSkill(s){if(!s||!s.name)return;var i=-1;for(var k=0;k<skillsData.length;k++){if(skillsData[k].name===s.name){i=k;break}}
     if(i>=0)skillsData[i]=s;else skillsData.unshift(s);freshSkills[s.name]=Date.now()+9000;
     if(activeTab==='brain')renderSkills();setTimeout(function(){if(activeTab==='brain')renderSkills()},9200)}
-  function feedLabel(it){if(it.kind==='delivered')return {h:esc(it.plane||'fabric')+' delivered work',s:esc(it.directive||''),ic:'#36d399'};
-    if(it.kind==='learned')return {h:'Skill learned &amp; broadcast',s:esc(it.directive||'')+(it.source?' · from '+esc(it.source):''),ic:'#f6c453'};
-    return {h:'Core decision'+(it.plane?' · '+esc(it.plane):''),s:esc(it.directive||''),ic:'#5b8cff'}}
+  function feedLabel(it){return {h:'Skill learned &amp; broadcast',s:esc(it.directive||'')+(it.source?' · from '+esc(it.source):''),ic:'#f6c453'}}
   function renderFeed(){var el=$('#feed');if(!el)return;if(!feedData.length){el.innerHTML='<div class="col-empty">No activity yet</div>';return}
     el.innerHTML=feedData.slice(0,60).map(function(it){var l=feedLabel(it);
       return '<div class="fi"><span class="ic" style="background:'+l.ic+'"></span><div class="ft"><div class="h">'+l.h+'</div><div class="s">'+l.s+'</div></div><span class="ts2">'+ago(it.t)+'</span></div>'}).join('')}
 const es=new EventSource('/api/stream')
 es.onmessage=e=>{const d=JSON.parse(e.data);
-  if(d.kind==='board'){if(d.board)boardData=d.board;if(activeTab==='board')renderBoard();return}
   if(d.kind==='skill'){upsertSkill(d.skill);return}
   if(d.kind==='brain'){if(d.item){feedData.unshift(d.item);if(feedData.length>80)feedData.length=80}if(activeTab==='brain')renderFeed();return}
   if(d.kind!=='msg')return;
@@ -974,7 +830,6 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 ;(async () => {
   redis = new RedisClient(REDIS_URL)
   await persistInit(); await loadHistory()
-  await hydrateBoard()
   await startSendChannel()
   langchainAgent = new PortalLangChainAgent({
     portalAgentId: PORTAL_AGENT_ID,

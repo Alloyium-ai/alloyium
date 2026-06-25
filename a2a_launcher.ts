@@ -35,22 +35,6 @@ type ClaudeLaunchRequest = {
   policy?: { effort?: unknown; model?: unknown; turn_timeout_ms?: unknown }
 }
 
-// Keyless demo peer launch (kind=demo). Deterministic a2a fabric node — no codex,
-// no keys, no login. `role` is required; the rest wire it into the fabric roster.
-type DemoLaunchRequest = {
-  agent_id?: unknown
-  role?: unknown
-  created_by?: unknown
-  label?: unknown
-  plane?: unknown
-  pm?: unknown
-  core?: unknown
-  peers?: unknown
-  workers?: unknown
-  topics?: unknown
-  dry_run?: unknown
-}
-
 type DockerContainerSpec = {
   name: string
   image: string
@@ -69,7 +53,6 @@ const DOCKER_SOCKET = env.A2A_LAUNCH_DOCKER_SOCKET ?? '/var/run/docker.sock'
 const PROJECT = env.COMPOSE_PROJECT_NAME ?? env.A2A_LAUNCH_COMPOSE_PROJECT ?? 'alloyium'
 const CODEX_IMAGE = env.A2A_LAUNCH_CODEX_IMAGE ?? `${PROJECT}-codex-gw:latest`
 const CLAUDE_IMAGE = env.A2A_LAUNCH_CLAUDE_IMAGE ?? `${PROJECT}-claude-gw:latest`
-const DEMO_IMAGE = env.A2A_LAUNCH_DEMO_IMAGE ?? `${PROJECT}-demo-agent:latest`
 const NETWORK = env.A2A_LAUNCH_NETWORK ?? `${PROJECT}_a2a-net`
 const SECRETS_VOLUME = env.A2A_LAUNCH_SECRETS_VOLUME ?? `${PROJECT}_a2a_secrets`
 const CORE_SOURCE = env.A2A_LAUNCH_CORE_SOURCE ?? env.A2A_LAUNCH_CORE_VOLUME ?? '/run/a2a-core'
@@ -132,20 +115,6 @@ function asSafeEnvValue(value: unknown, maxLen = 128): string | undefined {
 function asPositiveInteger(value: unknown): number | undefined {
   if (!Number.isInteger(value) || value <= 0) return undefined
   return value
-}
-
-function asDemoRole(value: unknown): 'core' | 'pm' | 'worker' | null {
-  return value === 'core' || value === 'pm' || value === 'worker' ? value : null
-}
-
-// A comma list of ids / topic tokens (e.g. "pm-design,pm-dev"). Validated to the
-// same charset as agent ids so nothing unexpected reaches the container env.
-function asCommaList(value: unknown, maxLen = 512): string | undefined {
-  if (value == null || value === '') return undefined
-  if (typeof value !== 'string' || value.length > maxLen) return undefined
-  const parts = value.split(',').map((s) => s.trim()).filter(Boolean)
-  if (!parts.length || !parts.every((p) => AGENT_ID_RE.test(p))) return undefined
-  return parts.join(',')
 }
 
 function envPair(k: string, v: string | number | boolean | undefined): string | null {
@@ -361,70 +330,6 @@ export function buildClaudeContainerSpec(req: {
   }
 }
 
-// Keyless demo peer (kind=demo): mirrors the codex spec shape but carries only the
-// channel identity + DEMO_* fabric wiring — no codex CLI, model, sandbox, or homes.
-export function buildDemoContainerSpec(req: {
-  agentId: string
-  role: 'core' | 'pm' | 'worker'
-  createdBy: string
-  label?: string
-  plane?: string
-  pm?: string
-  core?: string
-  peers?: string
-  workers?: string
-  topics?: string
-}): DockerContainerSpec {
-  const name = `cc-agent-${req.agentId}`
-  const labels: Record<string, string> = {
-    'ai.alloyium.managed': 'true',
-    'ai.alloyium.kind': 'demo',
-    'ai.alloyium.agent_id': req.agentId,
-    'ai.alloyium.created_by': req.createdBy,
-  }
-  if (req.label) labels['ai.alloyium.label'] = req.label
-
-  const envList = [
-    envPair('NATS_URL', NATS_URL),
-    envPair('REDIS_URL', REDIS_URL),
-    envPair('LOG_LEVEL', env.LOG_LEVEL ?? 'info'),
-    envPair('A2A_ENABLED', '1'),
-    envPair('A2A_AGENT_ID', req.agentId),
-    envPair('A2A_SIG_ALG', 'ed25519'),
-    envPair('A2A_SIGNING_KEY', `/run/secrets/a2a/${req.agentId}.seed`),
-    envPair('A2A_TRANSPORT_AUTH', 'none'),
-    envPair('A2A_MAX_SEND_BYTES', env.A2A_MAX_SEND_BYTES ?? '8192'),
-    envPair('A2A_PARENT_AGENT_ID', req.createdBy),
-    envPair('DEMO_ROLE', req.role),
-    envPair('DEMO_PLANE', req.plane),
-    envPair('DEMO_PM', req.pm),
-    envPair('DEMO_CORE', req.core),
-    envPair('DEMO_PEERS', req.peers),
-    envPair('DEMO_WORKERS', req.workers),
-    envPair('DEMO_TOPICS', req.topics),
-  ].filter((x): x is string => !!x)
-
-  return {
-    name,
-    image: DEMO_IMAGE,
-    body: {
-      Image: DEMO_IMAGE,
-      Cmd: ['bun', 'demo_agent.ts'],
-      User: CONTAINER_USER,
-      WorkingDir: '/app',
-      Env: envList,
-      Labels: labels,
-      HostConfig: {
-        Binds: [`${SECRETS_VOLUME}:/run/secrets/a2a:ro`],
-        RestartPolicy: { Name: 'unless-stopped' },
-      },
-      NetworkingConfig: {
-        EndpointsConfig: { [NETWORK]: {} },
-      },
-    },
-  }
-}
-
 export function launcherRequestAuthorized(req: Request, token = LAUNCHER_TOKEN): boolean {
   if (!token) return false
   const auth = req.headers.get('authorization') ?? ''
@@ -604,53 +509,6 @@ async function handleClaudeLaunch(input: ClaudeLaunchRequest): Promise<Response>
   return json({ ok: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'claude', provider: 'docker', runtime_id: runtime.runtimeId, status: state })
 }
 
-async function handleDemoLaunch(input: DemoLaunchRequest): Promise<Response> {
-  const agentId = asAgentId(input.agent_id)
-  if (!agentId) return err('bad_agent_id')
-  const createdBy = asCreatedBy(input.created_by)
-  if (!createdBy) return err('bad_created_by')
-  if (!allowed.has(createdBy)) return err('unauthorized', 403)
-  if (agentId === createdBy) return err('self_launch_refused')
-  const role = asDemoRole(input.role)
-  if (!role) return err('bad_role')
-  const label = asLabel(input.label)
-  const dryRun = input.dry_run === true
-  const plane = asSafeEnvValue(input.plane, 64)
-  const pm = asAgentId(input.pm) ?? undefined
-  const core = asAgentId(input.core) ?? undefined
-  const peers = asCommaList(input.peers)
-  const workers = asCommaList(input.workers)
-  const topics = asCommaList(input.topics)
-
-  if (PROVIDER !== 'docker') return err('unsupported_provider', 500, PROVIDER)
-  const spec = buildDemoContainerSpec({ agentId, role, createdBy, label, plane, pm, core, peers, workers, topics })
-  if (dryRun) {
-    return json({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'demo', role, provider: 'docker', runtime_id: spec.name, status: 'planned', container: spec })
-  }
-
-  const identity = await onboard({ id: agentId, dir: SECRETS_DIR, redis: getRedis(), transport: 'none', natsUrl: NATS_URL, redisUrl: REDIS_URL, verify: true })
-  if (identity.verified === false) return err('identity_verify_failed', 500)
-  chownIdentityFiles(identity.files)
-
-  const runtime = await ensureDockerRuntime(spec)
-  if (!runtime.ok) return err(runtime.error, 500, runtime.detail)
-  const ready = await waitPresence(agentId, PRESENCE_WAIT_MS)
-  const state = ready ? 'ready' : runtime.status
-  await recordLaunch(agentId, {
-    agent_id: agentId,
-    kind: 'demo',
-    role,
-    provider: 'docker',
-    runtime_id: runtime.runtimeId,
-    status: state,
-    created_by: createdBy,
-    label,
-    updated_at: new Date().toISOString(),
-  })
-  log('demo_agent_launched', { agent_id: agentId, role, created_by: createdBy, runtime_id: runtime.runtimeId, status: state })
-  return json({ ok: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'demo', role, provider: 'docker', runtime_id: runtime.runtimeId, status: state })
-}
-
 export function startLauncher(): void {
   Bun.serve({
     hostname: HOSTNAME,
@@ -668,11 +526,6 @@ export function startLauncher(): void {
         let body: ClaudeLaunchRequest
         try { body = await req.json() } catch { return err('bad_json') }
         try { return await handleClaudeLaunch(body) } catch (e) { return err('launcher_error', 500, e instanceof Error ? e.message : String(e)) }
-      }
-      if (url.pathname === '/v1/agents/demo' && req.method === 'POST') {
-        let body: DemoLaunchRequest
-        try { body = await req.json() } catch { return err('bad_json') }
-        try { return await handleDemoLaunch(body) } catch (e) { return err('launcher_error', 500, e instanceof Error ? e.message : String(e)) }
       }
       const m = url.pathname.match(/^\/v1\/agents\/([a-z0-9-]{1,64})$/)
       if (m && req.method === 'GET') {

@@ -12,69 +12,6 @@ x-a2a-core-run-bind: &a2a-core-run-bind
   bind:
     create_host_path: true
 
-# ── Keyless demo-fleet building blocks (shared by the core/PM/worker roster) ────
-# One image (built once, reused by every demo service + the onboarding one-shots)
-# so the launcher's `${PROJECT}-demo-agent:latest` resolves to exactly this build.
-x-demo-build: &demo-build
-  context: .
-  dockerfile: docker/demo-agent/Dockerfile
-
-x-demo-image: &demo-image "alloyium-demo-agent:latest"
-
-# Common env for every demo peer: keyless (transport none + ed25519 signing on),
-# with generous send-rate headroom so the scripted fabric never self-throttles.
-x-demo-env: &demo-env
-  <<: *cc-env
-  A2A_ENABLED: "1"
-  A2A_SIG_ALG: ed25519
-  A2A_TRANSPORT_AUTH: none
-  A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
-  A2A_SEND_RATE_PER_MIN: ${DEMO_SEND_RATE_PER_MIN:-240}
-  A2A_SEND_RATE_PER_PEER_PER_MIN: ${DEMO_SEND_RATE_PER_PEER_PER_MIN:-120}
-  DEMO_TICK_MS: ${DEMO_TICK_MS:-25000}
-  DEMO_WORK_MS: ${DEMO_WORK_MS:-3000}
-  DEMO_BEAT_MS: ${DEMO_BEAT_MS:-15000}
-
-# A demo peer is "up" once it holds its Redis presence key (claimed by A2AChannel).
-x-demo-presence-health: &demo-presence-health
-  test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
-  interval: 10s
-  timeout: 3s
-  retries: 18
-  start_period: 20s
-
-# One-shot that mints a demo peer's ed25519 signing key (reuses the onboard pattern;
-# id comes from A2A_AGENT_ID so the body stays identical across the whole roster).
-x-demo-onboard: &demo-onboard
-  image: *demo-image
-  build: *demo-build
-  user: root
-  networks:
-    - a2a-net
-  volumes:
-    - a2a_secrets:/run/secrets/a2a
-  depends_on:
-    redis:
-      condition: service_healthy
-  restart: "no"
-  command:
-    - sh
-    - -lc
-    - |
-      mkdir -p /run/secrets/a2a
-      chown -R bun:bun /run/secrets/a2a
-      exec su bun -s /bin/sh -c 'bun onboard.ts "$${A2A_AGENT_ID}" --transport none --dir /run/secrets/a2a --redis "$${REDIS_URL}" --nats "$${NATS_URL}"'
-
-x-demo-agent: &demo-agent
-  image: *demo-image
-  build: *demo-build
-  networks:
-    - a2a-net
-  volumes:
-    - a2a_secrets:/run/secrets/a2a:ro
-  restart: unless-stopped
-  command: ["bun", "demo_agent.ts"]
-
 services:
   nats:
     # Core path (no profile = started by a plain `docker compose up`).
@@ -230,7 +167,6 @@ services:
         exec gosu bun:bun bun a2a_portal.ts
 
   onboard-codex-gw:
-    profiles: ["gateways"]
     build:
       context: .
       dockerfile: docker/bun/Dockerfile
@@ -254,7 +190,6 @@ services:
         exec su bun -s /bin/sh -c 'bun onboard.ts codex-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
 
   onboard-claude-gw:
-    profiles: ["gateways"]
     build:
       context: .
       dockerfile: docker/bun/Dockerfile
@@ -372,7 +307,6 @@ services:
       A2A_LAUNCH_ALLOWED_IDS: ${A2A_LAUNCH_ALLOWED_IDS:-codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops}
       A2A_LAUNCH_CODEX_IMAGE: ${A2A_LAUNCH_CODEX_IMAGE:-alloyium-codex-gw:latest}
       A2A_LAUNCH_CLAUDE_IMAGE: ${A2A_LAUNCH_CLAUDE_IMAGE:-alloyium-claude-gw:latest}
-      A2A_LAUNCH_DEMO_IMAGE: ${A2A_LAUNCH_DEMO_IMAGE:-alloyium-demo-agent:latest}
       A2A_LAUNCH_NETWORK: ${A2A_LAUNCH_NETWORK:-alloyium_a2a-net}
       A2A_LAUNCH_SECRETS_VOLUME: ${A2A_LAUNCH_SECRETS_VOLUME:-alloyium_a2a_secrets}
       A2A_LAUNCH_CORE_SOURCE: ${A2A_CORE_RUN_HOST_PATH:-/run/a2a-core}
@@ -502,7 +436,6 @@ services:
     command: ["bun", "taskboard_event_dispatcher.ts"]
 
   codex-gw:
-    profiles: ["gateways"]
     build:
       context: .
       dockerfile: docker/gateway-codex/Dockerfile
@@ -564,7 +497,6 @@ services:
     command: ["bun", "codex_gateway.ts"]
 
   claude-gw:
-    profiles: ["gateways"]
     build:
       context: .
       dockerfile: docker/gateway-claude/Dockerfile
@@ -629,291 +561,6 @@ services:
       redis:
         condition: service_healthy
     command: ["bun", "run", "selftest"]
-
-  # ── Keyless demo fleet (CORE PATH — no profile, up on a plain `docker compose up`) ──
-  # A deterministic a2a peer fabric: 1 Core + 3 Project-Managers (design/dev/ops) +
-  # 6 Workers (2 per PM). No API keys, no login. The Core dispatches direction to the
-  # PMs, each PM fans the work out to its workers, the workers report completion back
-  # up, and a worker broadcasts a learned skill — all visible in the portal (presence,
-  # plane traffic, skills). The real gateways (codex-gw, launcher, …) stay behind their
-  # existing profiles, untouched.
-
-  seed-planes:
-    # One-shot: seed the six product topic planes into Redis membership (core in all
-    # planes; each PM + its workers in their own plane). Demo peers also self-join at
-    # boot, so this is the authoritative pre-seed and a guard against the join race.
-    image: *demo-image
-    build: *demo-build
-    environment:
-      <<: *cc-env
-    networks:
-      - a2a-net
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: "no"
-    command:
-      - sh
-      - -lc
-      - |
-        set -e
-        rc() { redis-cli -u "$${REDIS_URL}" "$@" >/dev/null; }
-        rc SET alloyium:a2a:topics:core '["design","research","data","dev","qa","ops"]'
-        rc SET alloyium:a2a:topics:pm-design '["design"]'
-        rc SET alloyium:a2a:topics:pm-dev '["dev"]'
-        rc SET alloyium:a2a:topics:pm-ops '["ops"]'
-        rc SET alloyium:a2a:topics:worker-design-1 '["design"]'
-        rc SET alloyium:a2a:topics:worker-design-2 '["design"]'
-        rc SET alloyium:a2a:topics:worker-dev-1 '["dev"]'
-        rc SET alloyium:a2a:topics:worker-dev-2 '["dev"]'
-        rc SET alloyium:a2a:topics:worker-ops-1 '["ops"]'
-        rc SET alloyium:a2a:topics:worker-ops-2 '["ops"]'
-        echo "seeded six topic planes (design research data dev qa ops)"
-
-  # ---- Core ------------------------------------------------------------------------
-  onboard-demo-core:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: core
-  demo-core:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: core
-      A2A_SIGNING_KEY: /run/secrets/a2a/core.seed
-      DEMO_ROLE: core
-      DEMO_PEERS: pm-design,pm-dev,pm-ops
-      DEMO_TOPICS: design,research,data,dev,qa,ops
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-core:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  # ---- Project-Managers (design / dev / ops) ---------------------------------------
-  onboard-demo-pm-design:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: pm-design
-  demo-pm-design:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: pm-design
-      A2A_SIGNING_KEY: /run/secrets/a2a/pm-design.seed
-      DEMO_ROLE: pm
-      DEMO_PLANE: design
-      DEMO_WORKERS: worker-design-1,worker-design-2
-      DEMO_CORE: core
-      DEMO_TOPICS: design
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-pm-design:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-pm-dev:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: pm-dev
-  demo-pm-dev:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: pm-dev
-      A2A_SIGNING_KEY: /run/secrets/a2a/pm-dev.seed
-      DEMO_ROLE: pm
-      DEMO_PLANE: dev
-      DEMO_WORKERS: worker-dev-1,worker-dev-2
-      DEMO_CORE: core
-      DEMO_TOPICS: dev
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-pm-dev:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-pm-ops:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: pm-ops
-  demo-pm-ops:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: pm-ops
-      A2A_SIGNING_KEY: /run/secrets/a2a/pm-ops.seed
-      DEMO_ROLE: pm
-      DEMO_PLANE: ops
-      DEMO_WORKERS: worker-ops-1,worker-ops-2
-      DEMO_CORE: core
-      DEMO_TOPICS: ops
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-pm-ops:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  # ---- Workers (2 per PM) ----------------------------------------------------------
-  onboard-demo-worker-design-1:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-design-1
-  demo-worker-design-1:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-design-1
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-design-1.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: design
-      DEMO_PM: pm-design
-      DEMO_TOPICS: design
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-design-1:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-worker-design-2:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-design-2
-  demo-worker-design-2:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-design-2
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-design-2.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: design
-      DEMO_PM: pm-design
-      DEMO_TOPICS: design
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-design-2:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-worker-dev-1:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-dev-1
-  demo-worker-dev-1:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-dev-1
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-dev-1.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: dev
-      DEMO_PM: pm-dev
-      DEMO_TOPICS: dev
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-dev-1:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-worker-dev-2:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-dev-2
-  demo-worker-dev-2:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-dev-2
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-dev-2.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: dev
-      DEMO_PM: pm-dev
-      DEMO_TOPICS: dev
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-dev-2:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-worker-ops-1:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-ops-1
-  demo-worker-ops-1:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-ops-1
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-ops-1.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: ops
-      DEMO_PM: pm-ops
-      DEMO_TOPICS: ops
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-ops-1:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
-
-  onboard-demo-worker-ops-2:
-    <<: *demo-onboard
-    environment:
-      <<: *cc-env
-      A2A_AGENT_ID: worker-ops-2
-  demo-worker-ops-2:
-    <<: *demo-agent
-    environment:
-      <<: *demo-env
-      A2A_AGENT_ID: worker-ops-2
-      A2A_SIGNING_KEY: /run/secrets/a2a/worker-ops-2.seed
-      DEMO_ROLE: worker
-      DEMO_PLANE: ops
-      DEMO_PM: pm-ops
-      DEMO_TOPICS: ops
-    depends_on:
-      a2a-core:
-        condition: service_healthy
-      seed-planes:
-        condition: service_completed_successfully
-      onboard-demo-worker-ops-2:
-        condition: service_completed_successfully
-    healthcheck: *demo-presence-health
 
 networks:
   # Docker auto-assigns a free subnet so the stack can run standalone alongside
