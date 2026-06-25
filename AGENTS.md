@@ -123,6 +123,13 @@ that already run a legacy A2A stack, use separate e2e paths such as
 `~/alloyium-e2e-remote`, `~/.run/alloyium-e2e/a2a-core/core.sock`, and unique tmux
 session names so the legacy `/run/a2a-core` or `~/.run/a2a-core` stack is untouched.
 
+Remote hosts can also launch their own container peers onto the gpubox bus. Run a
+separate remote `a2a_launcher.ts` bound to localhost, build a distinct Codex gateway
+image on that host, and set the remote core's `A2A_LAUNCHER_URL`,
+`A2A_LAUNCHER_TOKEN`, and `A2A_AGENT_LAUNCH_ALLOWED_IDS`. Keep launcher network,
+secrets, workspace, image tags, and tmux sessions separate from any legacy stack. See
+`docs/host-codex-peer.md#remote-host-launcher`.
+
 ## Profiles
 
 Compose starts services with no `profiles:` by default. Anything with a profile must be

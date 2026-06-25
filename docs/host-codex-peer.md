@@ -319,6 +319,179 @@ Then check the DM:
 curl -fsS http://127.0.0.1:8901/api/dm/host-ops-gw-e2e-srv01 | grep PONG_SRV01_E2E
 ```
 
+## Remote Host Launcher
+
+A remote host peer can also launch container peers on that remote host while those peers
+join the gpubox A2A bus. Keep this isolated from any legacy stack on the remote server:
+use a separate Docker image tag, network, secrets path, workspace volume, core socket,
+and tmux session names.
+
+Only gpubox needs LAN-exposed bus ports:
+
+- NATS: `<gpubox-lan-ip>:4222`
+- Redis: `<gpubox-lan-ip>:16379`
+
+The remote launcher's HTTP API should stay local to the remote host, for example
+`127.0.0.1:18910`. Do not expose it on the LAN unless you add an outer access-control
+layer.
+
+On the remote host, build a distinct Codex gateway image from the e2e clone:
+
+```bash
+cd "$HOME/alloyium-e2e-remote"
+
+bun install --frozen-lockfile
+
+docker build \
+  -f docker/gateway-codex/Dockerfile \
+  -t alloyium-e2e-remote-codex-gw:latest \
+  --build-arg CC_UID="$(id -u)" \
+  --build-arg CC_GID="$(id -g)" \
+  .
+```
+
+Prepare isolated runtime resources:
+
+```bash
+mkdir -p \
+  "$HOME/alloyium-e2e-remote/a2a-launch-secrets" \
+  "$HOME/alloyium-e2e-remote/data/workspace" \
+  "$HOME/.local/state/alloyium/e2e-launcher-gpubox" \
+  "$HOME/logs"
+
+chmod 700 "$HOME/alloyium-e2e-remote/a2a-launch-secrets"
+
+docker network inspect alloyium-e2e-remote_a2a-net >/dev/null 2>&1 \
+  || docker network create alloyium-e2e-remote_a2a-net >/dev/null
+
+docker volume inspect alloyium-e2e-remote_codex_workspaces >/dev/null 2>&1 \
+  || docker volume create alloyium-e2e-remote_codex_workspaces >/dev/null
+```
+
+Create the remote launcher wrapper:
+
+```bash
+cat > "$HOME/restart-alloyium-e2e-launcher-gpubox.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${ALLOYIUM_E2E_ROOT:-$HOME/alloyium-e2e-remote}"
+TOKEN_FILE="${A2A_LAUNCHER_TOKEN_FILE:-$HOME/.local/state/alloyium/e2e-launcher-gpubox/token}"
+CORE_DIR="${A2A_CORE_DIR:-$HOME/.run/alloyium-e2e/a2a-core}"
+WORKSPACE_DIR="${A2A_WORKSPACE_HOST_PATH:-$ROOT/data/workspace}"
+SECRETS_DIR="${A2A_LAUNCH_SECRETS_DIR:-$ROOT/a2a-launch-secrets}"
+
+mkdir -p "$(dirname "$TOKEN_FILE")" "$SECRETS_DIR" "$WORKSPACE_DIR" "$HOME/logs"
+chmod 700 "$SECRETS_DIR"
+if [ ! -s "$TOKEN_FILE" ]; then
+  umask 077
+  openssl rand -hex 32 > "$TOKEN_FILE"
+fi
+
+cd "$ROOT"
+
+export PATH="$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export NATS_URL="${NATS_URL:-nats://<gpubox-lan-ip>:4222}"
+export REDIS_URL="${REDIS_URL:-redis://<gpubox-lan-ip>:16379}"
+export A2A_LAUNCHER_HOST="${A2A_LAUNCHER_HOST:-127.0.0.1}"
+export A2A_LAUNCHER_PORT="${A2A_LAUNCHER_PORT:-18910}"
+export A2A_LAUNCHER_TOKEN="$(tr -d '\n' < "$TOKEN_FILE")"
+export A2A_LAUNCH_PROVIDER="${A2A_LAUNCH_PROVIDER:-docker}"
+export A2A_LAUNCH_ALLOWED_IDS="${A2A_LAUNCH_ALLOWED_IDS:-host-ops-gw-e2e-srv01}"
+export A2A_LAUNCH_COMPOSE_PROJECT="${A2A_LAUNCH_COMPOSE_PROJECT:-alloyium-e2e-remote}"
+export A2A_LAUNCH_CODEX_IMAGE="${A2A_LAUNCH_CODEX_IMAGE:-alloyium-e2e-remote-codex-gw:latest}"
+export A2A_LAUNCH_NETWORK="${A2A_LAUNCH_NETWORK:-alloyium-e2e-remote_a2a-net}"
+export A2A_LAUNCH_SECRETS_DIR="$SECRETS_DIR"
+export A2A_LAUNCH_SECRETS_VOLUME="$SECRETS_DIR"
+export A2A_LAUNCH_CORE_SOURCE="$CORE_DIR"
+export A2A_LAUNCH_WORKSPACES_VOLUME="${A2A_LAUNCH_WORKSPACES_VOLUME:-alloyium-e2e-remote_codex_workspaces}"
+export A2A_LAUNCH_PROJECT_DIR="$ROOT"
+export A2A_LAUNCH_WORKSPACE_HOST_PATH="$WORKSPACE_DIR"
+export A2A_LAUNCH_WORKSPACE_CONTAINER_PATH="${A2A_LAUNCH_WORKSPACE_CONTAINER_PATH:-/workspace}"
+export A2A_LAUNCH_PRESENCE_WAIT_MS="${A2A_LAUNCH_PRESENCE_WAIT_MS:-30000}"
+export A2A_LAUNCH_CONTAINER_USER="${A2A_LAUNCH_CONTAINER_USER:-$(id -u):$(id -g)}"
+export CODEX_HOST_HOME="${CODEX_HOST_HOME:-$HOME/.codex}"
+export CODEX_SSH_DIR="${CODEX_SSH_DIR:-$HOME/.ssh}"
+export CODEX_WORKSPACE_ROOT="${CODEX_WORKSPACE_ROOT:-$HOME/git}"
+export CODEX_BUILD_CWD_ROOTS="${CODEX_BUILD_CWD_ROOTS:-/workspace,$HOME/git,$ROOT}"
+export CODEX_GW_ALLOW_WRITE="${CODEX_GW_ALLOW_WRITE:-1}"
+export CODEX_GW_WRITE_ALLOWLIST="${CODEX_GW_WRITE_ALLOWLIST:-dev-pm,agent-1,a2a-portal,host-ops-gw-e2e-srv01}"
+export CODEX_GW_CODEX_SANDBOX="${CODEX_GW_CODEX_SANDBOX:-danger-full-access}"
+export CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX="${CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX:-workspace-write}"
+export BRAIN_URL="${BRAIN_URL:-}"
+export KAI_HTTP_URL="${KAI_HTTP_URL:-}"
+export KAI_WS_URL="${KAI_WS_URL:-}"
+export KAI_TOKEN_PATH="${KAI_TOKEN_PATH:-}"
+export LOG_LEVEL="${LOG_LEVEL:-info}"
+
+docker network inspect "$A2A_LAUNCH_NETWORK" >/dev/null 2>&1 || docker network create "$A2A_LAUNCH_NETWORK" >/dev/null
+docker volume inspect "$A2A_LAUNCH_WORKSPACES_VOLUME" >/dev/null 2>&1 || docker volume create "$A2A_LAUNCH_WORKSPACES_VOLUME" >/dev/null
+
+exec bun a2a_launcher.ts 2>&1 | tee -a "$HOME/logs/alloyium-e2e-launcher-gpubox.log"
+EOF
+
+chmod 700 "$HOME/restart-alloyium-e2e-launcher-gpubox.sh"
+tmux new-session -d -s e2e-gpubox-launcher-srv01 "$HOME/restart-alloyium-e2e-launcher-gpubox.sh"
+curl -fsS http://127.0.0.1:18910/readyz
+```
+
+Expose the launcher tool through the remote core. Add these lines to the remote core
+wrapper before `exec bun a2a_core.ts`:
+
+```bash
+TOKEN_FILE="${A2A_LAUNCHER_TOKEN_FILE:-$HOME/.local/state/alloyium/e2e-launcher-gpubox/token}"
+mkdir -p "$(dirname "$TOKEN_FILE")"
+if [ ! -s "$TOKEN_FILE" ]; then
+  umask 077
+  openssl rand -hex 32 > "$TOKEN_FILE"
+fi
+
+export A2A_LAUNCHER_URL="${A2A_LAUNCHER_URL:-http://127.0.0.1:18910}"
+export A2A_LAUNCHER_TOKEN="$(tr -d '\n' < "$TOKEN_FILE")"
+export A2A_AGENT_LAUNCH_ALLOWED_IDS="${A2A_AGENT_LAUNCH_ALLOWED_IDS:-host-ops-gw-e2e-srv01}"
+export A2A_AGENT_LAUNCH_MODE="${A2A_AGENT_LAUNCH_MODE:-shim}"
+export A2A_AGENT_LAUNCH_TIMEOUT_MS="${A2A_AGENT_LAUNCH_TIMEOUT_MS:-120000}"
+```
+
+Then restart the remote e2e core and host peer:
+
+```bash
+tmux kill-session -t e2e-gpubox-core-srv01 2>/dev/null || true
+rm -f "$HOME/.run/alloyium-e2e/a2a-core/core.sock"
+tmux new-session -d -s e2e-gpubox-core-srv01 "$HOME/restart-alloyium-e2e-core-gpubox.sh"
+
+tmux kill-session -t e2e-host-ops-srv01-1 2>/dev/null || true
+tmux new-session -d -s e2e-host-ops-srv01-1 "$HOME/restart-host-ops-gw-e2e-srv01.sh"
+```
+
+If the peer was restarted abruptly and Redis still has stale presence, wait for the TTL
+or delete only that exact presence key:
+
+```bash
+redis-cli -h <gpubox-lan-ip> -p 16379 TTL alloyium:a2a:presence:host-ops-gw-e2e-srv01
+redis-cli -h <gpubox-lan-ip> -p 16379 DEL alloyium:a2a:presence:host-ops-gw-e2e-srv01
+```
+
+Verify launch from gpubox through the portal:
+
+```bash
+curl -fsS http://127.0.0.1:8901/api/send \
+  -H 'content-type: application/json' \
+  -d '{"to":"host-ops-gw-e2e-srv01","type":"request","send_mode":"one-off","body":"Use your a2a_launch_codex_agent tool now. Launch a persistent Codex peer with agent_id exactly codex-srv01-launched-1, label srv01-launch, mode shim. Reply with JSON containing ok, agent_id, status, and runtime_id."}'
+
+curl -fsS http://127.0.0.1:8901/api/presence | grep codex-srv01-launched-1
+```
+
+Verify the remote-created node replies on the gpubox bus:
+
+```bash
+curl -fsS http://127.0.0.1:8901/api/send \
+  -H 'content-type: application/json' \
+  -d '{"to":"codex-srv01-launched-1","type":"request","send_mode":"one-off","body":"Reply with exactly: PONG_FROM_SRV01_LAUNCHED_1"}'
+
+curl -fsS http://127.0.0.1:8901/api/dm/codex-srv01-launched-1 | grep PONG_FROM_SRV01_LAUNCHED_1
+```
+
 ## Notes
 
 - The outer `codex_gateway.ts` joins the bus through NATS/Redis.
