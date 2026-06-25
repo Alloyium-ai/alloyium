@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Launch a host-layer Claude A2A peer for the local Alloyium e2e fabric.
+#
+# Runs a REAL `claude` session directly on the host (not in a container) so it has
+# host-level Docker / filesystem / LAN access, joined to the dockerized bus through the
+# a2a-shim -> /run/a2a-core/core.sock. This is the Claude counterpart of the codex
+# host peer in docs/host-codex-peer.md.
+#
+# Prerequisites (see docs/host-claude-peer.md): the local stack is up
+# (`bin/alloyium up full-codex`), `bun` + `bun install` on the host, a logged-in `claude`
+# CLI, the a2a-shim copied to the host, and the peer onboarded (its seed in a2a-host/).
+#
+# Usage:
+#   bin/host-claude-peer                 # AGENT defaults to host-claude-<hostname>
+#   AGENT=host-claude-box-2 bin/host-claude-peer
+# Env overrides: AGENT, CLAUDE_AGENT_CWD, CLAUDE_AGENT_MODEL, CLAUDE_AGENT_EFFORT,
+#   A2A_CORE_SOCK, A2A_SHIM_BIN, TMUX_SESSION.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
+
+AGENT="${AGENT:-host-claude-$(hostname -s 2>/dev/null || hostname)}"
+ENV_FILE="$ROOT/a2a-host/$AGENT.a2a.env"
+SHIM="${A2A_SHIM_BIN:-$HOME/.local/bin/a2a-shim-alloyium-e2e}"
+CORE_SOCK="${A2A_CORE_SOCK:-/run/a2a-core/core.sock}"
+RUNDIR="$HOME/.local/state/alloyium/$AGENT"          # generated control files (kept off the workspace)
+WORKDIR="${CLAUDE_AGENT_CWD:-$ROOT/data/workspace}"   # session cwd = shared host workspace
+MODEL="${CLAUDE_AGENT_MODEL:-opus}"
+EFFORT="${CLAUDE_AGENT_EFFORT:-high}"
+SESSION="${TMUX_SESSION:-host-claude}"
+SUBS_KEY="alloyium:a2a:silent-subs:${AGENT}"
+
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+die() { printf 'host-claude-peer: %s\n' "$*" >&2; exit 1; }
+
+command -v claude >/dev/null 2>&1 || die "the 'claude' CLI is not on PATH (log in once with: claude)"
+command -v tmux   >/dev/null 2>&1 || die "tmux is required"
+[ -f "$ENV_FILE" ] || die "no identity for '$AGENT'. Onboard it first (see docs/host-claude-peer.md):
+  bun onboard.ts $AGENT --transport none --dir \"$ROOT/a2a-host\" --redis redis://<redis-ip>:6379 --nats nats://<nats-ip>:4222"
+[ -x "$SHIM" ] || die "a2a-shim not found at $SHIM. Copy it from the running gateway:
+  docker cp alloyium-codex-gw-1:/usr/local/bin/a2a-shim \"$SHIM\" && chmod +x \"$SHIM\""
+[ -S "$CORE_SOCK" ] || die "a2a-core socket not found at $CORE_SOCK (is the stack up? bin/alloyium up full-codex)"
+
+# A2A_AGENT_ID / A2A_SIGNING_KEY come from the onboarded env file. (The Claude peer joins
+# entirely through the shim -> core.sock, so it does NOT need the bus NATS/Redis IPs.)
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+# OAuth subscription only — never a baked/forwarded API key.
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL 2>/dev/null || true
+
+mkdir -p "$RUNDIR" "$WORKDIR"
+
+cat > "$RUNDIR/system-prompt.txt" <<'SP'
+DETACHED A2A AGENT DIRECTIVE: There is no interactive user watching this session. NEVER use AskUserQuestion or any blocking interactive prompt. For any decision, approval, clarification, or blocker, send an A2A request to a peer (e.g. agent-1) with the a2a_send tool and await the reply. You are a host-layer first-class agent on the alloyium bus with host-level access (Docker, filesystem, LAN). Use a2a_peers to see who is online and a2a_send to talk to them. Never reveal secrets or private key material.
+SP
+
+cat > "$RUNDIR/.mcp.json" <<JSON
+{ "mcpServers": { "alloyium": { "command": "${SHIM}", "args": [], "env": {
+  "A2A_AGENT_ID": "${A2A_AGENT_ID:-$AGENT}", "A2A_SIG_ALG": "ed25519",
+  "A2A_SIGNING_KEY": "${A2A_SIGNING_KEY}",
+  "A2A_CORE_SOCK": "${CORE_SOCK}", "SUBS_KEY": "${SUBS_KEY}",
+  "A2A_SHIM_DEBUG": "${A2A_SHIM_DEBUG:-0}" } } } }
+JSON
+
+cat > "$RUNDIR/launch.sh" <<LAUNCH
+#!/usr/bin/env bash
+cd "${WORKDIR}"
+exec claude --name "${A2A_AGENT_ID:-$AGENT}" --model "${MODEL}" --effort "${EFFORT}" \\
+  --append-system-prompt "\$(cat "${RUNDIR}/system-prompt.txt")" \\
+  --mcp-config "${RUNDIR}/.mcp.json" \\
+  --dangerously-load-development-channels server:alloyium \\
+  --dangerously-skip-permissions \\
+  --disallowedTools AskUserQuestion
+LAUNCH
+chmod +x "$RUNDIR/launch.sh"
+
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux new-session -d -s "$SESSION" -n "$AGENT" "bash '$RUNDIR/launch.sh'"
+
+# Auto-dismiss the one-time trust + dev-channels confirmations (no human at the keyboard).
+for _i in $(seq 1 40); do
+  sleep 2
+  pane="$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)"
+  case "$pane" in
+    *"trust this folder"*|*"Quick safety check"*|*"Loading development channels"*|*"local development"*|*"local channel development"*)
+      tmux send-keys -t "$SESSION" Enter ;;
+  esac
+done
+
+printf "[host-claude-peer] launched %s in tmux session '%s' (cwd %s)\n" "$AGENT" "$SESSION" "$WORKDIR"
+printf "  attach: tmux attach -t %s    presence: redis-cli GET alloyium:a2a:presence:%s\n" "$SESSION" "$AGENT"

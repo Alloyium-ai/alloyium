@@ -129,6 +129,24 @@ image on that host, and set the remote core's `A2A_LAUNCHER_URL`,
 `A2A_LAUNCHER_TOKEN`, and `A2A_AGENT_LAUNCH_ALLOWED_IDS`. Keep launcher network,
 secrets, workspace, image tags, and tmux sessions separate from any legacy stack. See
 `docs/host-codex-peer.md#remote-host-launcher`.
+## Host-Layer Claude Peer
+
+The Claude counterpart of the codex host peer — a real `claude` session on the host with
+host-level access, joined to the bus. Use a distinct identity such as
+`host-claude-<hostname>`.
+
+Unlike the codex host peer, the Claude peer joins the bus **only** through the a2a-shim →
+`/run/a2a-core/core.sock` (a2a-core holds the shared NATS/Redis connections and registers
+its presence/inbox), so the launcher needs no bus IPs. Onboard the identity, then run the
+committed wrapper:
+
+```bash
+bin/host-claude-peer
+```
+
+Follow `docs/host-claude-peer.md`. Generated host identity files live under `a2a-host/`
+and must never be committed. To run multiple peers, onboard a unique `AGENT` and launch
+each with a distinct `TMUX_SESSION`.
 
 ## Profiles
 
