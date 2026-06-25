@@ -9,7 +9,8 @@ their `git clone`s / edits land back on the host.
 - **Host path:** `${A2A_WORKSPACE_HOST_PATH:-./data/workspace}` (repo-relative; inherits the
   `data/` gitignore).
 - **In-container path:** `/workspace` (same in every agent that gets it).
-- **Mounted into:** `codex-gw`, `codex-gw-b`, `claude-agent`, `claude-agent-b`.
+- **Mounted into:** `codex-gw`, `codex-gw-b`, `claude-agent`, `claude-agent-b`,
+  and launcher-spawned `kind=codex` peers when the launcher profile is enabled.
   - **Not** `claude-gw` (pure inference — no tools, can't touch files) or `a2a-core`
     (bus multiplexer) — least privilege.
 - **Ownership:** the host dir is owned by the host user (`CC_UID:CC_GID`, here 1003), and the
@@ -24,7 +25,8 @@ their `git clone`s / edits land back on the host.
   (`CLAUDE_AGENT_CWD`), so a bare `git clone` lands directly in the shared dir. The agent's
   generated control files (`system-prompt.txt`, `.mcp.json`, `launch.sh`) stay in
   `/home/bun/agent`, keeping `/workspace` clean.
-- `codex-gw` is authorized to write into `/workspace`: it is added to
+- `codex-gw` and launcher-spawned `kind=codex` peers are authorized to use
+  `/workspace`: it is added to
   `CODEX_BUILD_CWD_ROOTS` (`/workspace,${HOME}/git`).
 
   > Codex keeps its own defence-in-depth gate for **workspace-write jobs**: the requester must
@@ -32,6 +34,10 @@ their `git clone`s / edits land back on the host.
   > Redis cwd-allow set. The mount + cwd-root make `/workspace` *eligible*; codex's authz still
   > governs *who* may drive a write there. `codex-gw-b` is read-only (`CODEX_GW_ALLOW_WRITE=0`)
   > — it can read `/workspace` but not run write jobs.
+- Launcher-spawned peers keep the legacy same-path workspace root bind
+  (`CODEX_WORKSPACE_ROOT`, default `${HOME}/git`) and also receive the shared workspace
+  bind. Relative launcher workspace paths are resolved against `A2A_LAUNCH_PROJECT_DIR`
+  so Docker receives an absolute host path.
 
 ## Setup
 
@@ -43,3 +49,6 @@ docker compose up -d
 ```
 
 Override the location in `.env`: `A2A_WORKSPACE_HOST_PATH=/abs/or/repo-relative/path`.
+When using `--profile launcher`, the launcher inherits that same path through
+`A2A_LAUNCH_WORKSPACE_HOST_PATH`; set `A2A_LAUNCH_PROJECT_DIR=/abs/path/to/clone`
+if you run Compose from outside the repository directory.

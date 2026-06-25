@@ -325,13 +325,16 @@ services:
       A2A_LAUNCH_SECRETS_VOLUME: ${A2A_LAUNCH_SECRETS_VOLUME:-alloyium_a2a_secrets}
       A2A_LAUNCH_CORE_SOURCE: ${A2A_CORE_RUN_HOST_PATH:-/run/a2a-core}
       A2A_LAUNCH_WORKSPACES_VOLUME: ${A2A_LAUNCH_WORKSPACES_VOLUME:-alloyium_codex_workspaces}
+      A2A_LAUNCH_PROJECT_DIR: ${A2A_LAUNCH_PROJECT_DIR:-${PWD:-.}}
+      A2A_LAUNCH_WORKSPACE_HOST_PATH: ${A2A_LAUNCH_WORKSPACE_HOST_PATH:-${A2A_WORKSPACE_HOST_PATH:-./data/workspace}}
+      A2A_LAUNCH_WORKSPACE_CONTAINER_PATH: ${A2A_LAUNCH_WORKSPACE_CONTAINER_PATH:-/workspace}
       A2A_LAUNCH_PRESENCE_WAIT_MS: ${A2A_LAUNCH_PRESENCE_WAIT_MS:-15000}
       CODEX_HOST_HOME: ${CODEX_HOST_HOME:-${HOME}/.codex}
       CODEX_WORKSPACE_ROOT: ${CODEX_WORKSPACE_ROOT:-${HOME}/git}
       CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
       CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
       CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
-      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-${HOME}/git}
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${HOME}/git}
       # Spawned kind=claude workers need the HOST paths of the logged-in `claude` session
       # to bind in (mirrors CODEX_HOST_HOME). Claude's login is split across a dir and a
       # file, so pass BOTH: ~/.claude (dir) and ~/.claude.json (file). Default to ${HOME}.

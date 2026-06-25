@@ -17,6 +17,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "langchain": "^1.5.0",
     "nats": "^2.29.3",
+    "nkeys.js": "1.1.0",
     "playwright": "^1.60.0",
     "zod": "^4.4.3"
   }

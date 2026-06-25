@@ -8,6 +8,7 @@ import './preamble.ts'
 import http from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
 import { chownSync } from 'node:fs'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { RedisClient } from 'bun'
 import { onboard } from './onboard.ts'
 
@@ -58,6 +59,9 @@ const SECRETS_VOLUME = env.A2A_LAUNCH_SECRETS_VOLUME ?? `${PROJECT}_a2a_secrets`
 const CORE_SOURCE = env.A2A_LAUNCH_CORE_SOURCE ?? env.A2A_LAUNCH_CORE_VOLUME ?? '/run/a2a-core'
 const WORKSPACES_VOLUME = env.A2A_LAUNCH_WORKSPACES_VOLUME ?? `${PROJECT}_codex_workspaces`
 const WORKSPACE_ROOT = env.CODEX_WORKSPACE_ROOT ?? '/srv/git'
+const SHARED_WORKSPACE_HOST_PATH = resolveLaunchWorkspaceHostPath(env.A2A_LAUNCH_WORKSPACE_HOST_PATH ?? env.A2A_WORKSPACE_HOST_PATH, env.A2A_LAUNCH_PROJECT_DIR)
+const SHARED_WORKSPACE_CONTAINER_PATH = resolveContainerWorkspacePath(env.A2A_LAUNCH_WORKSPACE_CONTAINER_PATH)
+const DEFAULT_CODEX_CWD_ROOTS = buildDefaultCodexCwdRoots(SHARED_WORKSPACE_HOST_PATH ? SHARED_WORKSPACE_CONTAINER_PATH : null, WORKSPACE_ROOT)
 const CODEX_HOST_HOME = resolveCodexHostHome(env.CODEX_HOST_HOME, env.HOME, WORKSPACE_ROOT)
 // Claude's login is split across a dir (~/.claude) and a file (~/.claude.json); resolve
 // each host path the same way codex resolves CODEX_HOST_HOME (explicit env wins).
@@ -122,6 +126,29 @@ function envPair(k: string, v: string | number | boolean | undefined): string | 
   return `${k}=${String(v)}`
 }
 
+export function resolveLaunchWorkspaceHostPath(value: string | undefined, projectDir: string | undefined, cwd = process.cwd()): string | null {
+  const raw = value?.trim()
+  if (!raw) return null
+  if (isAbsolute(raw)) return raw
+  const baseRaw = projectDir?.trim() || cwd
+  const base = isAbsolute(baseRaw) ? baseRaw : resolvePath(cwd, baseRaw)
+  return resolvePath(base, raw)
+}
+
+function resolveContainerWorkspacePath(value: string | undefined): string {
+  const raw = value?.trim()
+  if (!raw || !raw.startsWith('/')) return '/workspace'
+  return raw.replace(/\/+$/, '') || '/'
+}
+
+export function buildDefaultCodexCwdRoots(sharedWorkspacePath: string | null, legacyWorkspaceRoot: string): string {
+  return [sharedWorkspacePath, legacyWorkspaceRoot]
+    .map((s) => s?.trim())
+    .filter((s): s is string => !!s)
+    .filter((s, i, all) => all.indexOf(s) === i)
+    .join(',')
+}
+
 export function resolveCodexHostHome(explicit: string | undefined, home: string | undefined, workspaceRoot: string): string {
   if (explicit && explicit.trim()) return explicit.trim()
   const workspaceHome = workspaceRoot.match(/^\/home\/[^/]+(?:\/|$)/)?.[0]?.replace(/\/$/, '')
@@ -179,9 +206,10 @@ export function buildDockerContainerSpec(req: {
     `${SECRETS_VOLUME}:/run/secrets/a2a:ro`,
     `${CORE_SOURCE}:/run/a2a-core`,
     `${CODEX_HOST_HOME}:/home/bun/.codex`,
-    `${WORKSPACE_ROOT}:${WORKSPACE_ROOT}`,
     `${WORKSPACES_VOLUME}:/workspaces`,
   ]
+  if (SHARED_WORKSPACE_HOST_PATH) binds.push(`${SHARED_WORKSPACE_HOST_PATH}:${SHARED_WORKSPACE_CONTAINER_PATH}`)
+  if (WORKSPACE_ROOT) binds.push(`${WORKSPACE_ROOT}:${WORKSPACE_ROOT}`)
   const codexSshDir = env.CODEX_SSH_DIR?.trim()
   if (codexSshDir) {
     binds.push(`${codexSshDir}:/home/bun/.ssh:ro`)
@@ -210,7 +238,7 @@ export function buildDockerContainerSpec(req: {
     envPair('CODEX_GW_WRITE_ALLOWLIST', env.CODEX_GW_WRITE_ALLOWLIST ?? 'dev-pm'),
     envPair('CODEX_GW_CODEX_SANDBOX', sandbox),
     envPair('CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX', workspaceWriteSandbox),
-    envPair('CODEX_BUILD_CWD_ROOTS', env.CODEX_BUILD_CWD_ROOTS ?? WORKSPACE_ROOT),
+    envPair('CODEX_BUILD_CWD_ROOTS', env.CODEX_BUILD_CWD_ROOTS ?? DEFAULT_CODEX_CWD_ROOTS),
     envPair('CODEX_GW_ENABLE_A2A_TOOLS', '1'),
     envPair('CODEX_GW_A2A_TOOLS_MODE', req.mode),
     envPair('CODEX_GW_A2A_SHIM_BIN', '/usr/local/bin/a2a-shim'),
