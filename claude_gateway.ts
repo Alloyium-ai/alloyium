@@ -45,6 +45,32 @@ const AGENT_ID = process.env.A2A_AGENT_ID ?? 'claude-gw'
 const MODEL = process.env.CLAUDE_GW_MODEL ?? 'opus'
 const EFFORT = process.env.CLAUDE_GW_EFFORT ?? 'high' // low|medium|high|xhigh|max — spec suggests max; high is the shared-endpoint default, env-overridable up
 const CWD = process.env.CLAUDE_GW_CWD ?? '/tmp' // clean inference cwd: no project CLAUDE.md/settings bleed into context
+
+// Detached-autonomous guard: this gateway drives `claude` with NO human attached. An
+// agent that self-raises an interactive prompt (AskUserQuestion / plan approval) blocks
+// until the turn timeout — there is no one to answer. Enforced two ways in CLAUDE_CLI_ARGS:
+// `--disallowedTools AskUserQuestion` (hard tool block) + this directive appended to the
+// system prompt (so the model never tries).
+export const CLAUDE_DETACHED_DIRECTIVE =
+  'You are a detached, autonomous agent: there is NO interactive human to answer prompts. ' +
+  'Never use AskUserQuestion or any interactive/approval prompt — no one can respond and you will hang indefinitely. ' +
+  'If you would ask, instead make the best-justified decision and state it, or include the question in your normal text output.'
+
+// The exact `claude` CLI argv — extracted + exported so the AskUserQuestion block is
+// audit-verifiable and regression-tested (see tests/claude_gateway.test.ts).
+export const CLAUDE_CLI_ARGS: string[] = [
+  'claude', '-p',
+  '--input-format', 'stream-json',
+  '--output-format', 'stream-json',
+  '--verbose',                            // required for stream-json output under -p
+  '--model', MODEL,
+  '--effort', EFFORT,
+  '--tools', '',                          // NO built-in tools → read-only/advisory inference
+  '--disallowedTools', 'AskUserQuestion', // HARD-block the interactive prompt — a detached agent has no human to answer it (else an 8h turn-timeout hang)
+  '--append-system-prompt', CLAUDE_DETACHED_DIRECTIVE, // + tell the model never to raise one
+  '--strict-mcp-config',                  // NO MCP servers → pure inference, no side channels
+  '--dangerously-skip-permissions',       // skip tool-permission gates (the tool set is already empty)
+]
 const POOL = Math.max(1, Number(process.env.CLAUDE_GW_POOL ?? process.env.CLAUDE_GW_CONCURRENCY ?? 2)) // warm idle sessions kept ready for no-thread-key jobs (CLAUDE_GW_CONCURRENCY = provisioned alias)
 // A no-thread-key session is retired (killed) once it has served this many turns —
 // default 1 ⇒ strict per-job isolation. Raise to enable warm multi-turn reuse of
@@ -128,17 +154,7 @@ export function parseStreamEvent(m: unknown): ParsedClaudeStreamEvent {
 // process) via a promise queue, matching the CLI's serial turn handling.
 class ClaudeSession {
   private proc = Bun.spawn(
-    [
-      'claude', '-p',
-      '--input-format', 'stream-json',
-      '--output-format', 'stream-json',
-      '--verbose',                       // required for stream-json output under -p
-      '--model', MODEL,
-      '--effort', EFFORT,
-      '--tools', '',                     // NO built-in tools → read-only/advisory inference
-      '--strict-mcp-config',             // NO MCP servers → pure inference, no side channels
-      '--dangerously-skip-permissions',  // never block on a prompt (tool denial is enforced by --tools "" regardless)
-    ],
+    CLAUDE_CLI_ARGS,
     { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', cwd: CWD, env: CHILD_ENV },
   )
   sessionId = ''

@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { parseStreamEvent } from '../claude_gateway.ts'
+import { parseStreamEvent, CLAUDE_CLI_ARGS, CLAUDE_DETACHED_DIRECTIVE } from '../claude_gateway.ts'
 
 describe('claude_gateway parseStreamEvent', () => {
   test('system/init carries session_id', () => {
@@ -68,5 +68,20 @@ describe('claude_gateway parseStreamEvent', () => {
     expect(parseStreamEvent(undefined)).toEqual({ kind: 'other' })
     expect(parseStreamEvent('not json')).toEqual({ kind: 'other' })
     expect(parseStreamEvent(42)).toEqual({ kind: 'other' })
+  })
+})
+
+describe('claude_gateway detached-autonomous guard (no AskUserQuestion hang)', () => {
+  test('the claude CLI args HARD-block AskUserQuestion', () => {
+    const i = CLAUDE_CLI_ARGS.indexOf('--disallowedTools')
+    expect(i).toBeGreaterThanOrEqual(0)
+    expect(CLAUDE_CLI_ARGS[i + 1]).toBe('AskUserQuestion')
+  })
+  test('the detached directive is appended to the system prompt and forbids interactive prompts', () => {
+    const i = CLAUDE_CLI_ARGS.indexOf('--append-system-prompt')
+    expect(i).toBeGreaterThanOrEqual(0)
+    expect(CLAUDE_CLI_ARGS[i + 1]).toBe(CLAUDE_DETACHED_DIRECTIVE)
+    expect(CLAUDE_DETACHED_DIRECTIVE).toContain('AskUserQuestion')
+    expect(CLAUDE_DETACHED_DIRECTIVE.toLowerCase()).toContain('detached')
   })
 })
