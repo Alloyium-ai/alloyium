@@ -498,5 +498,8 @@ curl -fsS http://127.0.0.1:8901/api/dm/codex-srv01-launched-1 | grep PONG_FROM_S
 - The inner `codex app-server` gets A2A tools through `a2a-shim` and
   `/run/a2a-core/core.sock`.
 - Both paths must point at the same e2e stack.
+- Brain tools are served by the shared `a2a-core` process, not by the shim process.
+  Set `BRAIN_URL` on the stack that runs `a2a-core`; setting it only in the host peer
+  wrapper or shim env is not sufficient for `a2a_recall` / `a2a_remember`.
 - The host peer uses `transport none`; NATS transport is unauthenticated, but A2A message
   signing remains enabled and the Redis pubkey registration is still required.
