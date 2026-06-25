@@ -1,11 +1,48 @@
 import { describe, expect, test } from 'bun:test'
-import { buildDockerContainerSpec, launcherRequestAuthorized, resolveCodexHostHome } from '../a2a_launcher.ts'
+import { buildDefaultCodexCwdRoots, buildDockerContainerSpec, launcherRequestAuthorized, resolveCodexHostHome, resolveLaunchWorkspaceHostPath } from '../a2a_launcher.ts'
+
+async function withEnv<T>(updates: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const old: Record<string, string | undefined> = {}
+  for (const k of Object.keys(updates)) old[k] = process.env[k]
+  try {
+    for (const [k, v] of Object.entries(updates)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    return await fn()
+  } finally {
+    for (const [k, v] of Object.entries(old)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
+async function withLauncherModule<T>(updates: Record<string, string | undefined>, fn: (mod: typeof import('../a2a_launcher.ts')) => T | Promise<T>): Promise<T> {
+  return withEnv(updates, async () => {
+    const mod = await import(`../a2a_launcher.ts?case=${Date.now()}-${Math.random()}`)
+    return fn(mod)
+  })
+}
 
 describe('a2a launcher docker provider', () => {
   test('derives host codex home from mounted workspace root', () => {
     expect(resolveCodexHostHome(undefined, '/home/bun', '/home/dev/git')).toBe('/home/dev/.codex')
     expect(resolveCodexHostHome(undefined, '/home/bun', '/home/ci/git')).toBe('/home/ci/.codex')
     expect(resolveCodexHostHome('/custom/codex', '/home/bun', '/home/dev/git')).toBe('/custom/codex')
+  })
+
+  test('resolves launcher shared workspace paths against the host project dir', () => {
+    expect(resolveLaunchWorkspaceHostPath('/data/workspace', '/repo')).toBe('/data/workspace')
+    expect(resolveLaunchWorkspaceHostPath('./data/workspace', '/repo/alloyium')).toBe('/repo/alloyium/data/workspace')
+    expect(resolveLaunchWorkspaceHostPath('data/workspace', 'alloyium', '/home/dev')).toBe('/home/dev/alloyium/data/workspace')
+    expect(resolveLaunchWorkspaceHostPath(undefined, '/repo')).toBeNull()
+  })
+
+  test('builds default cwd roots with shared workspace first and legacy root retained', () => {
+    expect(buildDefaultCodexCwdRoots('/workspace', '/home/dev/git')).toBe('/workspace,/home/dev/git')
+    expect(buildDefaultCodexCwdRoots('/workspace', '/workspace')).toBe('/workspace')
+    expect(buildDefaultCodexCwdRoots(null, '/home/dev/git')).toBe('/home/dev/git')
   })
 
   test('builds a codex peer container with unique identity wiring', () => {
@@ -52,6 +89,50 @@ describe('a2a launcher docker provider', () => {
       '/srv/git:/srv/git',
       'alloyium_codex_workspaces:/workspaces',
     ]))
+  })
+
+  test('mounts configured shared workspace into launched peers', async () => {
+    await withLauncherModule({
+      A2A_LAUNCH_PROJECT_DIR: '/opt/alloyium',
+      A2A_LAUNCH_WORKSPACE_HOST_PATH: './data/workspace',
+      A2A_LAUNCH_WORKSPACE_CONTAINER_PATH: '/workspace',
+      CODEX_WORKSPACE_ROOT: '/home/dev/git',
+      CODEX_BUILD_CWD_ROOTS: undefined,
+    }, (mod) => {
+      const spec = mod.buildDockerContainerSpec({
+        agentId: 'codex-gw-sub-workspace',
+        mode: 'shim',
+        createdBy: 'codex-gw',
+      })
+
+      const hostConfig = spec.body.HostConfig as any
+      expect(hostConfig.Binds).toEqual(expect.arrayContaining([
+        '/opt/alloyium/data/workspace:/workspace',
+        '/home/dev/git:/home/dev/git',
+      ]))
+
+      const envList = spec.body.Env as string[]
+      expect(envList).toContain('CODEX_BUILD_CWD_ROOTS=/workspace,/home/dev/git')
+    })
+  })
+
+  test('keeps explicit cwd roots for launched peers', async () => {
+    await withLauncherModule({
+      A2A_LAUNCH_PROJECT_DIR: '/opt/alloyium',
+      A2A_LAUNCH_WORKSPACE_HOST_PATH: './data/workspace',
+      A2A_LAUNCH_WORKSPACE_CONTAINER_PATH: '/workspace',
+      CODEX_WORKSPACE_ROOT: '/home/dev/git',
+      CODEX_BUILD_CWD_ROOTS: '/custom/root',
+    }, (mod) => {
+      const spec = mod.buildDockerContainerSpec({
+        agentId: 'codex-gw-sub-explicit-roots',
+        mode: 'shim',
+        createdBy: 'codex-gw',
+      })
+
+      const envList = spec.body.Env as string[]
+      expect(envList).toContain('CODEX_BUILD_CWD_ROOTS=/custom/root')
+    })
   })
 
   test('defaults launched codex peers to container-external sandbox boundary', () => {
