@@ -286,8 +286,8 @@ services:
       - sh
       - -lc
       - |
-        mkdir -p /run/a2a-core
-        chown -R bun:bun /run/a2a-core
+        mkdir -p /run/a2a-core /app/data
+        chown -R bun:bun /run/a2a-core /app/data
         exec gosu bun:bun bun a2a_core.ts
 
   a2a-launcher:
@@ -501,7 +501,7 @@ services:
       context: .
       dockerfile: docker/gateway-claude/Dockerfile
       args:
-        CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.177}
+        CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
       <<: *cc-env
@@ -546,6 +546,292 @@ services:
       retries: 18
       start_period: 20s
     command: ["bun", "claude_gateway.ts"]
+
+  onboard-claude-agent:
+    # One-shot: mint the conversational Claude agent's signing seed before it starts.
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts ${CLAUDE_AGENT_ID:-claude-agent} --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  claude-agent:
+    # A FIRST-CLASS conversational Claude peer — distinct from claude-gw (the inference
+    # gateway). A real `claude` session wired to the a2a-shim (UDS -> shared a2a-core), so
+    # the model HOLDS the a2a tools and RECEIVES channel injection in-session and talks to
+    # other agents. Default-on, like the gateways; drives the user's logged-in OAuth session.
+    build:
+      context: .
+      dockerfile: docker/agent-claude/Dockerfile
+      args:
+        CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${CLAUDE_AGENT_ID:-claude-agent}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${CLAUDE_AGENT_ID:-claude-agent}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_CORE_SOCK: /run/a2a-core/core.sock
+      A2A_SHIM_BIN: /usr/local/bin/a2a-shim
+      CLAUDE_AGENT_MODEL: ${CLAUDE_AGENT_MODEL:-opus}
+      CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
+      BRAIN_URL: ${BRAIN_URL:-}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      - *a2a-core-run-bind
+      # The user's logged-in `claude` session (dir + json) — mounted read-write so OAuth
+      # tokens refresh, identical to claude-gw. Override CLAUDE_HOST_HOME / CLAUDE_HOST_CONFIG.
+      - ${CLAUDE_HOST_HOME:-${HOME}/.claude}:/home/bun/.claude
+      - ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}:/home/bun/.claude.json
+      - ${CLAUDE_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-claude-agent:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 24
+      start_period: 60s
+
+  onboard-claude-agent-b:
+    # `fleet` profile: mint a 2nd conversational Claude identity (for claude<->claude).
+    profiles: ["fleet"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts claude-agent-b --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  claude-agent-b:
+    # `fleet` profile: a 2nd conversational Claude peer — same image/wiring as
+    # claude-agent, distinct identity. `docker compose --profile fleet up` to watch
+    # claude<->claude in real time.
+    profiles: ["fleet"]
+    build:
+      context: .
+      dockerfile: docker/agent-claude/Dockerfile
+      args:
+        CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: claude-agent-b
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/claude-agent-b.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_CORE_SOCK: /run/a2a-core/core.sock
+      A2A_SHIM_BIN: /usr/local/bin/a2a-shim
+      CLAUDE_AGENT_MODEL: ${CLAUDE_AGENT_MODEL:-opus}
+      CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
+      BRAIN_URL: ${BRAIN_URL:-}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      - *a2a-core-run-bind
+      - ${CLAUDE_HOST_HOME:-${HOME}/.claude}:/home/bun/.claude
+      - ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}:/home/bun/.claude.json
+      - ${CLAUDE_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-claude-agent-b:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 24
+      start_period: 60s
+
+  onboard-codex-gw-b:
+    # `fleet` profile: mint a 2nd codex identity (for codex<->codex).
+    profiles: ["fleet"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts codex-gw-b --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  codex-gw-b:
+    # `fleet` profile: a 2nd codex peer — same image/wiring as codex-gw, distinct
+    # identity, read-only. For codex<->codex (and a fuller fleet).
+    profiles: ["fleet"]
+    build:
+      context: .
+      dockerfile: docker/gateway-codex/Dockerfile
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.141.0}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: codex-gw-b
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/codex-gw-b.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      CODEX_GW_EFFORT: ${CODEX_GW_EFFORT:-xhigh}
+      CODEX_GW_MODEL: ${CODEX_GW_MODEL:-}
+      CODEX_GW_BUDGET_MAX_PCT: ${CODEX_GW_BUDGET_MAX_PCT:-92}
+      CODEX_GW_ALLOW_WRITE: "0"
+      CODEX_GW_ENABLE_A2A_TOOLS: ${CODEX_GW_ENABLE_A2A_TOOLS:-1}
+      CODEX_GW_A2A_TOOLS_MODE: ${CODEX_GW_A2A_TOOLS_MODE:-shim}
+      CODEX_GW_A2A_SHIM_BIN: /usr/local/bin/a2a-shim
+      CODEX_GW_A2A_TOOLS_REQUIRED: ${CODEX_GW_A2A_TOOLS_REQUIRED:-1}
+      A2A_CORE_SOCK: /run/a2a-core/core.sock
+      BRAIN_URL: ${BRAIN_URL:-}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      - *a2a-core-run-bind
+      - ${CODEX_HOST_HOME:-${HOME}/.codex}:/home/bun/.codex
+      - ${CODEX_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+      - codex_workspaces:/workspaces
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-codex-gw-b:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 20s
+    command: ["bun", "codex_gateway.ts"]
+
+  onboard-fusion-svc:
+    # `fusion` profile: mint the fusion-svc identity.
+    profiles: ["fusion"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts fusion-svc --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  fusion-svc:
+    # `fusion` profile: the cross-model panel. Dispatches a prompt to claude-gw (Opus) +
+    # codex-gw (GPT-5.5) in parallel over the bus, then an Opus judge synthesizes one
+    # answer. Joins the bus directly (like the portal). Needs both gateways up.
+    profiles: ["fusion"]
+    build:
+      context: .
+      dockerfile: docker/bun/Dockerfile
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${FUSION_SVC_AGENT_ID:-fusion-svc}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${FUSION_SVC_AGENT_ID:-fusion-svc}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      CODEX_GW_ID: ${CODEX_GW_AGENT_ID:-codex-gw}
+      CLAUDE_GW_ID: ${CLAUDE_GW_AGENT_ID:-claude-gw}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-fusion-svc:
+        condition: service_completed_successfully
+      claude-gw:
+        condition: service_healthy
+      codex-gw:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 15s
+    command: ["bun", "fusion_service.ts"]
 
   test:
     profiles: ["test"]

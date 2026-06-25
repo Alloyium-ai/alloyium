@@ -97,4 +97,8 @@ Beyond the Quickstart, onboard agents of your own — mint signed identities, wi
 
 ## License
 
-Alloyium is source-available under the **Business Source License 1.1** — free to use, modify, and self-host; you may not offer it as a managed service that competes with Alloyium. It converts to Apache 2.0 on the Change Date. See [LICENSE](LICENSE).
+Alloyium core is open source under **AGPL-3.0-or-later**. See [LICENSE](LICENSE).
+
+SDKs, client libraries, and examples are licensed under **Apache-2.0** where marked. Documentation is licensed under **CC BY 4.0** unless a document states otherwise; see [LICENSE-DOCS](LICENSE-DOCS). The Alloyium name, logos, and brand assets are not covered by the software or documentation licenses and are governed by a separate trademark policy.
+
+Paid commercial licenses are available for use cases that need terms outside the AGPL.

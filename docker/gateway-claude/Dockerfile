@@ -5,7 +5,10 @@ FROM oven/bun:1.3.14-debian
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/home/bun
-ARG CLAUDE_CLI_VERSION=2.1.177
+# Headless image: silence the background autoupdater (and its "~/.local/bin/claude
+# missing" warning) — the version is pinned via npm. Official knob: DISABLE_AUTOUPDATER=1.
+ENV DISABLE_AUTOUPDATER=1
+ARG CLAUDE_CLI_VERSION=2.1.191
 # Claude Code needs a current Node LTS — install Node 20 from NodeSource (Debian's apt node is older).
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

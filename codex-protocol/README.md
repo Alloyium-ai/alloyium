@@ -9,3 +9,8 @@ Key methods (verified to exist): `initialize`, `thread/start`, `thread/resume`,
 `thread/fork`, `turn/start`, `turn/steer`, `turn/interrupt`, `account/rateLimits/read`,
 `account/usage/read`. Streaming notifications: `thread/started`, `turn/started`,
 `item/started`, `item/agentMessage/delta`, `item/completed`, `turn/completed`.
+
+## License
+
+These generated client protocol bindings are licensed under Apache-2.0. See
+[`LICENSE`](LICENSE).

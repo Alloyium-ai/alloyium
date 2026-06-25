@@ -2,6 +2,7 @@
 name = "a2a-shim"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util", "io-std", "time", "sync", "macros"] }
