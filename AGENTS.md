@@ -1,0 +1,248 @@
+# AGENTS.md
+
+Guidance for coding agents working in this repository. Keep setup instructions practical:
+new users should be able to clone the repo, start the full local fabric, see the portal,
+and verify a fully A2A-enabled Codex peer without reconstructing Compose profiles by hand.
+
+## Primary Entry Points
+
+- `bin/alloyium` - local setup wrapper for init/up/launch/verify/down.
+- `compose.yaml` - base Docker Compose stack.
+- `compose.presets/full-codex.yaml` - preset for launcher + fleet + fusion + full Codex node.
+- `docs/full-codex-node.md` - user-facing full-node setup notes.
+- `docs/shared-workspace.md` - `/workspace` mount behavior.
+- `GETTING_STARTED.md` - longer product walkthrough.
+- `a2a_portal.ts` - web portal and send surface.
+- `a2a_launcher.ts` - Docker-backed runtime peer launcher.
+- `a2a_core.ts` - shared MCP-over-UDS A2A tool host.
+- `codex_gateway.ts` / `claude_gateway.ts` - model gateway peers.
+
+Alloyium uses the host user's logged-in CLI sessions. Before running the gateways, the
+host should have working CLI logins:
+
+```bash
+claude
+codex
+```
+
+The stack mounts host CLI state into containers:
+
+- Claude: `~/.claude` and `~/.claude.json`
+- Codex: `~/.codex`
+- SSH keys: `~/.ssh`, read-only
+
+Do not put API keys, OAuth tokens, private keys, `.env`, generated `a2a/`, or `data/`
+contents into commits.
+
+## Fresh Clone Startup
+
+Preferred full local setup:
+
+```bash
+git clone https://github.com/Alloyium-ai/alloyium.git
+cd alloyium
+bin/alloyium init
+bin/alloyium up full-codex
+bin/alloyium verify
+```
+
+`bin/alloyium init` creates `.env`, generates `A2A_LAUNCHER_TOKEN`, sets `CC_UID` and
+`CC_GID` to the current host user, records `A2A_LAUNCH_PROJECT_DIR`, and prepares
+`data/workspace`.
+
+`bin/alloyium up full-codex` layers `compose.presets/full-codex.yaml` over
+`compose.yaml`, starts the `launcher`, `fleet`, and `fusion` profiles, and launches
+`codex-a2a-full-1`.
+
+Expected long-running services include:
+
+- `redis`
+- `nats`
+- `a2a-core`
+- `a2a-portal`
+- `a2a-launcher`
+- `codex-gw`
+- `claude-gw`
+- `claude-agent`
+- `claude-agent-b`
+- `codex-gw-b`
+- `fusion-svc`
+- launcher-spawned container `cc-agent-codex-a2a-full-1`
+
+The `onboard-*` containers are one-shot setup jobs. It is normal for them to show
+`Exited (0)` after the stack is healthy.
+
+## Full Codex A2A Node
+
+`codex-a2a-full-1` is the standard full-node peer for local/e2e testing. It is launched
+by `a2a-launcher`, not managed directly by Compose.
+
+Expected properties:
+
+- A2A tools enabled through the shared-core shim.
+- Shared workspace mounted at `/workspace`.
+- Write-enabled policy (`CODEX_GW_ALLOW_WRITE=1`).
+- `CODEX_BUILD_CWD_ROOTS` includes `/workspace`.
+- Launch authority for `a2a_launch_codex_agent`.
+
+Two allowlists must stay in sync:
+
+- `A2A_AGENT_LAUNCH_ALLOWED_IDS` on `a2a-core`: controls which peers see the launch tool.
+- `A2A_LAUNCH_ALLOWED_IDS` on `a2a-launcher`: controls which `created_by` values the
+  launcher API accepts.
+
+The full-codex preset defaults both to include `codex-a2a-full-1`. If you rename the
+full node with `ALLOYIUM_FULL_CODEX_AGENT_ID`, update both allowlists in `.env`.
+
+To recreate the dynamic node after changing launcher-provided environment:
+
+```bash
+bin/alloyium launch full-codex --replace
+```
+
+## Profiles
+
+Compose starts services with no `profiles:` by default. Anything with a profile must be
+requested explicitly.
+
+Important profiles:
+
+| Profile | Services | Purpose |
+| --- | --- | --- |
+| `launcher` | `a2a-launcher` | Enables runtime worker launch endpoints. Requires `A2A_LAUNCHER_TOKEN`. |
+| `fleet` | `claude-agent-b`, `codex-gw-b`, plus onboarding jobs | Adds second Claude/Codex peers for multi-agent tests. |
+| `fusion` | `fusion-svc`, plus onboarding job | Fans a prompt to Claude and Codex and synthesizes a result. |
+| `taskboard` | taskboard bridge/dispatcher | Optional taskboard integration. |
+| `remote-bus` | Redis LAN proxy | Exposes Redis for remote bus scenarios. |
+| `legacy-nats-proxy` | NATS LAN proxy | Exposes NATS for legacy remote scenarios. |
+| `kai` / `gateways` | Kai token materialization | Optional local secrets path. |
+| `test` | test container | Runs repository selftest container. |
+
+Use the wrapper for the standard full stack:
+
+```bash
+bin/alloyium ps full-codex
+bin/alloyium config full-codex
+```
+
+Raw Compose equivalent:
+
+```bash
+docker compose -f compose.yaml -f compose.presets/full-codex.yaml \
+  --profile launcher --profile fleet --profile fusion up -d --build
+```
+
+## Portal UI
+
+Default portal URL:
+
+```text
+http://127.0.0.1:8901
+```
+
+For a LAN browser:
+
+```bash
+A2A_PORTAL_BIND=0.0.0.0 bin/alloyium up full-codex
+```
+
+To bind only to one LAN address:
+
+```bash
+A2A_PORTAL_BIND=<server-ip> bin/alloyium up full-codex
+```
+
+The portal has send controls. Do not expose it on an untrusted network without
+firewalling or other access control.
+
+## Agent Brain
+
+Brain tools are optional and fail soft when not configured. To wire the stack to an
+external agent-brain service:
+
+```bash
+BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace
+```
+
+Use `--replace` when changing `BRAIN_URL` because launcher-spawned containers inherit
+that value only when they are created.
+
+Read-only probe from inside the stack:
+
+```bash
+docker compose -f compose.yaml -f compose.presets/full-codex.yaml \
+  --profile launcher --profile fleet --profile fusion \
+  exec -T a2a-core bun -e \
+  'import { BrainTools } from "./brain_tools.ts"; const bt = new BrainTools({ timeoutMs: 5000 }); console.log(JSON.stringify(await bt.callTool("a2a_recall", { query: "alloyium", limit: 1 })));'
+```
+
+## Verify The Stack
+
+Use:
+
+```bash
+bin/alloyium verify
+```
+
+Manual checks:
+
+```bash
+curl -fsS http://127.0.0.1:8901/api/send-status
+curl -fsS http://127.0.0.1:8901/api/presence
+docker inspect cc-agent-codex-a2a-full-1
+```
+
+Expected presence should include at least:
+
+- `a2a-portal`
+- `a2a-core-*`
+- `codex-gw`
+- `claude-gw`
+- `claude-agent`
+- `claude-agent-b`
+- `codex-gw-b`
+- `fusion-svc`
+- `codex-a2a-full-1`
+
+## Shutdown
+
+Use the wrapper for the full stack:
+
+```bash
+bin/alloyium down full-codex
+```
+
+This removes `cc-agent-codex-a2a-full-1` before `docker compose down`, which prevents a
+launcher-spawned container from keeping the Compose network in use.
+
+If doing raw Compose shutdown, include the same profiles used at startup and remove any
+launcher-spawned containers:
+
+```bash
+docker rm -f cc-agent-codex-a2a-full-1
+docker compose -f compose.yaml -f compose.presets/full-codex.yaml \
+  --profile launcher --profile fleet --profile fusion down
+```
+
+If `docker compose down` reports that `alloyium_a2a-net` is still in use:
+
+```bash
+docker ps -a --filter network=alloyium_a2a-net \
+  --format '{{.Names}} {{.Status}} service={{.Label "com.docker.compose.service"}}'
+```
+
+Remove launcher-spawned `cc-agent-*` containers or rerun `down` with the missing
+profiles.
+
+## Common Gotchas
+
+- `docker compose up` alone does not start `launcher`, `fleet`, or `fusion`.
+- `docker compose ps` must be run from the repo directory, or with explicit `-f` files.
+- If a custom project name was used, include `-p <project>` in later `ps`, `up`, and
+  `down` commands.
+- The portal default bind is loopback-only.
+- `codex-gw` and `claude-gw` depend on host CLI login state.
+- Launcher-spawned containers do not automatically pick up changed environment; recreate
+  them with `bin/alloyium launch full-codex --replace`.
+- Do not delete named volumes casually; they contain generated bus/secrets/state. Use
+  `down -v` only when intentionally resetting the stack.
