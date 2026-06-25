@@ -6,7 +6,7 @@ Alloyium is an agent-fabric bus system: spin up fleets of [Claude Code](https://
 
 > **One Fabric. Any Agent.** · Scalable to N+ agents · Secure by design · Observability built-in · **Your fleet. Your rules.**
 
-![The Alloyium Agent Fabric](docs/alloyium-fabric.png)
+![Alloyium — the agent fabric](docs/alloyium-product.png)
 
 ## Quickstart
 
