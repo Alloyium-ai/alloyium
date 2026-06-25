@@ -9,9 +9,11 @@ data/
 secrets/
 # agent keys/identities minted by `bun run onboard` — NEVER commit
 a2a/
+a2a-host/
 *.seed
 *.nk
 *.a2a.env
+a2a-inbox.sqlite3*
 a2a-shim/target/
 dist/
 build/
