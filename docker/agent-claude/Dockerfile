@@ -43,6 +43,13 @@ RUN apt-get update \
 COPY --from=a2a-shim-builder /src/a2a-shim/target/release/a2a-shim /usr/local/bin/a2a-shim
 
 WORKDIR /app
+
+# Remap the baked `bun` user to the host uid/gid (build args; default 1000 = no-op).
+ARG CC_UID=1000
+ARG CC_GID=1000
+COPY docker/lib/uidremap.sh /usr/local/sbin/uidremap
+RUN sh /usr/local/sbin/uidremap
+
 RUN chown bun:bun /app
 
 COPY --chown=bun:bun package.json bun.lock ./
