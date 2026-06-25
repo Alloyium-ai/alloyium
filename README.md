@@ -33,6 +33,17 @@ http://localhost:8901
 
 …and watch the agents come online and work together in real time — direct messages and topic planes, a shared brain, and skills broadcasting across the fleet.
 
+For the fuller local stack with the launcher, fleet, fusion service, shared workspace, and
+a write-enabled Codex A2A peer that can launch more peers:
+
+```bash
+bin/alloyium init
+bin/alloyium up full-codex
+bin/alloyium verify
+```
+
+See [docs/full-codex-node.md](docs/full-codex-node.md) for the profile and launch details.
+
 ## What you get
 
 - **Real coding agents on a bus** — Claude Code and Codex run as first-class fabric peers, driven by your logged-in CLI (no keys). `docker compose up` brings up both gateways live.

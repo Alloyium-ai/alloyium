@@ -1,0 +1,20 @@
+services:
+  a2a-core:
+    environment:
+      A2A_LAUNCHER_URL: ${A2A_LAUNCHER_URL:-http://a2a-launcher:8910}
+      A2A_LAUNCHER_TOKEN: ${A2A_LAUNCHER_TOKEN:?run bin/alloyium init to generate A2A_LAUNCHER_TOKEN}
+      A2A_AGENT_LAUNCH_ALLOWED_IDS: ${A2A_AGENT_LAUNCH_ALLOWED_IDS:-codex-gw,codex-a2a-full-1}
+
+  a2a-launcher:
+    environment:
+      A2A_LAUNCHER_TOKEN: ${A2A_LAUNCHER_TOKEN:?run bin/alloyium init to generate A2A_LAUNCHER_TOKEN}
+      A2A_LAUNCH_ALLOWED_IDS: ${A2A_LAUNCH_ALLOWED_IDS:-codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops,codex-a2a-full-1}
+      A2A_LAUNCH_PROJECT_DIR: ${A2A_LAUNCH_PROJECT_DIR:-${PWD:-.}}
+      A2A_LAUNCH_WORKSPACE_HOST_PATH: ${A2A_LAUNCH_WORKSPACE_HOST_PATH:-${A2A_WORKSPACE_HOST_PATH:-./data/workspace}}
+      A2A_LAUNCH_WORKSPACE_CONTAINER_PATH: ${A2A_LAUNCH_WORKSPACE_CONTAINER_PATH:-/workspace}
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${CODEX_WORKSPACE_ROOT:-${HOME}/git}}
+
+  codex-gw:
+    environment:
+      A2A_LAUNCHER_TOKEN: ${A2A_LAUNCHER_TOKEN:?run bin/alloyium init to generate A2A_LAUNCHER_TOKEN}
+      A2A_AGENT_LAUNCH_ALLOWED_IDS: ${A2A_AGENT_LAUNCH_ALLOWED_IDS:-codex-gw,codex-a2a-full-1}

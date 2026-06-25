@@ -54,6 +54,38 @@ your own.
 
 ---
 
+## 1a. Full local fabric preset
+
+For a fresh clone where you want the launcher, fleet peers, fusion service, shared
+workspace, and a fully A2A-enabled Codex peer that can launch additional peers:
+
+```bash
+bin/alloyium init
+bin/alloyium up full-codex
+bin/alloyium verify
+```
+
+This layers `compose.presets/full-codex.yaml` over `compose.yaml`, starts the `launcher`,
+`fleet`, and `fusion` profiles, then launches `codex-a2a-full-1` as a write-enabled
+Codex A2A node. The wrapper generates `A2A_LAUNCHER_TOKEN`, records the current host
+uid/gid, and prepares the shared `data/workspace` directory.
+
+To expose the portal to a LAN browser:
+
+```bash
+A2A_PORTAL_BIND=0.0.0.0 bin/alloyium up full-codex
+```
+
+To connect the A2A tools to an external agent brain:
+
+```bash
+BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace
+```
+
+The full-node details are in [`docs/full-codex-node.md`](docs/full-codex-node.md).
+
+---
+
 ## 2. The gateways — Claude Code & Codex
 
 The two gateways from the Quickstart, `claude-gw` and `codex-gw`, are the real coding

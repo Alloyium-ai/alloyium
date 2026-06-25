@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
+
+FULL_PRESET="compose.presets/full-codex.yaml"
+FULL_CODEX_AGENT_ID="${ALLOYIUM_FULL_CODEX_AGENT_ID:-codex-a2a-full-1}"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bin/alloyium init
+  bin/alloyium up [core|full-codex] [--replace]
+  bin/alloyium launch full-codex [--replace]
+  bin/alloyium verify [full-codex]
+  bin/alloyium ps [core|full-codex]
+  bin/alloyium config [core|full-codex]
+  bin/alloyium down [core|full-codex]
+
+Common fresh-clone flow:
+  bin/alloyium init
+  bin/alloyium up full-codex
+  bin/alloyium verify
+
+Useful overrides:
+  A2A_PORTAL_BIND=0.0.0.0 bin/alloyium up full-codex
+  BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex
+  ALLOYIUM_FULL_CODEX_AGENT_ID=my-codex-node bin/alloyium launch full-codex --replace
+EOF
+}
+
+need_docker_compose() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
+}
+
+compose_core() {
+  docker compose -f compose.yaml "$@"
+}
+
+running_launcher_token() {
+  docker inspect alloyium-a2a-launcher-1 --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+    | awk -F= '$1=="A2A_LAUNCHER_TOKEN"{print $2; exit}' || true
+}
+
+compose_full() {
+  local token
+  token="${A2A_LAUNCHER_TOKEN:-$(get_env_value A2A_LAUNCHER_TOKEN)}"
+  if [ -z "$token" ]; then
+    token="$(running_launcher_token)"
+  fi
+  if [ -n "$token" ]; then
+    A2A_LAUNCHER_TOKEN="$token" docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion "$@"
+  else
+    docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion "$@"
+  fi
+}
+
+generate_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n'
+    printf '\n'
+  fi
+}
+
+get_env_value() {
+  local key="$1"
+  [ -f .env ] || return 0
+  awk -F= -v k="$key" '
+    $0 !~ /^[[:space:]]*#/ && $1 == k {
+      sub(/^[^=]*=/, "")
+      sub(/\r$/, "")
+      print
+      exit
+    }
+  ' .env
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  touch .env
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^" k "=" {
+      print k "=" v
+      done = 1
+      next
+    }
+    { print }
+    END {
+      if (!done) print k "=" v
+    }
+  ' .env >"$tmp"
+  mv "$tmp" .env
+}
+
+resolve_host_path() {
+  local raw="$1"
+  case "$raw" in
+    "") printf '%s\n' "$ROOT/data/workspace" ;;
+    /*) printf '%s\n' "$raw" ;;
+    *) printf '%s\n' "$ROOT/$raw" ;;
+  esac
+}
+
+prepare_host_dirs() {
+  local workspace_raw inbox_raw workspace inbox
+  workspace_raw="$(get_env_value A2A_WORKSPACE_HOST_PATH)"
+  inbox_raw="$(get_env_value A2A_INBOX_HOST_PATH)"
+  workspace="$(resolve_host_path "${workspace_raw:-./data/workspace}")"
+  inbox="$(resolve_host_path "${inbox_raw:-./data/a2a-inbox}")"
+
+  mkdir -p "$workspace" "$inbox" 2>/dev/null || true
+
+  if [ ! -d "$workspace" ] && command -v docker >/dev/null 2>&1; then
+    mkdir -p "$ROOT/data" 2>/dev/null || true
+    docker run --rm -v "$ROOT/data:/d" alpine sh -c \
+      "mkdir -p /d/workspace /d/a2a-inbox && chown $(id -u):$(id -g) /d/workspace /d/a2a-inbox && chmod 775 /d/workspace" >/dev/null
+  fi
+
+  [ -d "$workspace" ] || die "could not create workspace directory: $workspace"
+  [ -d "$inbox" ] || die "could not create inbox directory: $inbox"
+  chown "$(id -u):$(id -g)" "$workspace" "$inbox" 2>/dev/null || true
+  chmod 775 "$workspace" 2>/dev/null || true
+}
+
+cmd_init() {
+  need_docker_compose
+  if [ ! -f .env ]; then
+    cp .env.example .env
+    printf 'created .env from .env.example\n'
+  fi
+
+  set_env_value CC_UID "$(id -u)"
+  set_env_value CC_GID "$(id -g)"
+  set_env_value A2A_LAUNCH_PROJECT_DIR "$ROOT"
+
+  if [ -z "$(get_env_value A2A_LAUNCHER_TOKEN)" ]; then
+    set_env_value A2A_LAUNCHER_TOKEN "$(generate_token)"
+    printf 'generated A2A_LAUNCHER_TOKEN in .env\n'
+  fi
+
+  if [ -z "$(get_env_value A2A_AGENT_LAUNCH_ALLOWED_IDS)" ]; then
+    set_env_value A2A_AGENT_LAUNCH_ALLOWED_IDS "codex-gw,$FULL_CODEX_AGENT_ID"
+  fi
+
+  if [ -z "$(get_env_value A2A_LAUNCH_ALLOWED_IDS)" ]; then
+    set_env_value A2A_LAUNCH_ALLOWED_IDS "codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops,$FULL_CODEX_AGENT_ID"
+  fi
+
+  prepare_host_dirs
+  printf 'initialized Alloyium local config\n'
+}
+
+delete_presence() {
+  local agent_id="$1"
+  compose_full exec -T redis redis-cli DEL "alloyium:a2a:presence:$agent_id" >/dev/null 2>&1 || true
+}
+
+replace_agent_container() {
+  local agent_id="$1"
+  docker rm -f "cc-agent-$agent_id" >/dev/null 2>&1 || true
+  delete_presence "$agent_id"
+}
+
+launch_full_codex() {
+  local replace="${1:-0}"
+  need_docker_compose
+  [ -f "$FULL_PRESET" ] || die "missing $FULL_PRESET"
+
+  if [ "$replace" = "1" ]; then
+    replace_agent_container "$FULL_CODEX_AGENT_ID"
+  fi
+
+  compose_full exec -T -e ALLOYIUM_FULL_CODEX_AGENT_ID="$FULL_CODEX_AGENT_ID" a2a-launcher sh -lc 'bun -e '\''
+const agentId = process.env.ALLOYIUM_FULL_CODEX_AGENT_ID || "codex-a2a-full-1";
+const token = process.env.A2A_LAUNCHER_TOKEN;
+if (!token) {
+  console.error("A2A_LAUNCHER_TOKEN is not set inside a2a-launcher");
+  process.exit(2);
+}
+const request = {
+  agent_id: agentId,
+  created_by: "codex-gw",
+  mode: "shim",
+  label: "full-a2a-launcher",
+  policy: { allow_write: true },
+};
+const res = await fetch("http://127.0.0.1:8910/v1/agents/codex", {
+  method: "POST",
+  headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+  body: JSON.stringify(request),
+});
+const text = await res.text();
+console.log(text);
+let body;
+try { body = JSON.parse(text); } catch { body = null; }
+if (!res.ok || !body?.ok) process.exit(1);
+'\'''
+}
+
+portal_url() {
+  local bind port host
+  bind="${A2A_PORTAL_BIND:-$(get_env_value A2A_PORTAL_BIND)}"
+  port="${A2A_PORTAL_HOST_PORT:-$(get_env_value A2A_PORTAL_HOST_PORT)}"
+  bind="${bind%%#*}"
+  bind="${bind//[[:space:]]/}"
+  port="${port%%#*}"
+  port="${port//[[:space:]]/}"
+  port="${port:-8901}"
+  case "${bind:-127.0.0.1}" in
+    0.0.0.0|127.0.0.1|localhost) host="127.0.0.1" ;;
+    *) host="$bind" ;;
+  esac
+  printf 'http://%s:%s\n' "$host" "$port"
+}
+
+cmd_verify() {
+  local target="${1:-full-codex}"
+  local url tmp
+  need_docker_compose
+  command -v curl >/dev/null 2>&1 || die "curl is required for verify"
+  url="${ALLOYIUM_PORTAL_URL:-$(portal_url)}"
+  tmp="$(mktemp)"
+
+  curl -fsS "$url/api/presence" >"$tmp" || die "portal API is not reachable at $url"
+  grep -q '"codex-gw"' "$tmp" || die "codex-gw is missing from presence"
+  grep -q '"claude-gw"' "$tmp" || die "claude-gw is missing from presence"
+  if [ "$target" = "full-codex" ]; then
+    grep -q "\"$FULL_CODEX_AGENT_ID\"" "$tmp" || die "$FULL_CODEX_AGENT_ID is missing from presence"
+    docker inspect "cc-agent-$FULL_CODEX_AGENT_ID" >/dev/null 2>&1 || die "cc-agent-$FULL_CODEX_AGENT_ID container is missing"
+  fi
+  rm -f "$tmp"
+  printf 'verified %s at %s\n' "$target" "$url"
+}
+
+parse_replace_flag() {
+  local replace=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --replace|--recreate) replace=1 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  printf '%s\n' "$replace"
+}
+
+cmd_up() {
+  local target="${1:-core}"
+  shift || true
+  local replace
+  replace="$(parse_replace_flag "$@")"
+  need_docker_compose
+  case "$target" in
+    core)
+      cmd_init
+      compose_core up -d --build
+      ;;
+    full|full-codex)
+      cmd_init
+      compose_full up -d --build
+      launch_full_codex "$replace"
+      ;;
+    *) die "unknown up target: $target" ;;
+  esac
+}
+
+cmd_launch() {
+  local target="${1:-}"
+  [ -n "$target" ] || die "launch target required"
+  shift || true
+  local replace
+  replace="$(parse_replace_flag "$@")"
+  case "$target" in
+    full|full-codex) launch_full_codex "$replace" ;;
+    *) die "unknown launch target: $target" ;;
+  esac
+}
+
+cmd_down() {
+  local target="${1:-core}"
+  need_docker_compose
+  case "$target" in
+    core)
+      compose_core down
+      ;;
+    full|full-codex)
+      docker rm -f "cc-agent-$FULL_CODEX_AGENT_ID" >/dev/null 2>&1 || true
+      compose_full down
+      ;;
+    *) die "unknown down target: $target" ;;
+  esac
+}
+
+cmd_ps() {
+  local target="${1:-core}"
+  need_docker_compose
+  case "$target" in
+    core) compose_core ps ;;
+    full|full-codex) compose_full ps ;;
+    *) die "unknown ps target: $target" ;;
+  esac
+}
+
+cmd_config() {
+  local target="${1:-core}"
+  need_docker_compose
+  case "$target" in
+    core) compose_core config ;;
+    full|full-codex) compose_full config ;;
+    *) die "unknown config target: $target" ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    init) shift; [ "$#" -eq 0 ] || die "init takes no arguments"; cmd_init ;;
+    up) shift; cmd_up "$@" ;;
+    launch) shift; cmd_launch "$@" ;;
+    verify) shift; cmd_verify "${1:-full-codex}" ;;
+    ps) shift; cmd_ps "${1:-core}" ;;
+    config) shift; cmd_config "${1:-core}" ;;
+    down) shift; cmd_down "${1:-core}" ;;
+    -h|--help|help|"") usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
