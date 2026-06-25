@@ -19,13 +19,19 @@ SHIM_BIN="${A2A_SHIM_BIN:-/usr/local/bin/a2a-shim}"
 SUBS_KEY="${SUBS_KEY:-alloyium:a2a:silent-subs:${AGENT_ID}}"
 MODEL="${CLAUDE_AGENT_MODEL:-opus}"
 EFFORT="${CLAUDE_AGENT_EFFORT:-high}"
-RUNDIR="${CLAUDE_AGENT_CWD:-/home/bun/agent}"
+# Control/runtime files this agent generates (system prompt, .mcp.json, launch script).
+# Kept OFF any shared workspace so they don't clutter the host operator's dir.
+RUNDIR="${A2A_AGENT_RUNDIR:-/home/bun/agent}"
+# The session's working directory — where the agent operates and a bare `git clone` lands.
+# Defaults to RUNDIR; point CLAUDE_AGENT_CWD at a shared workspace (e.g. /workspace) so the
+# session works there while its control files stay in RUNDIR.
+WORKDIR_AGENT="${CLAUDE_AGENT_CWD:-$RUNDIR}"
 SESSION="agent-${AGENT_ID}"
 
 # OAuth subscription only — never a baked or forwarded API key.
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL 2>/dev/null || true
 
-mkdir -p "$RUNDIR"
+mkdir -p "$RUNDIR" "$WORKDIR_AGENT"
 
 # Detached-agent directive (system-prompt backstop) — in a file to dodge shell quoting.
 cat > "${RUNDIR}/system-prompt.txt" <<'SP'
@@ -46,7 +52,7 @@ JSON
 # Launch script run inside tmux (keeps the tmux command free of nested-quote hazards).
 cat > "${RUNDIR}/launch.sh" <<LAUNCH
 #!/bin/bash
-cd "${RUNDIR}"
+cd "${WORKDIR_AGENT}"
 exec claude --name "${AGENT_ID}" --model "${MODEL}" --effort "${EFFORT}" \\
   --append-system-prompt "\$(cat "${RUNDIR}/system-prompt.txt")" \\
   --mcp-config "${RUNDIR}/.mcp.json" \\

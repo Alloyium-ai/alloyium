@@ -1,0 +1,10 @@
+# Keep the build context lean and never bake runtime state or local env into images.
+# (Images get their source via `COPY . .`; deps via bun install; build args via compose.)
+.git
+.env
+.env.*
+!.env.example
+data/
+node_modules
+**/node_modules
+*.log

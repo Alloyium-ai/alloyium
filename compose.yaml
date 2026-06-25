@@ -12,6 +12,30 @@ x-a2a-core-run-bind: &a2a-core-run-bind
   bind:
     create_host_path: true
 
+# Shared host<->agent workspace: operator drop-ins + where the agents git-clone. One dir,
+# mounted at /workspace in every tool-capable agent; owned by the host user (CC_UID) so
+# files cross the boundary cleanly. Default is repo-relative (inherits the data/ gitignore).
+x-workspace-bind: &workspace-bind
+  type: bind
+  source: ${A2A_WORKSPACE_HOST_PATH:-./data/workspace}
+  target: /workspace
+  bind:
+    create_host_path: true
+
+# Single source of truth for the container user identity. CC_UID/CC_GID feed BOTH the
+# runtime `user:` directive and the build-time uid remap (docker/lib/uidremap.sh), so the
+# image's baked `bun` user matches the host user. Defaults to 1000 (upstream) when unset.
+x-cc-build-args: &cc-build-args
+  CC_UID: ${CC_UID:-1000}
+  CC_GID: ${CC_GID:-1000}
+
+# Shared build block for every service built from the generic bun image.
+x-build-bun: &build-bun
+  context: .
+  dockerfile: docker/bun/Dockerfile
+  args:
+    <<: *cc-build-args
+
 services:
   nats:
     # Core path (no profile = started by a plain `docker compose up`).
@@ -95,9 +119,7 @@ services:
 
   onboard-a2a-portal:
     # Core path: the one-shot that mints the portal's signing key before a2a-portal starts.
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -119,9 +141,7 @@ services:
 
   a2a-portal:
     # Core path (no profile = up by default).
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -167,9 +187,7 @@ services:
         exec gosu bun:bun bun a2a_portal.ts
 
   onboard-codex-gw:
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -190,9 +208,7 @@ services:
         exec su bun -s /bin/sh -c 'bun onboard.ts codex-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
 
   onboard-claude-gw:
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -216,9 +232,7 @@ services:
     # Opt-in only (kai integration). Requires the excluded `materialize_kai_token.ts` and a
     # host vault-tokens file; NOT part of the core path. a2a-core degrades gracefully without it.
     profiles: ["gateways", "launcher", "kai"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       CC_UID: ${CC_UID:-1000}
@@ -242,6 +256,8 @@ services:
     build:
       context: .
       dockerfile: docker/a2a-core/Dockerfile
+      args:
+        <<: *cc-build-args
     user: root
     environment:
       <<: *cc-env
@@ -292,9 +308,7 @@ services:
 
   a2a-launcher:
     profiles: ["launcher"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -351,9 +365,7 @@ services:
 
   taskboard-event-bridge:
     profiles: ["taskboard"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     environment:
       <<: *cc-env
       TASKBOARD_URL: ${TASKBOARD_URL:-}
@@ -375,9 +387,7 @@ services:
 
   onboard-taskboard-dispatcher:
     profiles: ["taskboard"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -399,9 +409,7 @@ services:
 
   a2a-taskboard-dispatcher:
     profiles: ["taskboard"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     # Optional review-token overrides; absent file is fine (service reads tokens from env instead).
     env_file:
       - path: ${TASKBOARD_REVIEW_TOKENS_ENV:-./secrets/taskboard-review-tokens.env}
@@ -440,6 +448,7 @@ services:
       context: .
       dockerfile: docker/gateway-codex/Dockerfile
       args:
+        <<: *cc-build-args
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.141.0}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
@@ -457,7 +466,8 @@ services:
       CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
       CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
       CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
-      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-${HOME}/git}
+      # Authorize codex workspace-write jobs to land in the shared /workspace (plus legacy ~/git).
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${HOME}/git}
       CODEX_GW_ENABLE_A2A_TOOLS: ${CODEX_GW_ENABLE_A2A_TOOLS:-1}
       CODEX_GW_A2A_TOOLS_MODE: ${CODEX_GW_A2A_TOOLS_MODE:-shim}
       CODEX_GW_A2A_SHIM_BIN: /usr/local/bin/a2a-shim
@@ -481,6 +491,7 @@ services:
       - ${CODEX_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
       - ${CODEX_WORKSPACE_ROOT:-${HOME}/git}:${CODEX_WORKSPACE_ROOT:-${HOME}/git}
       - codex_workspaces:/workspaces
+      - *workspace-bind
     depends_on:
       redis:
         condition: service_healthy
@@ -501,6 +512,7 @@ services:
       context: .
       dockerfile: docker/gateway-claude/Dockerfile
       args:
+        <<: *cc-build-args
         CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
@@ -549,9 +561,7 @@ services:
 
   onboard-claude-agent:
     # One-shot: mint the conversational Claude agent's signing seed before it starts.
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -580,6 +590,7 @@ services:
       context: .
       dockerfile: docker/agent-claude/Dockerfile
       args:
+        <<: *cc-build-args
         CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
@@ -594,6 +605,8 @@ services:
       A2A_SHIM_BIN: /usr/local/bin/a2a-shim
       CLAUDE_AGENT_MODEL: ${CLAUDE_AGENT_MODEL:-opus}
       CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
+      # Run the session in the shared workspace so bare `git clone`s land on the host.
+      CLAUDE_AGENT_CWD: ${CLAUDE_AGENT_CWD:-/workspace}
       BRAIN_URL: ${BRAIN_URL:-}
     networks:
       - a2a-net
@@ -605,6 +618,7 @@ services:
       - ${CLAUDE_HOST_HOME:-${HOME}/.claude}:/home/bun/.claude
       - ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}:/home/bun/.claude.json
       - ${CLAUDE_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+      - *workspace-bind
     depends_on:
       redis:
         condition: service_healthy
@@ -622,9 +636,7 @@ services:
   onboard-claude-agent-b:
     # `fleet` profile: mint a 2nd conversational Claude identity (for claude<->claude).
     profiles: ["fleet"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -653,6 +665,7 @@ services:
       context: .
       dockerfile: docker/agent-claude/Dockerfile
       args:
+        <<: *cc-build-args
         CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.191}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
@@ -667,6 +680,8 @@ services:
       A2A_SHIM_BIN: /usr/local/bin/a2a-shim
       CLAUDE_AGENT_MODEL: ${CLAUDE_AGENT_MODEL:-opus}
       CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
+      # Run the session in the shared workspace so bare `git clone`s land on the host.
+      CLAUDE_AGENT_CWD: ${CLAUDE_AGENT_CWD:-/workspace}
       BRAIN_URL: ${BRAIN_URL:-}
     networks:
       - a2a-net
@@ -676,6 +691,7 @@ services:
       - ${CLAUDE_HOST_HOME:-${HOME}/.claude}:/home/bun/.claude
       - ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}:/home/bun/.claude.json
       - ${CLAUDE_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+      - *workspace-bind
     depends_on:
       redis:
         condition: service_healthy
@@ -693,9 +709,7 @@ services:
   onboard-codex-gw-b:
     # `fleet` profile: mint a 2nd codex identity (for codex<->codex).
     profiles: ["fleet"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -723,6 +737,7 @@ services:
       context: .
       dockerfile: docker/gateway-codex/Dockerfile
       args:
+        <<: *cc-build-args
         CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.141.0}
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
@@ -752,6 +767,7 @@ services:
       - ${CODEX_HOST_HOME:-${HOME}/.codex}:/home/bun/.codex
       - ${CODEX_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
       - codex_workspaces:/workspaces
+      - *workspace-bind
     depends_on:
       redis:
         condition: service_healthy
@@ -770,9 +786,7 @@ services:
   onboard-fusion-svc:
     # `fusion` profile: mint the fusion-svc identity.
     profiles: ["fusion"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: root
     environment:
       <<: *cc-env
@@ -797,9 +811,7 @@ services:
     # codex-gw (GPT-5.5) in parallel over the bus, then an Opus judge synthesizes one
     # answer. Joins the bus directly (like the portal). Needs both gateways up.
     profiles: ["fusion"]
-    build:
-      context: .
-      dockerfile: docker/bun/Dockerfile
+    build: *build-bun
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
       <<: *cc-env
@@ -838,6 +850,8 @@ services:
     build:
       context: .
       dockerfile: docker/test/Dockerfile
+      args:
+        <<: *cc-build-args
     environment:
       <<: *cc-env
       A2A_TEST_REQUIRE_BUS: ${A2A_TEST_REQUIRE_BUS:-}
