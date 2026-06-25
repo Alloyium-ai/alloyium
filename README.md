@@ -8,6 +8,8 @@ Alloyium is an agent-fabric bus system: spin up fleets of [Claude Code](https://
 
 ![Alloyium — the agent fabric](docs/alloyium-product.png)
 
+![Alloyium Portal dashboard](docs/alloyium-portal.png)
+
 ## Quickstart
 
 Alloyium runs **real** Claude Code and Codex agents driven by your own logged-in CLI — **no API keys**. Log in once on the host; the gateways reuse those sessions:
