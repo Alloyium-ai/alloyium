@@ -25,7 +25,7 @@ function fakeRedis() {
   return r as BlobRedis & { store: Map<string, string> }
 }
 
-// The EXACT wrap fusion-svc / the gateways use for a claude.job.request.v1 dispatch.
+// The EXACT wrap alloyium-cortex / the gateways use for a claude.job.request.v1 dispatch.
 const claudeWrap = (jobId: string): WrapFn => (text, extra) =>
   ({ schema: 'claude.job.request.v1', job_id: jobId, input: [{ type: 'text', text }], ...(extra ?? {}) })
 const measure = (o: unknown) => Buffer.byteLength(JSON.stringify(o), 'utf8')
@@ -141,14 +141,14 @@ describe('resolveJobInput — gateway recovers a claim-checked prompt (the recei
 })
 
 describe('buildClaimCheckedInput → resolveJobInput is the producer/consumer pair fusion uses', () => {
-  test('end-to-end: fusion-svc dispatches a >8KB opus-leg input; claude-gw recovers it intact', async () => {
+  test('end-to-end: alloyium-cortex dispatches a >8KB opus-leg input; claude-gw recovers it intact', async () => {
     const redis = fakeRedis() // ONE shared Redis — exactly the host-1 bus Redis both sides use
     const question = 'Review this spec for P0 bugs.'
     const spec = '## Spec\n' + '- requirement line that is quite verbose and detailed\n'.repeat(2_000)
     const merged = `${question}\n\n--- INPUT ---\n${spec}`
     expect(utf8ByteLength(merged)).toBeGreaterThan(CAP)
 
-    // PRODUCER (fusion-svc claudeGw): build the dispatch body
+    // PRODUCER (alloyium-cortex claudeGw): build the dispatch body
     const { body, ref } = await buildClaimCheckedInput(redis, merged, CAP, claudeWrap('fusion-claude-e2e'))
     expect(measure(body)).toBeLessThanOrEqual(CAP) // would pass validateSendArgs (NOT body_too_large)
     expect(ref).not.toBeNull()

@@ -56,7 +56,7 @@ your own.
 
 ## 1a. Full local fabric preset
 
-For a fresh clone where you want the launcher, fleet peers, fusion service, shared
+For a fresh clone where you want the launcher, fleet peers, Alloyium Cortex, shared
 workspace, and a fully A2A-enabled Codex peer that can launch additional peers:
 
 ```bash

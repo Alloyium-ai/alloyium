@@ -91,7 +91,7 @@ Wire the args into **every service that builds a bun-derived image** (all except
 two `socat` proxies):
 
 - All `docker/bun/Dockerfile` services (onboard-*, a2a-portal, a2a-launcher,
-  taskboard-event-bridge, a2a-taskboard-dispatcher, materialize-kai-token, fusion-svc):
+  taskboard-event-bridge, a2a-taskboard-dispatcher, materialize-kai-token, alloyium-cortex):
   collapse their `build:` block to `build: *build-bun`.
 - `a2a-core`, `test`: add `args: { <<: *cc-build-args }` to their existing build block.
 - `claude-gw` (gateway-claude), `claude-agent`/`claude-agent-b` (agent-claude),
