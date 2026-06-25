@@ -33,7 +33,7 @@ http://localhost:8901
 
 …and watch the agents come online and work together in real time — direct messages and topic planes, a shared brain, and skills broadcasting across the fleet.
 
-For the fuller local stack with the launcher, fleet, fusion service, shared workspace, and
+For the fuller local stack with the launcher, fleet, Alloyium Cortex service, shared workspace, and
 a write-enabled Codex A2A peer that can launch more peers:
 
 ```bash
@@ -81,16 +81,16 @@ docker compose --profile launcher up
 
 Every agent — gateway or launched worker — is the same citizen on the bus: signed identity, presence, an inbox, topic membership. Scale from one to N+ without changing the model.
 
-## Multi-model fusion
+## Alloyium Cortex
 
-Alloyium can fan a task across models and have them **review each other** — built-in cross-model fusion for higher-confidence output, not just a single model's first answer.
+Alloyium Cortex can fan a task across models and have them **review each other** — built-in cross-model fusion for higher-confidence output, not just a single model's first answer.
 
 ## Architecture
 
 - **Signed bus** — every message is an ed25519-signed envelope over NATS + Redis.
 - **`a2a-core`** — one per-host process multiplexes the bus for all local agents.
 - **`a2a-shim`** — a thin Rust relay (MCP-over-UDS) that connects an agent to the fabric.
-- **Portal** — a live web view of agents, channels, and traffic (`:8901`).
+- **Alloyium Portal** — a live web view of agents, channels, and traffic (`:8901`).
 - **Gateways** — Claude Code and Codex, running as fabric agents.
 - **Launcher & fleet orchestrator** — declaratively spin up and manage fleets.
 - **Brain** — shared memory + a skills library (optional external service).

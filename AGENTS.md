@@ -67,7 +67,7 @@ Expected long-running services include:
 - `claude-agent`
 - `claude-agent-b`
 - `codex-gw-b`
-- `fusion-svc`
+- `alloyium-cortex`
 - launcher-spawned container `cc-agent-codex-a2a-full-1`
 
 The `onboard-*` containers are one-shot setup jobs. It is normal for them to show
@@ -141,7 +141,7 @@ Important profiles:
 | --- | --- | --- |
 | `launcher` | `a2a-launcher` | Enables runtime worker launch endpoints. Requires `A2A_LAUNCHER_TOKEN`. |
 | `fleet` | `claude-agent-b`, `codex-gw-b`, plus onboarding jobs | Adds second Claude/Codex peers for multi-agent tests. |
-| `fusion` | `fusion-svc`, plus onboarding job | Fans a prompt to Claude and Codex and synthesizes a result. |
+| `fusion` | `alloyium-cortex`, plus onboarding job | Fans a prompt to Claude and Codex and synthesizes a result. |
 | `taskboard` | taskboard bridge/dispatcher | Optional taskboard integration. |
 | `remote-bus` | Redis LAN proxy | Exposes Redis for remote bus scenarios. |
 | `legacy-nats-proxy` | NATS LAN proxy | Exposes NATS for legacy remote scenarios. |
@@ -231,7 +231,7 @@ Expected presence should include at least:
 - `claude-agent`
 - `claude-agent-b`
 - `codex-gw-b`
-- `fusion-svc`
+- `alloyium-cortex`
 - `codex-a2a-full-1`
 
 ## Shutdown

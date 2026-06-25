@@ -17,7 +17,7 @@ const PROMPT_FILE = process.argv[2]
 const INPUT_FILE = process.argv[3] && !process.argv[3].startsWith('--') && !/^\d+$/.test(process.argv[3]) ? process.argv[3] : undefined
 const TIMEOUT_MS = Number(process.argv.find((a) => /^\d+$/.test(a) && Number(a) > 1000) ?? 28_800_000) // 8h library default (≥ service ≥ gateway) for programmatic/ML callers; interactive wrappers pass a short bound DOWNWARD
 const PANEL_ONLY = process.argv.includes('--panel')
-const TARGET = process.env.FUSION_SVC_ID ?? 'fusion-svc'
+const TARGET = process.env.ALLOYIUM_CORTEX_AGENT_ID ?? process.env.ALLOYIUM_CORTEX_ID ?? process.env.FUSION_SVC_ID ?? 'alloyium-cortex'
 if (!PROMPT_FILE) { console.error('usage: bun fusion_client.ts <prompt-file> [input_file] [timeout_ms] [--panel]'); process.exit(2) }
 
 const prompt = (await Bun.file(PROMPT_FILE).text()).trim()
@@ -36,7 +36,7 @@ const a2a = new A2AChannel(onInbound as any, { enabled: true, agentId: process.e
 await a2a.start()
 if (!a2a.isStarted()) { console.error('[client] FATAL: bus join failed'); process.exit(1) }
 console.error(`[client] dispatching Alloyium Panel job ${job_id} → ${TARGET}`)
-// REMOTE-SAFE input: claim-check the input file into a Redis blob (fusion-svc on host-1
+// REMOTE-SAFE input: claim-check the input file into a Redis blob (alloyium-cortex on host-1
 // reads the blob from shared Redis — NEVER the caller's local filesystem) and pass a tiny
 // `input_ref`, instead of a local path host-1 cannot open. Works identically local/remote;
 // the question (prompt) stays inline (small). REDIS_URL must point at the bus's Redis.

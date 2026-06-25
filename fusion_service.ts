@@ -1,6 +1,6 @@
 // fusion_service.ts — STANDING Alloyium Panel bus service.
 //
-// Joins the A2A bus as `fusion-svc` and answers Alloyium Panel jobs: dispatches
+// Joins the A2A bus as `alloyium-cortex` and answers Alloyium Panel jobs: dispatches
 // a prompt to a panel of different models in parallel, then an Opus judge
 // synthesizes one answer (consensus / contradictions / unique insights).
 //   panel  = Opus (the RUNNING claude-gw, over the bus)  +  GPT-5.5 (the RUNNING codex-gw app-server, over the bus)
@@ -9,7 +9,7 @@
 // one-shot is spawned here. Mirrors the GPT-5.5/codex-gw dispatch exactly.
 //
 // Contract:
-//   inbound  request -> fusion-svc inbox:
+//   inbound  request -> alloyium-cortex inbox:
 //     { schema:'fusion.job.request.v1', job_id?, prompt, input_file?, input_ref?, models?, judge?, panel_only? }
 //     input_ref = { result_ref, sha256, len } — a claim-check Redis blob (REMOTE-SAFE: host-1
 //       reads it; preferred over input_file, which must be a SAME-HOST path).
@@ -22,14 +22,14 @@ import { A2AChannel } from './a2a-channel.ts'
 import { RedisClient } from 'bun'
 import { putBlob, delBlob, previewMarked, truncateToBytes, sentOk, sendError, resolveRef, getBlob, buildClaimCheckedInput, type BlobRef, type WrapFn } from './output_transport.ts'
 
-const AGENT_ID = process.env.A2A_AGENT_ID ?? 'fusion-svc'
+const AGENT_ID = process.env.A2A_AGENT_ID ?? process.env.ALLOYIUM_CORTEX_AGENT_ID ?? process.env.FUSION_SVC_AGENT_ID ?? 'alloyium-cortex'
 const CODEX_GW = process.env.CODEX_GW_ID ?? 'codex-gw'
 const CLAUDE_GW = process.env.CLAUDE_GW_ID ?? 'claude-gw'
 // 8h service ceiling (never preempts a gateway turn): an ML/deep-analysis panel leg
 // may run long. Per-job callers (fusion-ask) bound DOWNWARD via their own client timeout.
 const CLAUDE_TIMEOUT_MS = Number(process.env.FUSION_CLAUDE_TIMEOUT_MS ?? 28_800_000)
 const CODEX_TIMEOUT_MS = Number(process.env.FUSION_CODEX_TIMEOUT_MS ?? 28_800_000)
-const log = (...a: any[]) => console.error(`[fusion-svc]`, ...a)
+const log = (...a: any[]) => console.error(`[${AGENT_ID}]`, ...a)
 const uid = (p: string) => `${p}-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`
 
 let a2a: A2AChannel
@@ -233,4 +233,4 @@ async function onInbound(content: string, attrs: any) {
 a2a = new A2AChannel(onInbound as any, { enabled: true, agentId: AGENT_ID })
 await a2a.start()
 if (!a2a.isStarted()) { log('FATAL: could not join bus (duplicate id / stale presence?)'); process.exit(1) }
-log(`bus joined as '${AGENT_ID}'. Alloyium Panel fusion.job.* ready (panel: opus via ${CLAUDE_GW} + gpt-5.5 via ${CODEX_GW}, judge: opus via ${CLAUDE_GW}).`)
+log(`bus joined as '${AGENT_ID}'. Alloyium Cortex fusion.job.* ready (panel: opus via ${CLAUDE_GW} + gpt-5.5 via ${CODEX_GW}, judge: opus via ${CLAUDE_GW}).`)

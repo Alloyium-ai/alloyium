@@ -789,13 +789,14 @@ services:
       start_period: 20s
     command: ["bun", "codex_gateway.ts"]
 
-  onboard-fusion-svc:
-    # `fusion` profile: mint the fusion-svc identity.
+  onboard-alloyium-cortex:
+    # `fusion` profile: mint the alloyium-cortex identity.
     profiles: ["fusion"]
     build: *build-bun
     user: root
     environment:
       <<: *cc-env
+      ALLOYIUM_CORTEX_AGENT_ID: ${ALLOYIUM_CORTEX_AGENT_ID:-${FUSION_SVC_AGENT_ID:-alloyium-cortex}}
     networks:
       - a2a-net
     volumes:
@@ -810,9 +811,9 @@ services:
       - |
         mkdir -p /run/secrets/a2a
         chown -R bun:bun /run/secrets/a2a
-        exec su bun -s /bin/sh -c 'bun onboard.ts fusion-svc --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+        exec su bun -s /bin/sh -c 'bun onboard.ts "$${ALLOYIUM_CORTEX_AGENT_ID}" --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
 
-  fusion-svc:
+  alloyium-cortex:
     # `fusion` profile: the cross-model panel. Dispatches a prompt to claude-gw (Opus) +
     # codex-gw (GPT-5.5) in parallel over the bus, then an Opus judge synthesizes one
     # answer. Joins the bus directly (like the portal). Needs both gateways up.
@@ -821,10 +822,11 @@ services:
     user: "${CC_UID:-1000}:${CC_GID:-1000}"
     environment:
       <<: *cc-env
+      ALLOYIUM_CORTEX_AGENT_ID: ${ALLOYIUM_CORTEX_AGENT_ID:-${FUSION_SVC_AGENT_ID:-alloyium-cortex}}
       A2A_ENABLED: "1"
-      A2A_AGENT_ID: ${FUSION_SVC_AGENT_ID:-fusion-svc}
+      A2A_AGENT_ID: ${ALLOYIUM_CORTEX_AGENT_ID:-${FUSION_SVC_AGENT_ID:-alloyium-cortex}}
       A2A_SIG_ALG: ed25519
-      A2A_SIGNING_KEY: /run/secrets/a2a/${FUSION_SVC_AGENT_ID:-fusion-svc}.seed
+      A2A_SIGNING_KEY: /run/secrets/a2a/${ALLOYIUM_CORTEX_AGENT_ID:-${FUSION_SVC_AGENT_ID:-alloyium-cortex}}.seed
       A2A_TRANSPORT_AUTH: none
       A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
       CODEX_GW_ID: ${CODEX_GW_AGENT_ID:-codex-gw}
@@ -836,7 +838,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      onboard-fusion-svc:
+      onboard-alloyium-cortex:
         condition: service_completed_successfully
       claude-gw:
         condition: service_healthy

@@ -27,7 +27,7 @@ export const BLOB_KEY_PREFIX = process.env.A2A_BLOB_KEY_PREFIX ?? 'alloyium:a2a:
 export const REDIS_OP_TIMEOUT_MS = Number(process.env.A2A_BLOB_REDIS_TIMEOUT_MS ?? 2500)
 export const PREVIEW_BYTES = Number(process.env.A2A_OUTPUT_PREVIEW_BYTES ?? 1024)
 // Ceiling on a claim-checked INPUT blob — bounds Redis pressure (incl. the double-blob
-// client→fusion-svc→gateway path). A spec/diff is ≪ this; an abusive multi-MB input is
+// client→alloyium-cortex→gateway path). A spec/diff is ≪ this; an abusive multi-MB input is
 // rejected LOUDLY rather than silently parked in Redis. Generous default, env-tunable.
 export const MAX_INPUT_BYTES = Number(process.env.A2A_MAX_INPUT_BYTES ?? 16 * 1024 * 1024)
 
@@ -253,7 +253,7 @@ export function fitTruncate(full: string, bodyCap: number, wrap: WrapFn): { kind
 }
 
 // ── request-INPUT planning (the producer mirror of planReply) ───────────────────
-// A dispatch (fusion-svc → claude-gw/codex-gw, or a client → fusion-svc) carries the
+// A dispatch (alloyium-cortex → claude-gw/codex-gw, or a client → alloyium-cortex) carries the
 // PROMPT in a body that is byte-capped exactly like a reply. The judge fan-in (both
 // panel answers) and the opus-leg input routinely exceed 8 KiB → the bus REJECTS the
 // send and the job silently drops. Same disease as the reply path (RCA Issue 1), same

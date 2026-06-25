@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// a2a-portal — a live Slack/Discord-style web view of the A2A bus.
+// Alloyium Portal — a live Slack/Discord-style web view of the A2A bus.
 //
 // Captures every message on alloyium.a2a.> (topics + agent inboxes), tracks presence
 // from Redis, and serves a single-page UI: channels in the sidebar, click one to
@@ -8,7 +8,7 @@
 //   bun a2a_portal.ts            # serves on 0.0.0.0:8900 (override A2A_PORTAL_PORT)
 //
 // Monitor + operator send surface. Reads the full A2A namespace directly, and can
-// publish through a normal signed A2AChannel when an a2a-portal identity is configured.
+// publish through a normal signed A2AChannel when the portal identity is configured.
 import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
 import { randomUUID } from 'node:crypto'
@@ -522,7 +522,7 @@ Bun.serve({
 })
 
 const HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>A2A Portal</title><style>
+<title>Alloyium Portal</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0b0d12;--bg2:#12151c;--bg3:#1a1e27;--line:#222733;--tx:#d7dce5;--mut:#7b8494;--acc:#5b8cff;--ok:#36d399;--bad:#ff6b8a;--side-w:310px}
 html,body{height:100%;-webkit-text-size-adjust:100%}body{font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx);display:flex;height:100vh;overflow:hidden}
@@ -663,9 +663,9 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 @media(max-width:760px){.fleet .metric{padding:9px 5px}.homebtn{min-height:44px;padding:12px 16px}.dash{padding-bottom:18px}.dash-head{align-items:flex-start;flex-direction:column;margin-top:2px}.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.dash-card{padding:10px 9px}.dash-card .num{font-size:20px}.dash-card .lab{font-size:9px}.panel{padding:12px}.chart{height:132px}.row{gap:8px}}
 </style></head><body class="tab-chat">
 <div class="side">
-  <div class="brand"><span class="dot"></span> A2A Portal</div>
+  <div class="brand"><span class="dot"></span> Alloyium Portal</div>
   <div class="fleet" id="fleetStats" aria-label="Fleet stats"></div>
-  <button class="homebtn active" id="homeBtn" type="button">Fleet Dashboard</button>
+  <button class="homebtn active" id="homeBtn" type="button">Dashboard</button>
   <div class="sec">Agents</div><div id="presence"></div>
   <div class="sec">Channels</div><div class="list" id="channels"></div>
 </div>
@@ -775,9 +775,9 @@ async function loadFleet(){let r;try{r=await(await fetch('/api/fleet')).json()}c
 async function loadPresence(){return loadFleet()}
 function openHome(){active=HOME;if(activeTab!=='chat')setTab('chat');closeNavOnMobile();renderSidebar();renderDashboard(fleetData);updateComposerState()}
 function renderDashboard(data){const el=$('#msgs');if(!el)return;const d=data||{stats:fleetStats,presence:presenceList,servers:[],teams:[],activity:{agents:[],trend:[]},taskboard:null};const s=d.stats||{}
-  $('#title').textContent='Fleet Dashboard';$('#meta').textContent=(s.online_agents??s.agents??0)+' online · '+metricValue(s.messages)+' messages'
+  $('#title').textContent='Alloyium Portal';$('#meta').textContent=(s.online_agents??s.agents??0)+' online · '+metricValue(s.messages)+' messages'
   const taskNote=d.taskboard&&d.taskboard.enabled?'Taskboard project '+d.taskboard.project_id:(d.taskboard?'Tasks disabled: '+(d.taskboard.error||'disabled'):'Live bus status')
-  el.innerHTML='<div class="dash"><div class="dash-head"><div><div class="dash-title">Fleet Dashboard</div><div class="dash-sub">'+esc(taskNote)+'</div></div></div>'+
+  el.innerHTML='<div class="dash"><div class="dash-head"><div><div class="dash-title">Fleet Overview</div><div class="dash-sub">'+esc(taskNote)+'</div></div></div>'+
     '<div class="dash-grid">'+dashboardCells(s,d.taskboard).map(([k,v,title])=>'<div class="dash-card'+(k==='UNMAPPED'&&Number(v)>0?' warn':'')+'" title="'+escAttr(title)+'"><span class="num">'+esc(metricValue(v))+'</span><span class="lab">'+esc(k)+'</span></div>').join('')+'</div>'+
     '<div class="dash-panels">'+
       '<div class="panel"><h3>Message volume</h3>'+messageVolumeSvg(d.activity&&d.activity.trend||[])+'</div>'+
@@ -945,7 +945,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
     listChannels,
     readChannel: readPortalChannel,
   })
-  nc = await connect({ servers: NATS_URL, name: 'a2a-portal' })
+  nc = await connect({ servers: NATS_URL, name: 'alloyium-portal' })
   const sub = nc.subscribe('alloyium.a2a.>')
   console.error(`[portal] serving http://0.0.0.0:${PORT}  (NATS ${NATS_URL})`)
   ;(async () => { for await (const m of sub) onMessage(m.subject, m.data) })()
