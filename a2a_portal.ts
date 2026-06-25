@@ -14,6 +14,7 @@ import { RedisClient } from 'bun'
 import { randomUUID } from 'node:crypto'
 import { A2AChannel } from './a2a-channel.ts'
 import { buildPortalDefaultCwd, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
+import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
 
@@ -198,8 +199,16 @@ let sendChannel: A2AChannel | null = null
 let sendStatus: { enabled: boolean; agent_id: string; error: string } = { enabled: false, agent_id: PORTAL_AGENT_ID, error: SEND_ENABLED ? 'not_started' : 'disabled' }
 let langchainAgent: PortalLangChainAgent | null = null
 
-async function presence(): Promise<any[]> {
-  const out: any[] = []
+function portalHostOptions(): { knownHosts: LogicalHost[]; aliases: Record<string, LogicalHost>; containerHostFallback: LogicalHost } {
+  const knownHosts = parseKnownHosts(process.env.A2A_PORTAL_KNOWN_HOSTS)
+  const aliases = parseHostAliases(process.env.A2A_PORTAL_HOST_ALIASES, knownHosts)
+  const fallback = String(process.env.A2A_PORTAL_CONTAINER_HOST_FALLBACK || knownHosts[0] || 'local').trim().toLowerCase()
+  const containerHostFallback = knownHosts.includes(fallback) ? fallback : (knownHosts[0] || 'local')
+  return { knownHosts, aliases, containerHostFallback }
+}
+
+async function rawPresence(): Promise<RawPresence[]> {
+  const out: RawPresence[] = []
   try {
     const keys: string[] = []
     // bun RedisClient has no scan helper; use SCAN via send
@@ -211,11 +220,31 @@ async function presence(): Promise<any[]> {
     for (const k of keys) {
       const id = k.split(':').pop()!
       const ttl = Number(await redis.send('TTL', [k]))
-      let host = ''; try { host = JSON.parse((await redis.get(k)) ?? '{}').host ?? '' } catch {}
-      out.push({ id, host, ttl })
+      let rec: any = {}; try { rec = JSON.parse((await redis.get(k)) ?? '{}') } catch {}
+      out.push({ id, host: rec.host ?? '', ttl, logical_host: rec.logical_host })
     }
   } catch {}
   return out.sort((a, b) => a.id.localeCompare(b.id))
+}
+
+function capturedActivityMessages(): FleetActivityMessage[] {
+  const byId = new Map<string, Msg>()
+  for (const c of channels.values()) {
+    for (const m of c.msgs) byId.set(m.id, m)
+  }
+  for (const m of langchainAgent?.messages() ?? []) byId.set(m.id, m as Msg)
+  return [...byId.values()].map(m => ({ from: m.from, to: m.to, t: m.t }))
+}
+
+async function fleet(): Promise<Fleet> {
+  return computeFleet(await rawPresence(), portalHostOptions(), {
+    messages: capturedActivityMessages(),
+    taskboard: disabledTaskboardTotals(),
+  })
+}
+
+async function presence(): Promise<FleetPresence[]> {
+  return (await fleet()).presence
 }
 
 async function startSendChannel() {
@@ -454,7 +483,8 @@ Bun.serve({
     if (p === '/api/channels') {
       return json({ channels: listChannels() })
     }
-    if (p === '/api/presence') return json({ presence: await presence() })
+    if (p === '/api/fleet') return json(await fleet())
+    if (p === '/api/presence') return json({ presence: (await presence()).map(fp => ({ ...fp, host: fp.logical_host })) })
     if (p === '/api/skills') return json({ skills: await readSkills(), feed: brainFeed })
     const mc = p.match(/^\/api\/channels\/(.+)$/)
     if (mc) {
@@ -503,6 +533,13 @@ body.resizing{cursor:col-resize;user-select:none}
 .scrim{display:none}
 .brand{padding:14px 16px;font-weight:700;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
 .brand .dot{width:9px;height:9px;border-radius:50%;background:#36d399;box-shadow:0 0 8px #36d399}
+.fleet{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
+.fleet .metric{min-width:0;background:var(--bg2);padding:8px 6px;text-align:center}
+.fleet .v{display:block;font-size:16px;font-weight:800;line-height:1.05;color:#eef2f8;font-variant-numeric:tabular-nums}
+.fleet .k{display:block;margin-top:3px;color:var(--mut);font-size:9px;line-height:1;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fleet .metric.warn .v,.fleet .metric.warn .k{color:var(--bad)}
+.homebtn{width:100%;border:0;border-bottom:1px solid var(--line);background:var(--bg2);color:var(--tx);padding:10px 14px;text-align:left;font:13px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-weight:700;cursor:pointer}
+.homebtn:hover,.homebtn.active{background:var(--bg3);color:#eef2f8}
 .sec{padding:12px 12px 4px;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .list{overflow:auto;flex:1 1 0;min-height:120px}
 #presence{flex:0 1 auto;max-height:min(42vh,360px);min-height:88px;overflow:auto;border-bottom:1px solid var(--line)}
@@ -549,6 +586,18 @@ body.resizing{cursor:col-resize;user-select:none}
 	.body.rendered code{font:12px ui-monospace,Menlo,Consolas,monospace;background:var(--bg2);border:1px solid var(--line);border-radius:4px;padding:1px 4px;color:#a8b6cc}.body.rendered pre code{background:transparent;border:0;padding:0}
 	.body.rendered a{color:#8fb0ff;text-decoration:none}.body.rendered a:hover{text-decoration:underline}
 	.body.rendered table{border-collapse:collapse;margin:8px 0 10px;display:block;max-width:100%;overflow:auto}.body.rendered th,.body.rendered td{border:1px solid var(--line);padding:5px 8px;text-align:left}.body.rendered th{background:var(--bg2)}
+.dash{max-width:1280px;margin:0 auto;padding-bottom:28px}
+.dash-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:4px 0 16px}
+.dash-title{font-size:20px;font-weight:800;color:#eef2f8;line-height:1.2}.dash-sub{color:var(--mut);font-size:12px;margin-top:4px}
+.dash-grid{display:grid;grid-template-columns:repeat(8,minmax(88px,1fr));gap:8px;margin-bottom:16px}
+.dash-card{min-width:0;background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:11px 12px}
+.dash-card.warn{border-color:#5b2634;background:#171118}.dash-card .num{display:block;color:#eef2f8;font-size:22px;font-weight:800;line-height:1.05;font-variant-numeric:tabular-nums}.dash-card.warn .num{color:var(--bad)}
+.dash-card .lab{display:block;margin-top:7px;color:var(--mut);font-size:10px;line-height:1;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dash-panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:12px}
+.panel{min-width:0;background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:14px}
+.panel h3{font-size:13px;margin:0 0 10px;color:#eef2f8}.chart{width:100%;height:150px;display:block}.chart text{fill:var(--mut);font-size:10px}.chart .grid{stroke:#242a36;stroke-width:1}.chart .line{fill:none;stroke:var(--acc);stroke-width:2.4}.chart .fill{fill:rgba(91,140,255,.16)}.chart .bar{fill:var(--ok)}.chart .offbar{fill:#5b6575}.chart .mutbar{fill:var(--acc)}
+.rows{display:grid;gap:8px}.row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:9px 0;border-top:1px solid #171b24}.row:first-child{border-top:0;padding-top:0}.row-main{min-width:0}.row-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-meta{color:var(--mut);font-size:12px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-num{font-weight:800;color:#eef2f8;font-variant-numeric:tabular-nums}.mini{height:6px;border-radius:3px;background:var(--bg);overflow:hidden;margin-top:7px}.mini span{display:block;height:100%;background:var(--acc)}
+.dash-empty{color:var(--mut);padding:18px 0;text-align:center}
 .empty{color:var(--mut);text-align:center;margin-top:80px}
 .thr{color:var(--mut);font-size:11px}
 .composer{border-top:1px solid var(--line);background:var(--bg2);padding:10px 12px;display:grid;grid-template-columns:180px 104px 112px 96px 1fr 80px;gap:8px;align-items:end;flex:0 0 auto}
@@ -609,10 +658,14 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 .fi .ic{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:0 0 8px}
 .fi .ft{flex:1;min-width:0}.fi .ft .h{font-size:12px;color:var(--tx)}.fi .ft .s{font-size:11px;color:var(--mut);margin-top:2px;word-break:break-word}
 .fi .ts2{color:var(--mut);font-size:10px;white-space:nowrap}
+@container (max-width:980px){.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.dash-panels{grid-template-columns:1fr}}
 @media(max-width:760px){.tab{padding:8px 12px}.brain-grid{grid-template-columns:1fr}#brainPanel{padding:10px 12px}}
+@media(max-width:760px){.fleet .metric{padding:9px 5px}.homebtn{min-height:44px;padding:12px 16px}.dash{padding-bottom:18px}.dash-head{align-items:flex-start;flex-direction:column;margin-top:2px}.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.dash-card{padding:10px 9px}.dash-card .num{font-size:20px}.dash-card .lab{font-size:9px}.panel{padding:12px}.chart{height:132px}.row{gap:8px}}
 </style></head><body class="tab-chat">
 <div class="side">
   <div class="brand"><span class="dot"></span> A2A Portal</div>
+  <div class="fleet" id="fleetStats" aria-label="Fleet stats"></div>
+  <button class="homebtn active" id="homeBtn" type="button">Fleet Dashboard</button>
   <div class="sec">Agents</div><div id="presence"></div>
   <div class="sec">Channels</div><div class="list" id="channels"></div>
 </div>
@@ -620,7 +673,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 <div class="scrim" id="scrim"></div>
 <div class="main">
   <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
-  <div class="msgs" id="msgs"><div class="empty">Select a channel</div></div>
+  <div class="msgs" id="msgs"><div class="empty">Loading fleet dashboard</div></div>
   <div class="composer">
     <input id="sendTo" autocomplete="off" spellcheck="false" aria-label="Recipient" placeholder="@agent or #topic">
     <select id="sendType" aria-label="Message type"><option value="request">request</option><option value="msg">msg</option></select>
@@ -641,7 +694,8 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
   <script>
   const $=s=>document.querySelector(s)
   const LANGCHAIN_CHANNEL='${PORTAL_LANGCHAIN_CHANNEL}'
-  let active=null, chans=[], presenceList=[], sendReady=false, portalAgent='', currentMsgs=[]
+  const HOME='__fleet_dashboard__'
+  let active=HOME, chans=[], presenceList=[], fleetStats=null, fleetData=null, sendReady=false, portalAgent='', currentMsgs=[]
   let activeTab='chat', skillsData=[], feedData=[], freshSkills={}
   let langchainReady=false, langchainError='', langchainModel=''
   let renderOutput=localStorage.getItem('a2a.portal.renderOutput')==='1'
@@ -670,7 +724,9 @@ function setupSidebarResize(){const r=$('#sideResizer');if(!r)return;const isMob
   r.addEventListener('keydown',e=>{if(isMobile())return;if(e.key==='Home'||e.key==='End'||e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();const b=sideBounds();const cur=storedSideWidth();const next=e.key==='Home'?b.min:e.key==='End'?b.max:cur+(e.key==='ArrowRight'?16:-16);applySideWidth(next)}})
   window.addEventListener('resize',()=>{if(!isMobile())applySideWidth(storedSideWidth())})}
 function setupPresenceClicks(){const el=$('#presence');if(!el)return;el.addEventListener('click',e=>{const target=e.target&&e.target.closest?e.target:null;const row=target&&target.closest('.pr[data-agent]');if(row&&row.dataset.agent)open_('@'+row.dataset.agent)})}
-function setupRenderToggle(){const cb=$('#renderOutput');if(!cb)return;cb.checked=renderOutput;cb.onchange=()=>{renderOutput=cb.checked;localStorage.setItem('a2a.portal.renderOutput',renderOutput?'1':'0');render(currentMsgs)}}
+function setupChannelClicks(){const el=$('#channels');if(!el)return;el.addEventListener('click',e=>{const target=e.target&&e.target.closest?e.target:null;const row=target&&target.closest('.ch[data-ch]');if(row&&row.dataset.ch)open_(row.dataset.ch)})}
+function setupHome(){const b=$('#homeBtn');if(b)b.onclick=openHome}
+function setupRenderToggle(){const cb=$('#renderOutput');if(!cb)return;cb.checked=renderOutput;cb.onchange=()=>{renderOutput=cb.checked;localStorage.setItem('a2a.portal.renderOutput',renderOutput?'1':'0');active===HOME?renderDashboard(fleetData):render(currentMsgs)}}
   function setupSendMode(){const el=$('#sendMode');if(!el)return;el.value=sendMode==='one-off'?'one-off':'chat';el.onchange=()=>{sendMode=el.value==='one-off'?'one-off':'chat';localStorage.setItem('a2a.portal.sendMode',sendMode)}}
   function loadChatContexts(){try{const v=JSON.parse(localStorage.getItem('a2a.portal.chatContexts')||'{}');return v&&typeof v==='object'?v:{}}catch{return {}}}
   function saveChatContexts(){localStorage.setItem('a2a.portal.chatContexts',JSON.stringify(chatContexts))}
@@ -684,10 +740,11 @@ function primaryForAgent(id){const s=String(id||''),i=s.indexOf('-sub-');return 
 function isOnlinePresence(p){return p&&Number(p.ttl)>0}
 function sortedPresenceItems(items){return [...items].sort((a,b)=>{const ao=isOnlinePresence(a)?0:1,bo=isOnlinePresence(b)?0:1;if(ao!==bo)return ao-bo;return String(a.id).localeCompare(String(b.id))})}
 function presenceGroupOnline(g){return isOnlinePresence(g.primary)||g.subs.some(isOnlinePresence)}
-function renderAgentRow(p,cls=''){const id=String(p.id||''),self=id===portalAgent;return '<div class="pr'+(cls?' '+cls:'')+(active==='@'+id?' active':'')+(self?' self':'')+'" '+(self?'':'data-agent="'+escAttr(id)+'"')+'><span class="d'+(isOnlinePresence(p)?'':' off')+'"></span><span class="agent-name" style="color:'+color(id)+'">'+esc(id)+'</span><span class="host">'+(self?'you':'')+'</span></div>'}
+function renderAgentRow(p,cls=''){const id=String(p.id||''),self=id===portalAgent;const raw=String(p.raw_host||p.host||''),tip=id+(raw?' @ '+raw:'')+(p.host_source?' ['+p.host_source+']':'');return '<div class="pr'+(cls?' '+cls:'')+(active==='@'+id?' active':'')+(self?' self':'')+'" title="'+escAttr(tip)+'" '+(self?'':'data-agent="'+escAttr(id)+'"')+'><span class="d'+(isOnlinePresence(p)?'':' off')+'"></span><span class="agent-name" style="color:'+color(id)+'">'+esc(id)+'</span><span class="host">'+(self?'you':'')+'</span></div>'}
 function renderPresenceGroups(items){if(!items.length)return '<div class="pr" style="color:#7b8494">none</div>'
-  const hosts=new Map();for(const p of items){const h=String(p.host||'').trim()||'unknown host';if(!hosts.has(h))hosts.set(h,[]);hosts.get(h).push(p)}
-  return [...hosts.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([host,agents])=>{
+  const hosts=new Map();for(const p of items){let h=String(p.logical_host||p.host||'').trim()||'unknown';if(h==='unknown')h='unmapped';if(!hosts.has(h))hosts.set(h,[]);hosts.get(h).push(p)}
+  const order=(fleetData&&fleetData.servers?fleetData.servers.map(s=>s.logical_host):[]),horder=h=>{const i=order.indexOf(h);return i<0?order.length:i}
+  return [...hosts.entries()].sort((a,b)=>{const d=horder(a[0])-horder(b[0]);return d!==0?d:a[0].localeCompare(b[0])}).map(([host,agents])=>{
     const byPrimary=new Map();for(const p of sortedPresenceItems(agents)){const primary=primaryForAgent(p.id);if(!byPrimary.has(primary))byPrimary.set(primary,{primary:null,subs:[]});const g=byPrimary.get(primary);if(primary===p.id)g.primary=p;else g.subs.push(p)}
     const rows=[...byPrimary.entries()].sort((a,b)=>{const ao=presenceGroupOnline(a[1])?0:1,bo=presenceGroupOnline(b[1])?0:1;if(ao!==bo)return ao-bo;return a[0].localeCompare(b[0])}).map(([primary,g])=>{
       const parts=[];if(g.primary)parts.push(renderAgentRow(g.primary));else parts.push('<div class="pr placeholder"><span class="d off"></span><span class="agent-name">'+esc(primary)+'</span><span class="host">primary</span></div>')
@@ -696,7 +753,55 @@ function renderPresenceGroups(items){if(!items.length)return '<div class="pr" st
     }).join('')
     return '<div class="hostgrp"><div class="hosthead">'+esc(host)+'</div>'+rows+'</div>'
   }).join('')}
-async function loadPresence(){const r=await(await fetch('/api/presence')).json();presenceList=r.presence||[];const el=$('#presence');el.innerHTML=renderPresenceGroups(presenceList)}
+function metricValue(v){return v===null||v===undefined?'—':v}
+function dashboardCells(stats,taskboard){const s=stats||{servers:0,online_agents:0,offline_agents:0,pms:0,teams:0,unmapped:0,messages:0,active_agents:0,open_tasks:null,done_tasks:null}
+  const taskTitle=taskboard&&taskboard.enabled?'open '+metricValue(s.open_tasks)+' · done '+metricValue(s.done_tasks):(taskboard&&taskboard.error?taskboard.error:'disabled')
+  const cells=[
+    ['SERVERS',s.servers,'Servers with online agents'],
+    ['ONLINE',s.online_agents??s.agents??0,'Online agents'],
+    ['OFFLINE',s.offline_agents??0,'Offline presence records'],
+    ['PMs',s.pms,'Present PM agents'],
+    ['TEAMS',s.teams,'Primary agents with sub-agents'],
+    ['UNMAPPED',s.unmapped,'Online agents without a mapped server'],
+    ['MSGS',s.messages,'Captured portal messages'],
+    ['ACTIVE',s.active_agents,'Agents seen in captured messages'],
+  ]
+  if(taskboard)cells.push(['TASKS',metricValue(s.open_tasks),'Taskboard '+taskTitle])
+  return cells}
+function renderFleetStats(stats,taskboard){const el=$('#fleetStats');if(!el)return;const cells=dashboardCells(stats,taskboard).slice(0,6)
+  el.innerHTML=cells.map(([k,v,title])=>'<div class="metric'+(k==='UNMAPPED'&&Number(v)>0?' warn':'')+'" title="'+escAttr(title)+'"><span class="v">'+esc(metricValue(v))+'</span><span class="k">'+esc(k)+'</span></div>').join('')}
+async function loadFleet(){let r;try{r=await(await fetch('/api/fleet')).json()}catch{r={presence:[],stats:null,servers:[],teams:[],activity:{agents:[],trend:[]},taskboard:null}}
+  fleetData=r;presenceList=r.presence||[];fleetStats=r.stats||null;renderFleetStats(fleetStats,r.taskboard||null);const el=$('#presence');if(el)el.innerHTML=renderPresenceGroups(presenceList);if(active===HOME)renderDashboard(r)}
+async function loadPresence(){return loadFleet()}
+function openHome(){active=HOME;if(activeTab!=='chat')setTab('chat');closeNavOnMobile();renderSidebar();renderDashboard(fleetData);updateComposerState()}
+function renderDashboard(data){const el=$('#msgs');if(!el)return;const d=data||{stats:fleetStats,presence:presenceList,servers:[],teams:[],activity:{agents:[],trend:[]},taskboard:null};const s=d.stats||{}
+  $('#title').textContent='Fleet Dashboard';$('#meta').textContent=(s.online_agents??s.agents??0)+' online · '+metricValue(s.messages)+' messages'
+  const taskNote=d.taskboard&&d.taskboard.enabled?'Taskboard project '+d.taskboard.project_id:(d.taskboard?'Tasks disabled: '+(d.taskboard.error||'disabled'):'Live bus status')
+  el.innerHTML='<div class="dash"><div class="dash-head"><div><div class="dash-title">Fleet Dashboard</div><div class="dash-sub">'+esc(taskNote)+'</div></div></div>'+
+    '<div class="dash-grid">'+dashboardCells(s,d.taskboard).map(([k,v,title])=>'<div class="dash-card'+(k==='UNMAPPED'&&Number(v)>0?' warn':'')+'" title="'+escAttr(title)+'"><span class="num">'+esc(metricValue(v))+'</span><span class="lab">'+esc(k)+'</span></div>').join('')+'</div>'+
+    '<div class="dash-panels">'+
+      '<div class="panel"><h3>Message volume</h3>'+messageVolumeSvg(d.activity&&d.activity.trend||[])+'</div>'+
+      '<div class="panel"><h3>Agent activity</h3>'+agentActivitySvg(d.activity&&d.activity.agents||[])+'</div>'+
+      '<div class="panel"><h3>Online / offline</h3>'+onlineOfflineSvg(s.online_agents??s.agents??0,s.offline_agents??0)+'</div>'+
+    '</div>'+
+    '<div class="dash-panels">'+
+      '<div class="panel"><h3>Per-server breakdown</h3>'+serverRows(d.servers||[],d.presence||[])+'</div>'+
+      '<div class="panel"><h3>Per-team breakdown</h3>'+teamRows(d.teams||[])+'</div>'+
+      '<div class="panel"><h3>Most active agents</h3>'+activityRows(d.activity&&d.activity.agents||[])+'</div>'+
+    '</div></div>'}
+function messageVolumeSvg(trend){const rows=trend&&trend.length?trend:[];const vals=rows.map(x=>Number(x.messages)||0),max=Math.max(1,...vals),w=360,h=150,p=18,base=h-24,innerW=w-p*2,innerH=94
+  const pts=vals.map((v,i)=>[p+(rows.length<2?innerW/2:i*(innerW/(rows.length-1))),base-(v/max)*innerH]);const path=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join(' ');const area=pts.length?'M '+p+' '+base+' '+path.slice(1)+' L '+(w-p)+' '+base+' Z':''
+  const labels=rows.map((r,i)=>i%3===0?'<text x="'+(p+i*(innerW/Math.max(1,rows.length-1))).toFixed(1)+'" y="144" text-anchor="middle">'+esc(r.label||'')+'</text>':'').join('')
+  return '<svg class="chart" viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Message volume trend"><path class="grid" d="M'+p+' '+base+'H'+(w-p)+'M'+p+' '+(base-innerH/2)+'H'+(w-p)+'M'+p+' '+(base-innerH)+'H'+(w-p)+'"></path><path class="fill" d="'+area+'"></path><path class="line" d="'+path+'"></path>'+labels+'<text x="'+(w-p)+'" y="14" text-anchor="end">'+max+' max</text></svg>'}
+function agentActivitySvg(agents){const rows=(agents||[]).slice(0,8),max=Math.max(1,...rows.map(a=>Number(a.messages)||0)),w=360,h=150,p=18,barH=10,gap=7
+  const bars=rows.map((a,i)=>{const y=18+i*(barH+gap),bw=Math.max(2,(Number(a.messages)||0)/max*(w-142));return '<text x="'+p+'" y="'+(y+9)+'">'+esc(shortName(a.id,18))+'</text><rect class="mutbar" x="128" y="'+y+'" width="'+bw.toFixed(1)+'" height="'+barH+'" rx="3"></rect><text x="'+(w-p)+'" y="'+(y+9)+'" text-anchor="end">'+esc(a.messages)+'</text>'}).join('')
+  return '<svg class="chart" viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Agent activity">'+(rows.length?bars:'<text x="'+(w/2)+'" y="'+(h/2)+'" text-anchor="middle">No captured activity yet</text>')+'</svg>'}
+function onlineOfflineSvg(online,offline){online=Number(online)||0;offline=Number(offline)||0;const total=Math.max(1,online+offline),ow=260*online/total,fw=260*offline/total
+  return '<svg class="chart" viewBox="0 0 360 150" role="img" aria-label="Online offline split"><text x="18" y="30">Online</text><text x="342" y="30" text-anchor="end">'+online+'</text><rect x="18" y="44" width="260" height="18" rx="5" fill="#11151d"></rect><rect class="bar" x="18" y="44" width="'+ow.toFixed(1)+'" height="18" rx="5"></rect><text x="18" y="94">Offline</text><text x="342" y="94" text-anchor="end">'+offline+'</text><rect x="18" y="108" width="260" height="18" rx="5" fill="#11151d"></rect><rect class="offbar" x="18" y="108" width="'+fw.toFixed(1)+'" height="18" rx="5"></rect></svg>'}
+function serverRows(servers,presence){if(!servers.length)return '<div class="dash-empty">No online servers</div>';const max=Math.max(1,...servers.map(s=>Number(s.agents)||0));return '<div class="rows">'+servers.map(s=>{const agents=(presence||[]).filter(p=>p.online&&p.logical_host===s.logical_host).map(p=>p.id).sort().join(', ');return '<div class="row" title="'+escAttr(agents)+'"><div class="row-main"><div class="row-name">'+esc(s.label||s.logical_host)+'</div><div class="row-meta">'+esc((s.pms||0)+' PMs · '+(s.teams||0)+' teams')+'</div><div class="mini"><span style="width:'+((Number(s.agents)||0)/max*100).toFixed(1)+'%"></span></div></div><div class="row-num">'+esc(s.agents)+'</div></div>'}).join('')+'</div>'}
+function teamRows(teams){if(!teams.length)return '<div class="dash-empty">No sub-agent teams online</div>';const max=Math.max(1,...teams.map(t=>Number(t.agents)||0));return '<div class="rows">'+teams.map(t=>'<div class="row"><div class="row-main"><div class="row-name">'+esc(t.primary_id)+'</div><div class="row-meta">'+esc(t.logical_host+' · '+(t.primary_present?'primary online':'primary missing')+' · '+t.sub_agents+' sub-agents')+'</div><div class="mini"><span style="width:'+((Number(t.agents)||0)/max*100).toFixed(1)+'%"></span></div></div><div class="row-num">'+esc(t.agents)+'</div></div>').join('')+'</div>'}
+function activityRows(agents){const rows=(agents||[]).slice(0,7);if(!rows.length)return '<div class="dash-empty">No captured activity yet</div>';const max=Math.max(1,...rows.map(a=>Number(a.messages)||0));return '<div class="rows">'+rows.map(a=>'<div class="row"><div class="row-main"><div class="row-name">'+esc(a.id)+'</div><div class="row-meta">last seen '+esc(ago(a.last_t))+' ago</div><div class="mini"><span style="width:'+((Number(a.messages)||0)/max*100).toFixed(1)+'%"></span></div></div><div class="row-num">'+esc(a.messages)+'</div></div>').join('')+'</div>'}
+function shortName(s,n){s=String(s||'');return s.length>n?s.slice(0,n-3)+'...':s}
   async function loadSendStatus(){let r;try{r=await(await fetch('/api/send-status')).json()}catch{r={send:{enabled:false,error:'offline'}}}
     sendReady=!!r.send?.enabled;portalAgent=r.send?.agent_id||'';updateComposerState(r.send?.error||'send disabled')}
   async function loadLangChainStatus(){let r;try{r=await(await fetch('/api/langchain/status')).json()}catch{r={langchain:{ready:false,error:'offline',model:''}}}
@@ -705,9 +810,9 @@ async function loadPresence(){const r=await(await fetch('/api/presence')).json()
     if(isLangChainChannel()){b.disabled=!langchainReady;s.className='sendstate'+(langchainReady?' ok':' err');s.textContent=langchainReady?'langchain '+langchainModel:(langchainError||'langchain disabled');return}
     b.disabled=!sendReady;s.className='sendstate'+(sendReady?' ok':' err');s.textContent=sendReady?'sending as '+portalAgent:sendError}
   function preferredInitialChannel(){return chans.find(c=>c.kind==='dm'&&c.name!=='@'+portalAgent)||chans.find(c=>c.kind==='topic')||chans.find(c=>c.name!=='@'+portalAgent)||chans[0]}
-  function renderSidebar(){$('#channels').innerHTML=chans.map(c=>{
-    const marker=c.kind==='topic'?'#':(c.kind==='local'?'ai':'');return '<div class="ch'+(c.name===active?' active':'')+'" onclick="open_(\\''+c.name+'\\')">'+
-    '<span class="h">'+marker+'</span><span class="n">'+c.name+'</span><span class="c">'+c.count+'</span></div>'}).join('')}
+  function renderSidebar(){const home=$('#homeBtn');if(home)home.classList.toggle('active',active===HOME);$('#channels').innerHTML=chans.map(c=>{
+    const marker=c.kind==='topic'?'#':(c.kind==='local'?'ai':'');return '<div class="ch'+(c.name===active?' active':'')+'" data-ch="'+escAttr(c.name)+'">'+
+    '<span class="h">'+marker+'</span><span class="n">'+esc(c.name)+'</span><span class="c">'+c.count+'</span></div>'}).join('')}
   async function open_(name){active=name;closeNavOnMobile();renderSidebar();const path=isLangChainChannel(name)?'/api/langchain/messages':(name[0]==='@'?'/api/dm/'+encodeURIComponent(name.slice(1)):'/api/channels/'+encodeURIComponent(name));const r=await(await fetch(path)).json();
     $('#title').textContent=isLangChainChannel(name)?'LangChain Agent':((name[0]==='@'?'':'# ')+name);setRecipientForActive(name,r.messages||[]);loadPresence();updateComposerState();render(r.messages);}
   function setRecipientForActive(name=active,msgs=[]){if(!name)return;let target=name[0]==='@'?name:'#'+name;
@@ -775,8 +880,8 @@ function channelForTarget(v){const t=normalizedTarget(v);if(!t||t===portalAgent)
 $('#sendBtn').onclick=sendNow
 $('#resetContextBtn').onclick=resetChatContext
 $('#sendBody').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendNow()}})
-  function activePath(){return isLangChainChannel()?'/api/langchain/messages':(active&&active[0]==='@'?'/api/dm/'+encodeURIComponent(active.slice(1)):'/api/channels/'+encodeURIComponent(active))}
-  function messageTouchesActive(d){if(!active)return false;if(d.channel===active)return true;if(active[0]!=='@')return false;const peer=active.slice(1);const m=d.message||{};return d.channel==='@'+portalAgent&&m.from===peer}
+  function activePath(){if(active===HOME)return '/api/fleet';return isLangChainChannel()?'/api/langchain/messages':(active&&active[0]==='@'?'/api/dm/'+encodeURIComponent(active.slice(1)):'/api/channels/'+encodeURIComponent(active))}
+  function messageTouchesActive(d){if(!active||active===HOME)return false;if(d.channel===active)return true;if(active[0]!=='@')return false;const peer=active.slice(1);const m=d.message||{};return d.channel==='@'+portalAgent&&m.from===peer}
   function setupTabs(){document.body.classList.add('tab-chat');var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++){(function(b){b.onclick=function(){setTab(b.dataset.tab)}})(bs[i])}}
   function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain');document.body.classList.add('tab-'+name);
     var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++)bs[i].classList.toggle('active',bs[i].dataset.tab===name);
@@ -802,9 +907,10 @@ es.onmessage=e=>{const d=JSON.parse(e.data);
   if(d.kind==='brain'){if(d.item){feedData.unshift(d.item);if(feedData.length>80)feedData.length=80}if(activeTab==='brain')renderFeed();return}
   if(d.kind!=='msg')return;
   const c=chans.find(x=>x.name===d.channel);if(c){c.count++;c.lastT=d.message.t}else loadChannels();renderSidebar();
+  if(active===HOME)loadFleet();
   if(messageTouchesActive(d)){const el=$('#msgs');const stick=el.scrollTop+el.clientHeight>el.scrollHeight-40;
     fetch(activePath()).then(r=>r.json()).then(r=>{render(r.messages);if(!stick)el.scrollTop=el.scrollTop})}}
-  async function init(){setupNav();setupTabs();setupSidebarResize();setupPresenceClicks();setupRenderToggle();setupSendMode();await loadSendStatus();await loadLangChainStatus();await loadChannels();await loadPresence();setInterval(loadPresence,5000);setInterval(loadChannels,8000);setInterval(loadSendStatus,10000);setInterval(loadLangChainStatus,10000)}
+  async function init(){setupNav();setupTabs();setupSidebarResize();setupPresenceClicks();setupChannelClicks();setupHome();setupRenderToggle();setupSendMode();await loadSendStatus();await loadLangChainStatus();await loadChannels();await loadFleet();setInterval(loadPresence,5000);setInterval(loadChannels,8000);setInterval(loadSendStatus,10000);setInterval(loadLangChainStatus,10000)}
 init()
 </script></body></html>`
 
