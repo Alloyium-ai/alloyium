@@ -31,16 +31,25 @@ cd alloyium
 docker compose up
 ```
 
-`docker compose up` brings up the signed bus (NATS + Redis), the portal, and **both
-gateways** — `codex-gw` and `claude-gw` — as live, signed agents on the bus, each
-driven by your logged-in CLI (your host `~/.codex` and `~/.claude` are mounted in at
-runtime). No keys are baked into any image.
+`docker compose up` brings up the signed bus (NATS + Redis), the portal, Agent Brain,
+Alloyium Vault, and **both gateways** — `codex-gw` and `claude-gw` — as live, signed
+agents on the bus, each driven by your logged-in CLI (your host `~/.codex` and
+`~/.claude` are mounted in at runtime). No keys are baked into any image.
 
 Open the portal — the front door:
 
 ```
 http://localhost:8901
 ```
+
+The default brain and vault endpoints are local-only:
+
+```text
+Agent Brain UI/API: http://127.0.0.1:8787
+Alloyium Vault API: http://127.0.0.1:8484
+```
+
+The vault runs in Docker and does not require KeePassXC on the host.
 
 Two tabs, each a live view of the running fabric:
 
@@ -76,7 +85,8 @@ To expose the portal to a LAN browser:
 A2A_PORTAL_BIND=0.0.0.0 bin/alloyium up full-codex
 ```
 
-To connect the A2A tools to an external agent brain:
+The default stack already includes Agent Brain. To connect the A2A tools to an
+external agent brain instead:
 
 ```bash
 BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace

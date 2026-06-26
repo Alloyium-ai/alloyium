@@ -270,7 +270,9 @@ services:
       A2A_CORE_BEAT_MS: ${A2A_CORE_BEAT_MS:-0}
       A2A_MCP_PENDING_INJECT_CAP: ${A2A_MCP_PENDING_INJECT_CAP:-256}
       A2A_UDS_MAX_CONNECTIONS: ${A2A_UDS_MAX_CONNECTIONS:-512}
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
       KAI_HTTP_URL: ${KAI_HTTP_URL:-}
       KAI_WS_URL: ${KAI_WS_URL:-}
       KAI_TOKEN_PATH: /run/secrets/kai-token
@@ -347,7 +349,9 @@ services:
       CLAUDE_HOST_CONFIG: ${CLAUDE_HOST_CONFIG:-${HOME}/.claude.json}
       CLAUDE_GW_MODEL: ${CLAUDE_GW_MODEL:-opus}
       CLAUDE_GW_EFFORT: ${CLAUDE_GW_EFFORT:-high}
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
       KAI_HTTP_URL: ${KAI_HTTP_URL:-}
       KAI_WS_URL: ${KAI_WS_URL:-}
       KAI_TOKEN_PATH: ${KAI_TOKEN_PATH:-}
@@ -484,7 +488,9 @@ services:
       # codex-gw's launch tool (agent_launcher_tools) needs the launcher URL to spawn A2A peers;
       # without it codex-gw can't forward a2a.launch.request -> launch failures.
       A2A_LAUNCHER_URL: ${A2A_LAUNCHER_URL:-http://a2a-launcher:8910}
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
       KAI_HTTP_URL: ${KAI_HTTP_URL:-}
       KAI_WS_URL: ${KAI_WS_URL:-}
       KAI_TOKEN_PATH: ${KAI_TOKEN_PATH:-}
@@ -615,7 +621,9 @@ services:
       CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
       # Run the session in the shared workspace so bare `git clone`s land on the host.
       CLAUDE_AGENT_CWD: ${CLAUDE_AGENT_CWD:-/workspace}
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
     networks:
       - a2a-net
     volumes:
@@ -690,7 +698,9 @@ services:
       CLAUDE_AGENT_EFFORT: ${CLAUDE_AGENT_EFFORT:-high}
       # Run the session in the shared workspace so bare `git clone`s land on the host.
       CLAUDE_AGENT_CWD: ${CLAUDE_AGENT_CWD:-/workspace}
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
     networks:
       - a2a-net
     volumes:
@@ -766,7 +776,9 @@ services:
       CODEX_GW_A2A_SHIM_BIN: /usr/local/bin/a2a-shim
       CODEX_GW_A2A_TOOLS_REQUIRED: ${CODEX_GW_A2A_TOOLS_REQUIRED:-1}
       A2A_CORE_SOCK: /run/a2a-core/core.sock
-      BRAIN_URL: ${BRAIN_URL:-}
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
     networks:
       - a2a-net
     volumes:
@@ -875,11 +887,11 @@ services:
   brain:
     # Alloyium Agent Brain Notepad — shared memory + skills store backing the a2a
     # brain tools (a2a_remember/recall/skill_*). Without it, brain_tools.ts gets an
-    # empty BRAIN_URL and fails fetch("") -> "brain_unavailable: fetch() URL is invalid".
-    # Source: github.com/Alloyium-ai/alloyium-brain (cloned in data/workspace/alloyium-brain).
+    # unreachable localhost default inside containers.
+    # Source: github.com/Alloyium-ai/alloyium-brain.
     image: alloyium-brain:local
     build:
-      context: ./data/workspace/alloyium-brain
+      context: ${ALLOYIUM_BRAIN_BUILD_CONTEXT:-https://github.com/Alloyium-ai/alloyium-brain.git#main}
     environment:
       # Optional bearer token for the agent API; unset = open within a2a-net + localhost only.
       BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
@@ -901,6 +913,51 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
+
+  vault:
+    # Alloyium Vault — encrypted KDBX-backed credential service for local agents.
+    # First boot initializes /data/vault and generates scoped tokens in
+    # /data/vault/.tokens when VAULT_BOOTSTRAP_TOKEN is not provided.
+    image: alloyium-vault:local
+    build:
+      context: ${ALLOYIUM_VAULT_BUILD_CONTEXT:-https://github.com/Alloyium-ai/alloyium-vault.git#main}
+      dockerfile: Dockerfile
+      target: production
+    user: root
+    environment:
+      VAULT_DB_PATH: /data/vault/alloyium-vault.kdbx
+      VAULT_KEYFILE_PATH: /data/vault/.keyfile
+      VAULT_TOKEN_CONFIG: /data/vault/token-config.json
+      VAULT_AUDIT_LOG: /data/vault/vault-api.log
+      VAULT_BOOTSTRAP_TOKEN: ${VAULT_BOOTSTRAP_TOKEN:-}
+    networks:
+      - a2a-net
+    ports:
+      # host-only publish for operator CLI/client use; not exposed on the LAN.
+      - "${ALLOYIUM_VAULT_BIND:-127.0.0.1}:${ALLOYIUM_VAULT_HOST_PORT:-8484}:8484"
+    volumes:
+      - vault_data:/data/vault
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8484/v1/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+        mkdir -p /data/vault
+        python3 scripts/init_vault.py --vault-dir /data/vault >/tmp/alloyium-vault-init.log
+        if [ -z "$${VAULT_BOOTSTRAP_TOKEN:-}" ] && [ -f /data/vault/vault.env ]; then
+          set -a
+          . /data/vault/vault.env
+          set +a
+        fi
+        chown -R vault:vault /data/vault
+        exec su vault -s /bin/sh -c 'python -m uvicorn vault_api:app --host 0.0.0.0 --port 8484 --workers 1'
 
   tei:
     # Embedding server (HF Text Embeddings Inference) serving BAAI/bge-m3 for the
@@ -944,4 +1001,5 @@ volumes:
   portal_logs:
   codex_workspaces:
   brain_data:
+  vault_data:
   tei_data:

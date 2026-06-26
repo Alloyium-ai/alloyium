@@ -23,11 +23,12 @@ describe('codex A2A tool config', () => {
       natsUrl: 'nats://nats:4222',
       redisUrl: 'redis://redis:6379',
       brainUrl: 'http://brain:8787',
+      vaultUrl: 'http://vault:8484',
       kaiHttpUrl: 'http://kai:18789',
       kaiWsUrl: 'ws://kai:18789/ws',
       kaiTokenPath: '/run/secrets/kai-token',
       maxSendBytes: 8192,
-      inheritEnvVars: ['KAI_TOKEN'],
+      inheritEnvVars: ['BRAIN_API_TOKEN', 'KAI_TOKEN'],
     }))
 
     expect(cfg.get('mcp_servers.a2a_tools.command')).toBe('"bun"')
@@ -37,8 +38,9 @@ describe('codex A2A tool config', () => {
     expect(cfg.get('mcp_servers.a2a_tools.env.A2A_AGENT_ID')).toBe('"codex-gw"')
     expect(cfg.get('mcp_servers.a2a_tools.env.A2A_SIGNING_KEY')).toBe('"/run/secrets/a2a/codex-gw.seed"')
     expect(cfg.get('mcp_servers.a2a_tools.env.BRAIN_URL')).toBe('"http://brain:8787"')
+    expect(cfg.get('mcp_servers.a2a_tools.env.VAULT_URL')).toBe('"http://vault:8484"')
     expect(cfg.get('mcp_servers.a2a_tools.env.KAI_WS_URL')).toBe('"ws://kai:18789/ws"')
-    expect(cfg.get('mcp_servers.a2a_tools.env_vars')).toBe('["KAI_TOKEN"]')
+    expect(cfg.get('mcp_servers.a2a_tools.env_vars')).toBe('["BRAIN_API_TOKEN","KAI_TOKEN"]')
     expect(cfg.get('tools.request_user_input')).toBe('false')
   })
 
@@ -46,10 +48,11 @@ describe('codex A2A tool config', () => {
     const args = buildCodexA2AToolsConfigArgs({
       channelsDir: '/srv/cc',
       agentId: 'agent-1',
-      inheritEnvVars: ['KAI_TOKEN'],
+      inheritEnvVars: ['BRAIN_API_TOKEN', 'KAI_TOKEN'],
     }).join('\n')
 
-    expect(args).toContain('mcp_servers.a2a_tools.env_vars=["KAI_TOKEN"]')
+    expect(args).toContain('mcp_servers.a2a_tools.env_vars=["BRAIN_API_TOKEN","KAI_TOKEN"]')
+    expect(args).not.toContain('mcp_servers.a2a_tools.env.BRAIN_API_TOKEN')
     expect(args).not.toContain('mcp_servers.a2a_tools.env.KAI_TOKEN')
   })
 
