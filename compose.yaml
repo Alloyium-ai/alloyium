@@ -266,8 +266,10 @@ services:
       <<: *cc-env
       A2A_TRANSPORT_AUTH: none
       A2A_UDS_SOCKET_PATH: /run/a2a-core/core.sock
-      A2A_INBOX_DB: ${A2A_INBOX_DB:-/app/data/a2a-inbox.sqlite3}
+      A2A_INBOX_DB: /app/data/a2a-inbox.sqlite3
       A2A_CORE_BEAT_MS: ${A2A_CORE_BEAT_MS:-0}
+      A2A_MCP_PENDING_INJECT_CAP: ${A2A_MCP_PENDING_INJECT_CAP:-256}
+      A2A_UDS_MAX_CONNECTIONS: ${A2A_UDS_MAX_CONNECTIONS:-512}
       BRAIN_URL: ${BRAIN_URL:-}
       KAI_HTTP_URL: ${KAI_HTTP_URL:-}
       KAI_WS_URL: ${KAI_WS_URL:-}

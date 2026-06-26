@@ -327,6 +327,44 @@ test('binds the socket, completes hello, buffers MCP until add, and removes on c
   }
 })
 
+test('caps total live UDS connections', async () => {
+  const { socketPath } = tempPaths('max-connections')
+  const calls = makeCalls()
+  const handle = await startUdsAcceptor({
+    core: fakeCore(calls),
+    redis: new FakeRedis() as any,
+    socketPath,
+    maxConnections: 1,
+  })
+  handles.push(handle)
+
+  const first = await connectClient(socketPath)
+  let second: Awaited<ReturnType<typeof connectClient>> | undefined
+  let secondConnectErr: unknown
+  try {
+    await Bun.sleep(20)
+    try {
+      second = await connectClient(socketPath)
+    } catch (err) {
+      secondConnectErr = err
+    }
+
+    if (second) {
+      expect(await waitFor(() => second!.closed, 1500)).toBe(true)
+      second.close()
+    } else {
+      expect(secondConnectErr).toBeTruthy()
+    }
+
+    await first.sendCtrl({ t: 'ping', ts: 1 })
+    expect(await first.nextCtrl()).toMatchObject({ t: 'pong', ts: 1 })
+    expect(calls.add).toHaveLength(0)
+  } finally {
+    second?.close()
+    first.close()
+  }
+})
+
 test('old shim without delivered cap gets ph2 flush-only direct injection', async () => {
   const { socketPath } = tempPaths('no-delivered-cap')
   const calls = makeCalls()

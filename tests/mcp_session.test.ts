@@ -108,6 +108,37 @@ describe('buildSessionMcpServer', () => {
     expect(res.tools).toEqual([channelTool, brainTool, kaiTool, vaultTool])
   })
 
+  test('tools/list uses the cached per-session tool surface', async () => {
+    const calls = { channel: 0, brain: 0, kai: 0, vault: 0 }
+    const server = buildSessionMcpServer(makeCtx({
+      channel: {
+        listTools: () => { calls.channel++; return [channelTool] },
+        handles: (name: string) => name === channelTool.name,
+        callTool: async () => ({ content: [] }),
+      },
+      brain: {
+        listTools: () => { calls.brain++; return [brainTool] },
+        handles: (name: string) => name === brainTool.name,
+        callTool: async () => ({ content: [] }),
+      },
+      kai: {
+        listTools: () => { calls.kai++; return [kaiTool] },
+        handles: (name: string) => name === kaiTool.name,
+        callTool: async () => ({ content: [] }),
+      },
+      vault: {
+        listTools: () => { calls.vault++; return [vaultTool] },
+        handles: (name: string) => name === vaultTool.name,
+        callTool: async () => ({ content: [] }),
+      },
+    } as Partial<SessionCtx>))
+
+    await request(server, 'tools/list', {})
+    await request(server, 'tools/list', {})
+
+    expect(calls).toEqual({ channel: 1, brain: 1, kai: 1, vault: 1 })
+  })
+
   test('tools/call dispatches kai before brain before vault before channel', async () => {
     const server = buildSessionMcpServer(makeCtx())
 
@@ -169,6 +200,37 @@ describe('buildSessionMcpServer', () => {
     releaseInject()
     await send
     expect(resolved).toBe(true)
+  })
+
+  test('notifications/claude/channel rejects pre-initialize overflow', async () => {
+    const prev = process.env.A2A_MCP_PENDING_INJECT_CAP
+    process.env.A2A_MCP_PENDING_INJECT_CAP = '1'
+    try {
+      const injects: unknown[] = []
+      const server = buildSessionMcpServer(makeCtx({ inject: async (notif: unknown) => { injects.push(notif) } } as Partial<SessionCtx>))
+      const first = claudeChannelNotif('first')
+      const second = claudeChannelNotif('second')
+
+      const p1 = server.notification(first as any)
+      const p2 = server.notification(second as any).then(
+        () => ({ ok: true as const }),
+        (err) => ({ ok: false as const, err }),
+      )
+
+      await tick()
+      const overflow = await p2
+      expect(overflow.ok).toBe(false)
+      expect(String((overflow as any).err?.message ?? '')).toContain('pre-initialize notification buffer full')
+      expect(injects).toEqual([])
+
+      server.oninitialized?.()
+      await p1
+
+      expect(injects).toEqual([wireNotif('first')])
+    } finally {
+      if (prev === undefined) delete process.env.A2A_MCP_PENDING_INJECT_CAP
+      else process.env.A2A_MCP_PENDING_INJECT_CAP = prev
+    }
   })
 
   test('notifications/claude/channel flushes buffered notifications in order', async () => {

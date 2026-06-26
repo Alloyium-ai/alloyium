@@ -115,6 +115,7 @@ type Session = {
   a2a: A2AChannel
   inject: Inject
   launcher: AgentLauncherTools
+  toolList?: any[]
   toolOnly?: boolean
   epoch?: number
   mcpServer?: Server
@@ -369,6 +370,7 @@ export class A2ACore {
 
   private async _doAddSession(agentId: string, inject: Inject, opts: Partial<A2AChannelOpts>): Promise<AddSessionResult> {
     const a2a = new A2AChannel(inject, this.buildSessionOpts(agentId, opts))
+    const launcher = new AgentLauncherTools({ agentId })
     // Wrap start() in try/catch: A2AChannel.start() self-heals + returns today, but the
     // AddSessionResult contract must not depend on "start never throws" (GPT5.5-1).
     let startErr: unknown
@@ -383,7 +385,7 @@ export class A2ACore {
       log('warn', 'a2a_core_session_start_failed', { agent_id: agentId, ...(startErr ? errFields(startErr) : {}) })
       return { ok: false, agentId, error: 'session_start_failed' }
     }
-    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher: new AgentLauncherTools({ agentId }) })
+    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher) })
     log('info', 'a2a_core_session_added', { agent_id: agentId, sessions: this.sessions.size })
     return { ok: true, agentId }
   }
@@ -407,6 +409,7 @@ export class A2ACore {
     // server needs this A2AChannel instance to exist first, so bind it late via serverRef.
     // sanitizeBody is applied HERE (A2AChannel passes RAW body to inject) for byte-parity with webhook.ts.
     let serverRef: Server | undefined
+    const launcher = new AgentLauncherTools({ agentId })
     const inject: Inject = async (content, attrs) => {
       if (!serverRef) throw new Error('a2a-core: session mcp server not ready')
       const meta = attrs && attrs.kind === 'direct' && typeof attrs.id === 'string'
@@ -431,7 +434,7 @@ export class A2ACore {
           brain: this.brain,
           kai: this.kai,
           vault: this.vault,
-          launcher: new AgentLauncherTools({ agentId }),
+          launcher,
           inject: wiring.ctxInject,
         })
         serverRef = mcpServer
@@ -451,7 +454,7 @@ export class A2ACore {
       return { ok: false, agentId, error: 'session_start_failed' }
     }
 
-    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher: new AgentLauncherTools({ agentId }), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
+    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
     log('info', 'a2a_core_uds_session_added', { agent_id: agentId, session_key: sessionKey, tool_only: toolOnly, epoch: wiring.epoch, sessions: this.sessions.size })
     return { ok: true, agentId, epoch: wiring.epoch }
   }
@@ -486,7 +489,11 @@ export class A2ACore {
   listTools(agentId: string): any[] {
     const s = this.getSession(agentId)
     if (!s) return []
-    return [...s.a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...s.launcher.listTools()]
+    return [...(s.toolList ?? this.makeToolList(s.a2a, s.launcher))]
+  }
+
+  private makeToolList(a2a: A2AChannel, launcher: AgentLauncherTools): any[] {
+    return [...a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...launcher.listTools()]
   }
 
   // Dispatch a tool call for a session. Routing mirrors webhook.ts exactly: kai tools

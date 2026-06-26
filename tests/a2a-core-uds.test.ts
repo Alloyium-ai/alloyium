@@ -9,6 +9,10 @@ import { requireBus } from './_require_bus.ts'
 
 const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
+const TEST_STREAM_LIMITS = {
+  streamMaxMsgSize: 64 * 1024,
+  streamMaxBytes: 2 * 1024 * 1024,
+}
 
 let available = true
 let probeNats: NatsConnection | undefined
@@ -74,7 +78,7 @@ function newCore(fleet: Fleet): A2ACore {
     redisUrl: REDIS_URL,
     prefix: fleet.prefix,
     stream: fleet.stream,
-    sessionDefaults: { devNoAuth: true },
+    sessionDefaults: { devNoAuth: true, ...TEST_STREAM_LIMITS },
   })
   cores.push(core)
   return core

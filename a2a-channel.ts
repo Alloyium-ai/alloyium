@@ -541,6 +541,8 @@ export type A2AChannelOpts = {
   inboxMaxAckPending?: number
   inboxAckWaitMs?: number
   streamMaxAgeH?: number
+  streamMaxMsgSize?: number
+  streamMaxBytes?: number
   maxMsgsPerSubject?: number
   inboxDbPath?: string
   inboxStore?: A2AInboxStore
@@ -722,8 +724,8 @@ export class A2AChannel {
     // Stream-level byte guards: pair the per-agent SEND cap with JetStream limits so a
     // raised sender cap can't exhaust durable storage (RCA Issue 1). New streams always
     // get these; auto-applying to an EXISTING shared stream is opt-in (A2A_STREAM_ENFORCE_LIMITS).
-    this.streamMaxMsgSize = atLeast(envNum(e.A2A_STREAM_MAX_MSG_SIZE, 262_144), 1024)
-    this.streamMaxBytes = atLeast(envNum(e.A2A_STREAM_MAX_BYTES, 1_073_741_824), 1_048_576)
+    this.streamMaxMsgSize = atLeast(opts.streamMaxMsgSize ?? envNum(e.A2A_STREAM_MAX_MSG_SIZE, 262_144), 1024)
+    this.streamMaxBytes = atLeast(opts.streamMaxBytes ?? envNum(e.A2A_STREAM_MAX_BYTES, 1_073_741_824), 1_048_576)
     this.streamEnforce = (e.A2A_STREAM_ENFORCE_LIMITS === '1' || e.A2A_STREAM_ENFORCE_LIMITS === 'true') ? 'on' : 'off'
     this.ownsInboxStore = opts.inboxStore == null
     this.inboxStore = opts.inboxStore
