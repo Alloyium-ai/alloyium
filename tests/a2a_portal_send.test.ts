@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildPortalDefaultCwd, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, normalizePortalRecipient, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, normalizePortalRecipient, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
 
 describe('a2a portal send helpers', () => {
   test('normalizes dm and topic recipients from UI notation', () => {
@@ -63,6 +63,36 @@ describe('a2a portal send helpers', () => {
     expect(wrapPlainCodexRequest({ to: 'agent-1', type: 'request', body: 'say hi' }, 'job-3').body).toBe('say hi')
   })
 
+  test('wraps chat-mode codex requests in the realtime session contract', () => {
+    const wrapped = wrapPlainCodexRealtimeInput(
+      { to: 'codex-gw', type: 'request', body: 'say hi' },
+      {
+        sessionId: 'portal:chat:a2a-portal:codex-gw',
+        threadKey: 'portal:chat:a2a-portal:codex-gw',
+        cwd: '/app',
+        streamTopic: 'portal-rt-a2a-portal-codex-gw',
+      },
+    )
+    expect(wrapped.to).toBe('codex-gw')
+    expect(wrapped.type).toBe('request')
+    expect(JSON.parse(wrapped.body)).toMatchObject({
+      schema: 'codex.session.input.v1',
+      session_id: 'portal:chat:a2a-portal:codex-gw',
+      thread_key: 'portal:chat:a2a-portal:codex-gw',
+      input: [{ type: 'text', text: 'say hi' }],
+      mode: 'auto',
+      sandbox: 'read-only',
+      approval_policy: 'never',
+      cwd: '/app',
+      stream_topic: 'portal-rt-a2a-portal-codex-gw',
+    })
+
+    const existing = JSON.stringify({ schema: 'codex.turn.steer.v1', session_id: 's1', text: 'follow up' })
+    expect(wrapPlainCodexRealtimeInput({ to: 'codex-gw', type: 'request', body: existing }, { sessionId: 's1' }).body).toBe(existing)
+    expect(wrapPlainCodexRealtimeInput({ to: 'agent-1', type: 'request', body: 'say hi' }, { sessionId: 's1' }).body).toBe('say hi')
+    expect(wrapPlainCodexRealtimeInput({ to: 'codex-gw', type: 'request', body: 'say hi' }).body).toBe('say hi')
+  })
+
   test('classifies codex job recipients separately from direct claude peers', () => {
     expect(isCodexJobRecipient('codex-gw')).toBe(true)
     expect(isCodexJobRecipient('host-ops-gw-1')).toBe(true)
@@ -81,6 +111,12 @@ describe('a2a portal send helpers', () => {
     expect(buildPortalThreadKey({ to: 'host-ops-gw', type: 'request', body: 'x' }, 'a2a-portal', 'one-off')).toBeNull()
     expect(buildPortalThreadKey({ to: 'host-ops-gw', type: 'msg', body: 'x' }, 'a2a-portal', 'chat')).toBeNull()
     expect(buildPortalThreadKey({ to: 'topic:ops', type: 'request', body: 'x' }, 'a2a-portal', 'chat')).toBeNull()
+  })
+
+  test('builds deterministic realtime stream topics for portal chat sessions', () => {
+    expect(buildPortalRealtimeStreamTopic('portal:chat:a2a-portal:codex-gw'))
+      .toBe('portal-rt-portal-chat-a2a-portal-codex-gw')
+    expect(buildPortalRealtimeStreamTopic(null)).toBeNull()
   })
 
   test('builds mode-aware default cwd for plain codex requests', () => {
@@ -155,5 +191,15 @@ describe('a2a portal send helpers', () => {
     expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.job.accepted.v1', job_id: 'job-1', primary_used_pct: 4 }))).toBe('Codex job accepted (primary 4%)')
     expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.job.rejected.v1', reason: 'write-unauthorized', detail: 'approval-policy-not-never' }))).toBe('Codex job rejected: write-unauthorized: approval-policy-not-never')
     expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.job.failed.v1', error: 'rate limited' }))).toBe('Codex job failed: rate limited')
+  })
+
+  test('renders codex realtime session messages compactly', () => {
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.session.ready.v1', session_id: 's1' }))).toBe('Codex session ready: s1')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.turn.started.v1', turn_id: 'turn-1' }))).toBe('Codex turn started: turn-1')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.turn.completed.v1', status: 'completed' }))).toBe('Codex turn completed: completed')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.turn.completed.v1', status: 'completed', output: 'final text' }))).toBe('Codex turn completed: completed\n\nfinal text')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.turn.failed.v1', error: 'no_active_turn' }))).toBe('Codex turn failed: no_active_turn')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.session.event.v1', event: 'agent_text_delta', text: 'delta' }))).toBe('delta')
+    expect(formatPortalRenderedBody(JSON.stringify({ schema: 'codex.session.event.v1', event: 'turn_completed' }))).toBe('Codex realtime turn_completed')
   })
 })

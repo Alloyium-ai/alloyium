@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { GatewayThreadCache, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides } from '../codex_gateway.ts'
+import { GatewayThreadCache, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides, codexHttpGatewayStartAllowed, isCodexHttpLoopbackBind } from '../codex_gateway.ts'
 
 describe('codex gateway workspace-write preflight', () => {
   test('formats structured app-server errors without [object Object]', () => {
@@ -132,6 +132,15 @@ describe('codex gateway workspace-write preflight', () => {
     expect(resolveCodexExecutionSandbox('workspace-write', { defaultSandbox: 'danger-full-access' })).toBe('danger-full-access')
     expect(resolveCodexExecutionSandbox('read-only', { defaultSandbox: 'danger-full-access' })).toBe('danger-full-access')
     expect(resolveCodexExecutionSandbox('read-only', { workspaceWriteSandbox: 'danger-full-access' })).toBe('read-only')
+  })
+
+  test('HTTP realtime gateway is loopback-open but requires a token for non-loopback binds', () => {
+    expect(isCodexHttpLoopbackBind('127.0.0.1')).toBe(true)
+    expect(isCodexHttpLoopbackBind('localhost')).toBe(true)
+    expect(isCodexHttpLoopbackBind('0.0.0.0')).toBe(false)
+    expect(codexHttpGatewayStartAllowed('127.0.0.1', '')).toBe(true)
+    expect(codexHttpGatewayStartAllowed('0.0.0.0', '')).toBe(false)
+    expect(codexHttpGatewayStartAllowed('0.0.0.0', 'token')).toBe(true)
   })
 })
 
