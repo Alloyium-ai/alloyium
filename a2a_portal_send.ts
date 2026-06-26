@@ -1,3 +1,13 @@
+import {
+  CODEX_SESSION_EVENT_SCHEMA,
+  CODEX_SESSION_INPUT_SCHEMA,
+  CODEX_SESSION_READY_SCHEMA,
+  CODEX_TURN_COMPLETED_SCHEMA,
+  CODEX_TURN_FAILED_SCHEMA,
+  CODEX_TURN_INTERRUPTED_SCHEMA,
+  CODEX_TURN_STARTED_SCHEMA,
+} from './codex_realtime.ts'
+
 export type PortalSendType = 'msg' | 'request' | 'reply'
 export type PortalSendMode = 'chat' | 'one-off'
 
@@ -95,6 +105,26 @@ export function wrapPlainCodexRequest(args: PortalSendArgs, jobId: string, opts:
   }
 }
 
+export function wrapPlainCodexRealtimeInput(args: PortalSendArgs, opts: { sessionId?: string | null; threadKey?: string | null; cwd?: string | null; streamTopic?: string | null } = {}): PortalSendArgs {
+  if (args.type !== 'request' || !isCodexJobRecipient(args.to) || isJsonObjectWithCodexSchema(args.body)) return args
+  const sessionId = opts.sessionId || opts.threadKey
+  if (!sessionId) return args
+  return {
+    ...args,
+    body: JSON.stringify({
+      schema: CODEX_SESSION_INPUT_SCHEMA,
+      session_id: sessionId,
+      thread_key: opts.threadKey ?? sessionId,
+      input: [{ type: 'text', text: args.body }],
+      mode: 'auto',
+      sandbox: 'read-only',
+      approval_policy: 'never',
+      cwd: opts.cwd || '/tmp',
+      ...(opts.streamTopic ? { stream_topic: opts.streamTopic } : {}),
+    }),
+  }
+}
+
 export function buildPortalDefaultCwd(
   args: PortalSendArgs,
   sendMode: PortalSendMode,
@@ -113,6 +143,16 @@ export function buildPortalThreadKey(args: PortalSendArgs, portalAgentId: string
   const target = normalizeThreadKeyPart(args.to)
   if (!self || !target) return null
   return opts.chatContext ? `portal:chat:${self}:${target}:${opts.chatContext}` : `portal:chat:${self}:${target}`
+}
+
+export function buildPortalRealtimeStreamTopic(threadKey: string | null): string | null {
+  if (!threadKey) return null
+  const token = threadKey
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+  return token ? `portal-rt-${token}`.slice(0, 64).replace(/-$/g, '') : null
 }
 
 function normalizePortalSendMode(value: unknown): PortalSendMode | null {
@@ -157,6 +197,15 @@ function isJsonObjectWithSchema(text: string, schema: string): boolean {
   }
 }
 
+function isJsonObjectWithCodexSchema(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text)
+    return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && typeof (parsed as any).schema === 'string' && (parsed as any).schema.startsWith('codex.')
+  } catch {
+    return false
+  }
+}
+
 export function formatPortalRenderedBody(body: string): string | null {
   let parsed: any
   try { parsed = JSON.parse(body) } catch { return null }
@@ -190,6 +239,33 @@ export function formatPortalRenderedBody(body: string): string | null {
 
   if (parsed.schema === 'codex.job.failed.v1' && typeof parsed.error === 'string') {
     return `Codex job failed: ${parsed.error}`
+  }
+
+  if (parsed.schema === CODEX_SESSION_READY_SCHEMA) {
+    return `Codex session ready: ${parsed.session_id ?? '?'}`
+  }
+
+  if (parsed.schema === CODEX_TURN_STARTED_SCHEMA) {
+    return `Codex turn started: ${parsed.turn_id ?? '?'}`
+  }
+
+  if (parsed.schema === CODEX_TURN_COMPLETED_SCHEMA) {
+    const header = `Codex turn completed: ${parsed.status ?? 'completed'}`
+    return typeof parsed.output === 'string' && parsed.output ? `${header}\n\n${parsed.output}` : header
+  }
+
+  if (parsed.schema === CODEX_TURN_INTERRUPTED_SCHEMA) {
+    return `Codex turn interrupted: ${parsed.turn_id ?? '?'}`
+  }
+
+  if (parsed.schema === CODEX_TURN_FAILED_SCHEMA && typeof parsed.error === 'string') {
+    return `Codex turn failed: ${parsed.error}`
+  }
+
+  if (parsed.schema === CODEX_SESSION_EVENT_SCHEMA) {
+    if (parsed.event === 'agent_text_delta' && typeof parsed.text === 'string') return parsed.text
+    const event = typeof parsed.event === 'string' ? parsed.event : 'event'
+    return `Codex realtime ${event}`
   }
 
   return null
