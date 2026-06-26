@@ -872,6 +872,65 @@ services:
         condition: service_healthy
     command: ["bun", "run", "selftest"]
 
+  brain:
+    # Alloyium Agent Brain Notepad — shared memory + skills store backing the a2a
+    # brain tools (a2a_remember/recall/skill_*). Without it, brain_tools.ts gets an
+    # empty BRAIN_URL and fails fetch("") -> "brain_unavailable: fetch() URL is invalid".
+    # Source: github.com/Alloyium-ai/alloyium-brain (cloned in data/workspace/alloyium-brain).
+    image: alloyium-brain:local
+    build:
+      context: ./data/workspace/alloyium-brain
+    environment:
+      # Optional bearer token for the agent API; unset = open within a2a-net + localhost only.
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      # Real neural embeddings via the `tei` service (BAAI/bge-m3, 1024-dim). Falls back
+      # to the local hash backend if tei is unreachable (FALLBACK_LOCAL default on).
+      BRAIN_EMBEDDING_BASE_URL: ${BRAIN_EMBEDDING_BASE_URL:-http://tei:80}
+      BRAIN_EMBEDDING_MODEL: ${BRAIN_EMBEDDING_MODEL:-BAAI/bge-m3}
+    networks:
+      - a2a-net
+    ports:
+      # host-only publish for the operator web UI / debugging; not exposed on the LAN.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - brain_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/api/health').getcode()==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  tei:
+    # Embedding server (HF Text Embeddings Inference) serving BAAI/bge-m3 for the
+    # brain's semantic search; the brain reaches it at http://tei:80 (/v1/embeddings).
+    # Default = CPU image (portable, no VRAM) — chosen because the 8GB GPU is consumed
+    # by the desktop session. Same model+dims as the GPU path, so switching needs NO reembed.
+    # To run on GPU instead (needs ~2.5GB free VRAM + nvidia-container-toolkit): set
+    #   TEI_IMAGE=ghcr.io/huggingface/text-embeddings-inference:89-1.7   (Ada/sm_89, RTX 40-series)
+    # in .env and uncomment the `deploy:` GPU reservation below.
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.7}
+    command: ["--model-id", "${TEI_MODEL:-BAAI/bge-m3}", "--port", "80"]
+    environment:
+      HF_HOME: /data
+    networks:
+      - a2a-net
+    ports:
+      # host-only publish for debugging the embedding API.
+      - "127.0.0.1:8788:80"
+    volumes:
+      - tei_data:/data
+    # --- GPU path (uncomment when VRAM is free; pair with the Ada TEI_IMAGE above) ---
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
 networks:
   # Docker auto-assigns a free subnet so the stack can run standalone alongside
   # other compose projects without address-pool overlap.
@@ -884,3 +943,5 @@ volumes:
   kai_token_secret:
   portal_logs:
   codex_workspaces:
+  brain_data:
+  tei_data:
