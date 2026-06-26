@@ -21,6 +21,10 @@ import { requireBus } from './_require_bus.ts'
 
 const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
+const TEST_STREAM_LIMITS = {
+  streamMaxMsgSize: 64 * 1024,
+  streamMaxBytes: 2 * 1024 * 1024,
+}
 
 let available = true
 // The shared NATS+Redis the INJECTION tests ride — ONE connection set carrying every
@@ -58,7 +62,7 @@ function newFleet(): Fleet {
 async function startShared(agentId: string, fleet: Fleet, received: Rec[] = [], extra: Partial<A2AChannelOpts> = {}) {
   const ch = new A2AChannel(
     async (content, attrs) => { received.push({ ...attrs, content } as Rec) },
-    { enabled: true, agentId, devNoAuth: true, prefix: fleet.prefix, stream: fleet.stream, sharedNats, sharedJs, sharedRedis, ...extra },
+    { enabled: true, agentId, devNoAuth: true, prefix: fleet.prefix, stream: fleet.stream, sharedNats, sharedJs, sharedRedis, ...TEST_STREAM_LIMITS, ...extra },
   )
   channels.push(ch)
   await ch.start()
@@ -135,7 +139,7 @@ describe.skipIf(!available)('A2AChannel — shared-connection injection (spec §
     const f = newFleet(); const id = `ctgate-${uid}`
     const ch = new A2AChannel(async () => {}, {
       enabled: true, agentId: id, sigAlg: 'hmac', signingKey: 'own-secret',
-      prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis,
+      prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis, ...TEST_STREAM_LIMITS,
     })
     channels.push(ch)
     await ch.start()
@@ -162,7 +166,7 @@ describe.skipIf(!available)('A2AChannel — shared-connection injection (spec §
     // then THROWS in loadOwnSignKey → the start-catch path runs with shared conns injected.
     const ch = new A2AChannel(async () => {}, {
       enabled: true, agentId: id, sigAlg: 'ed25519', signingKeyPath: '/nonexistent/a2a-core-test.seed',
-      prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis,
+      prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis, ...TEST_STREAM_LIMITS,
     })
     channels.push(ch)
     await ch.start()
@@ -176,7 +180,7 @@ describe.skipIf(!available)('A2AChannel — shared-connection injection (spec §
   test('a presence-DUP on an injected session leaves the shared Redis OPEN — gate P2-2b', async () => {
     const f = newFleet(); const D = `ctdup-${uid}`
     redisKeys.push(`alloyium:a2a:presence:${D}`)
-    const mk = () => new A2AChannel(async () => {}, { enabled: true, agentId: D, devNoAuth: true, prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis })
+    const mk = () => new A2AChannel(async () => {}, { enabled: true, agentId: D, devNoAuth: true, prefix: f.prefix, stream: f.stream, sharedNats, sharedJs, sharedRedis, ...TEST_STREAM_LIMITS })
     const ch1 = mk(); channels.push(ch1); await ch1.start()
     expect(ch1.isStarted()).toBe(true)
     // a SECOND instance of the same id over the SAME shared conns → claimPresence returns
@@ -195,7 +199,7 @@ describe.skipIf(!available)('A2AChannel — shared-connection injection (spec §
 describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned shared conns', () => {
   // The core opens its OWN shared NATS+Redis internally (the real connect path).
   function newCore(fleet: Fleet): A2ACore {
-    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: fleet.prefix, stream: fleet.stream, sessionDefaults: { devNoAuth: true } })
+    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: fleet.prefix, stream: fleet.stream, sessionDefaults: { devNoAuth: true, ...TEST_STREAM_LIMITS } })
     cores.push(core)
     return core
   }
@@ -271,7 +275,7 @@ describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned 
 
   // ── 2C: traffic-class pool + per-session backpressure ──
   function newPoolCore(fleet: Fleet, natsPoolSize: number): A2ACore {
-    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: fleet.prefix, stream: fleet.stream, sessionDefaults: { devNoAuth: true }, natsPoolSize })
+    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: fleet.prefix, stream: fleet.stream, sessionDefaults: { devNoAuth: true, ...TEST_STREAM_LIMITS }, natsPoolSize })
     cores.push(core); return core
   }
 
@@ -332,7 +336,7 @@ describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned 
     const f = newFleet(); const A = `cbnd-${uid}`
     redisKeys.push(`alloyium:a2a:presence:${A}`)
     // tiny bound (4) so a modest flood proves the cap; wedged inject (never completes in-test).
-    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream, natsPoolSize: 3, sessionDefaults: { devNoAuth: true, inboxQueueMax: 4, inboxMaxAckPending: 4, inboxAckWaitMs: 120000 } })
+    const core = new A2ACore({ devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream, natsPoolSize: 3, sessionDefaults: { devNoAuth: true, ...TEST_STREAM_LIMITS, inboxQueueMax: 4, inboxMaxAckPending: 4, inboxAckWaitMs: 120000 } })
     cores.push(core); await core.start()
     await core.addSession(A, async () => { await Bun.sleep(120000) }) // wedged: never acks
     for (let i = 0; i < 20; i++) await rawPublishInbox(f, A, mkEnv('peer-x', A, { body: `a${i}` }))
@@ -347,7 +351,7 @@ describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned 
     const f = newFleet(); const A = `ctun-${uid}`
     redisKeys.push(`alloyium:a2a:presence:${A}`)
     // 1st channel creates the durable with the default tuning…
-    const own = (extra: Partial<A2AChannelOpts>) => new A2AChannel(async () => {}, { enabled: true, agentId: A, devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream, ...extra })
+    const own = (extra: Partial<A2AChannelOpts>) => new A2AChannel(async () => {}, { enabled: true, agentId: A, devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream, ...TEST_STREAM_LIMITS, ...extra })
     const ch1 = own({}); channels.push(ch1); await ch1.start(); expect(ch1.isStarted()).toBe(true)
     await ch1.stop()
     // …2nd channel (same id/durable) with a DIFFERENT max_ack_pending → must UPDATE in place,
@@ -462,7 +466,7 @@ describe.skipIf(!available)('A2AChannel — no-injection default is unchanged', 
     // OWN conns (no shared* injected) — the exact single-agent bridge path.
     const own = (received: Rec[] = []) => new A2AChannel(
       async (content, attrs) => { received.push({ ...attrs, content } as Rec) },
-      { enabled: true, agentId: id, devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream },
+      { enabled: true, agentId: id, devNoAuth: true, natsUrl: NATS_URL, redisUrl: REDIS_URL, prefix: f.prefix, stream: f.stream, ...TEST_STREAM_LIMITS },
     )
     const ch1 = own(); channels.push(ch1)
     await ch1.start()

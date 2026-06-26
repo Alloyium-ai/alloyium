@@ -35,6 +35,7 @@ export interface UdsAcceptorOptions {
   expectedUid?: number
   idleTimeoutMs?: number // close a connection that makes no frame progress for this long (0 disables)
   helloTimeoutMs?: number // bound the pre-auth hello/challenge/auth handshake (runHello default 5s)
+  maxConnections?: number // total live UDS connections accepted by this core process
 }
 
 export interface UdsAcceptorHandle {
@@ -53,8 +54,16 @@ const MAX_PRE_SESSION_BYTES = 1024 * 1024
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000
 const DELIVERY_ACK_TIMEOUT_MS = Math.max(1_000, Number(process.env.A2A_DELIVERY_ACK_TIMEOUT_MS ?? 30_000) || 30_000)
 const DELIVERY_MAX_INFLIGHT = Math.max(1, Number(process.env.A2A_DELIVERY_MAX_INFLIGHT ?? 64) || 64)
+const DEFAULT_MAX_CONNECTIONS = positiveIntEnv('A2A_UDS_MAX_CONNECTIONS', 512)
 type BunSocket = any
 type BunServer = { stop: () => unknown }
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  const parsed = raw === undefined || raw === '' ? fallback : Number(raw)
+  const n = Math.trunc(parsed)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
 
 function log(level: 'info' | 'warn' | 'error', event: string, fields: Record<string, unknown> = {}): void {
   const kv = Object.entries(fields)
@@ -480,6 +489,7 @@ export async function startUdsAcceptor(opts: UdsAcceptorOptions): Promise<UdsAcc
 
   const live = new Set<UdsConnection>()
   const bySocket = new WeakMap<object, UdsConnection>()
+  const maxConnections = Math.max(1, Math.trunc(opts.maxConnections ?? DEFAULT_MAX_CONNECTIONS) || DEFAULT_MAX_CONNECTIONS)
 
   let server: BunServer
   try {
@@ -487,6 +497,11 @@ export async function startUdsAcceptor(opts: UdsAcceptorOptions): Promise<UdsAcc
       unix: socketPath,
       socket: {
         open(socket: BunSocket) {
+          if (live.size >= maxConnections) {
+            log('warn', 'uds_connection_limit_exceeded', { live: live.size, max_connections: maxConnections })
+            destroySocket(socket)
+            return
+          }
           const conn = new UdsConnection(socket, opts, () => live.delete(conn))
           bySocket.set(socket, conn)
           live.add(conn)
