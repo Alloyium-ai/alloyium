@@ -59,6 +59,9 @@ Expected long-running services include:
 
 - `redis`
 - `nats`
+- `brain`
+- `tei`
+- `vault`
 - `a2a-core`
 - `a2a-portal`
 - `a2a-launcher`
@@ -72,6 +75,11 @@ Expected long-running services include:
 
 The `onboard-*` containers are one-shot setup jobs. It is normal for them to show
 `Exited (0)` after the stack is healthy.
+
+The base stack owns the default Agent Brain and Vault services. Fresh clones should
+not require a manual clone of `alloyium-brain` or a host KeePassXC install. Override
+`ALLOYIUM_BRAIN_BUILD_CONTEXT`, `ALLOYIUM_VAULT_BUILD_CONTEXT`, `BRAIN_URL`, or
+`VAULT_URL` only for local development or external service deployments.
 
 ## Full Codex A2A Node
 
@@ -206,8 +214,8 @@ firewalling or other access control.
 
 ## Agent Brain
 
-Brain tools are optional and fail soft when not configured. To wire the stack to an
-external agent-brain service:
+Brain tools are default-on against the in-stack `brain` service and fail soft if the
+service is unavailable. To wire the stack to an external agent-brain service:
 
 ```bash
 BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace

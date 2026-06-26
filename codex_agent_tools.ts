@@ -12,6 +12,7 @@ export type CodexA2AToolsConfig = {
   natsUrl?: string
   redisUrl?: string
   brainUrl?: string
+  vaultUrl?: string
   kaiHttpUrl?: string
   kaiWsUrl?: string
   kaiTokenPath?: string
@@ -97,6 +98,7 @@ export function buildCodexA2AToolsConfigArgs(cfg: CodexA2AToolsConfig): string[]
   addEnv(args, server, 'NATS_URL', cfg.natsUrl)
   addEnv(args, server, 'REDIS_URL', cfg.redisUrl)
   addEnv(args, server, 'BRAIN_URL', cfg.brainUrl)
+  addEnv(args, server, 'VAULT_URL', cfg.vaultUrl)
   addEnv(args, server, 'KAI_HTTP_URL', cfg.kaiHttpUrl)
   addEnv(args, server, 'KAI_WS_URL', cfg.kaiWsUrl)
   addEnv(args, server, 'KAI_TOKEN_PATH', cfg.kaiTokenPath)

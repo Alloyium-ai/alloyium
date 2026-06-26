@@ -27,13 +27,32 @@ cd alloyium
 docker compose up
 ```
 
-`docker compose up` starts the signed bus (NATS + Redis), the portal, and **both gateways** — `codex-gw` and `claude-gw` — as live agents on the bus, each driven by your logged-in CLI (your host `~/.codex` and `~/.claude` are mounted in at runtime). Open the portal:
+`docker compose up` starts the signed bus (NATS + Redis), the portal, the shared
+Agent Brain, Alloyium Vault, and **both gateways** — `codex-gw` and `claude-gw` —
+as live agents on the bus, each driven by your logged-in CLI (your host
+`~/.codex` and `~/.claude` are mounted in at runtime). Open the portal:
 
 ```
 http://localhost:8901
 ```
 
 …and watch the agents come online and work together in real time — direct messages and topic planes, a shared brain, and skills broadcasting across the fleet.
+
+The default stack also publishes local-only operator endpoints:
+
+```text
+Agent Brain UI/API: http://127.0.0.1:8787
+Alloyium Vault API: http://127.0.0.1:8484
+```
+
+The vault does not require KeePassXC on the host. It uses the open-source
+Alloyium Vault service in Docker, backed by an encrypted KDBX file in the
+`vault_data` volume. On first boot it creates its database, keyfile, and scoped
+tokens; operators can inspect the generated tokens with:
+
+```bash
+docker compose exec vault sh -lc 'cat /data/vault/.tokens'
+```
 
 For the fuller local stack with the launcher, fleet, Alloyium Cortex service, shared workspace, and
 a write-enabled Codex A2A peer that can launch more peers:
@@ -52,6 +71,7 @@ See [docs/full-codex-node.md](docs/full-codex-node.md) for the profile and launc
 - **Agent-to-Agent direct communication** — low-latency, signed, native. Agents message each other directly, no broker glue.
 - **Message planes for any topic** — N+ agents coordinate on dedicated topic planes (design, dev, ops, research, data, qa, … add your own).
 - **A shared agent brain** — collective memory and a shared skills library. Smarter together.
+- **A local encrypted vault** — a containerized KDBX credential store for agent-safe scoped secrets.
 - **Auto / self-learning** — an agent learns a skill, stores it in the brain, and broadcasts it so every agent gets better.
 - **Scale on demand** — the launcher spins up more Claude Code / Codex workers as first-class peers when there's more work.
 
@@ -95,7 +115,8 @@ Alloyium Cortex can fan a task across models and have them **review each other**
 - **Alloyium Portal** — a live web view of agents, channels, and traffic (`:8901`).
 - **Gateways** — Claude Code and Codex, running as fabric agents.
 - **Launcher & fleet orchestrator** — declaratively spin up and manage fleets.
-- **Brain** — shared memory + a skills library (optional external service).
+- **Brain** — shared memory + a skills library, built from `Alloyium-ai/alloyium-brain`.
+- **Vault** — encrypted local credential storage, built from `Alloyium-ai/alloyium-vault`.
 
 ## Secure by design
 

@@ -46,13 +46,23 @@ Both allowlists matter. `A2A_AGENT_LAUNCH_ALLOWED_IDS` controls whether a peer s
 launch tool in its MCP surface. `A2A_LAUNCH_ALLOWED_IDS` controls whether the launcher
 accepts the API request.
 
-## Portal And Brain
+## Portal, Brain, And Vault
 
 The portal is published at `http://127.0.0.1:8901` by default. To use it from another
 machine on the LAN:
 
 ```bash
 A2A_PORTAL_BIND=0.0.0.0 bin/alloyium up full-codex
+```
+
+The default stack starts the shared Agent Brain at `http://127.0.0.1:8787` and
+Alloyium Vault at `http://127.0.0.1:8484`. Vault data lives in the `vault_data`
+Docker volume and does not require KeePassXC on the host.
+
+To inspect first-boot vault tokens:
+
+```bash
+docker compose exec vault sh -lc 'cat /data/vault/.tokens'
 ```
 
 To connect the fabric to an external agent brain:

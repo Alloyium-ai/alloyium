@@ -245,10 +245,11 @@ export function buildDockerContainerSpec(req: {
     envPair('CODEX_GW_A2A_TOOLS_REQUIRED', '1'),
     envPair('CODEX_GW_A2A_TOOLS_STARTUP_TIMEOUT_SEC', env.CODEX_GW_A2A_TOOLS_STARTUP_TIMEOUT_SEC ?? '20'),
     envPair('CODEX_GW_A2A_TOOLS_TOOL_TIMEOUT_SEC', env.CODEX_GW_A2A_TOOLS_TOOL_TIMEOUT_SEC ?? '45'),
-    // Optional external integrations: only injected into spawned agents when explicitly
-    // configured. Unset => envPair() returns null and the var is omitted, so the agent's
-    // brain/kai tools fall back to their own neutral defaults and fail soft (no LAN assumption).
+    // Optional integrations: only injected into spawned agents when configured on the
+    // launcher. The Compose stack sets the core-owned brain/vault URLs by default.
     envPair('BRAIN_URL', env.BRAIN_URL),
+    envPair('BRAIN_API_TOKEN', env.BRAIN_API_TOKEN),
+    envPair('VAULT_URL', env.VAULT_URL),
     envPair('KAI_HTTP_URL', env.KAI_HTTP_URL),
     envPair('KAI_WS_URL', env.KAI_WS_URL),
     envPair('KAI_TOKEN_PATH', env.KAI_TOKEN_PATH),

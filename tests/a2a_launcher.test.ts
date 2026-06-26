@@ -91,6 +91,25 @@ describe('a2a launcher docker provider', () => {
     ]))
   })
 
+  test('passes configured brain and vault endpoints into launched codex peers', async () => {
+    await withLauncherModule({
+      BRAIN_URL: 'http://brain:8787',
+      BRAIN_API_TOKEN: 'brain-token-for-test',
+      VAULT_URL: 'http://vault:8484',
+    }, (mod) => {
+      const spec = mod.buildDockerContainerSpec({
+        agentId: 'codex-gw-sub-memory',
+        mode: 'shim',
+        createdBy: 'codex-gw',
+      })
+
+      const envList = spec.body.Env as string[]
+      expect(envList).toContain('BRAIN_URL=http://brain:8787')
+      expect(envList).toContain('BRAIN_API_TOKEN=brain-token-for-test')
+      expect(envList).toContain('VAULT_URL=http://vault:8484')
+    })
+  })
+
   test('mounts configured shared workspace into launched peers', async () => {
     await withLauncherModule({
       A2A_LAUNCH_PROJECT_DIR: '/opt/alloyium',
