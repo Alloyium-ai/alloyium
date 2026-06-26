@@ -64,6 +64,48 @@ BRAIN_URL=http://brain-host:8787 bin/alloyium up full-codex --replace
 The `--replace` flag recreates `cc-agent-codex-a2a-full-1` so the launched peer picks up
 new launcher-provided environment.
 
+## Codex Jobs And Realtime Sessions
+
+Alloyium exposes two Codex execution shapes:
+
+- `codex.job.request.v1` remains the batch/one-off contract for fleet dispatch,
+  CI-style work, and portal one-off sends.
+- Portal chat sends to Codex-like peers use `codex.session.input.v1`, which creates
+  or reuses a long-lived app-server thread, starts a turn when idle, steers an active
+  turn when possible, and streams normalized `codex.session.event.v1` events to a
+  deterministic portal topic.
+
+The gateway also accepts the lower-level realtime A2A schemas:
+
+- `codex.session.create.v1`
+- `codex.session.state.v1`
+- `codex.turn.start.v1`
+- `codex.turn.steer.v1`
+- `codex.thread.inject_items.v1`
+- `codex.turn.interrupt.v1`
+
+For local tools that need HTTP instead of A2A, a Codex gateway can expose an optional
+loopback-only HTTP/SSE control plane:
+
+```bash
+CODEX_GW_HTTP_PORT=8995 bun codex_gateway.ts
+```
+
+Useful endpoints:
+
+```text
+POST /v1/codex/sessions
+GET  /v1/codex/sessions
+GET  /v1/codex/sessions/{session_id}
+POST /v1/codex/sessions/{session_id}/turns
+POST /v1/codex/sessions/{session_id}/events
+GET  /v1/codex/sessions/{session_id}/events
+POST /v1/codex/sessions/{session_id}/interrupt
+```
+
+Do not expose the HTTP gateway publicly. Non-loopback binds require
+`CODEX_GW_HTTP_TOKEN`; clients must send `Authorization: Bearer <token>`.
+
 ## Useful Commands
 
 ```bash

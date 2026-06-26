@@ -13,7 +13,7 @@ import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
 import { randomUUID } from 'node:crypto'
 import { A2AChannel } from './a2a-channel.ts'
-import { buildPortalDefaultCwd, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
 import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
@@ -335,7 +335,9 @@ async function waitForPortalReply(fromPeer: string, corr: string, sinceT: number
 async function publishPortalSend(built: Extract<PortalSendBuildResult, { ok: true }>): Promise<SendOk> {
   const threadKey = buildPortalThreadKey(built.args, PORTAL_AGENT_ID, built.sendMode, { chatContext: built.chatContext })
   const cwd = buildPortalDefaultCwd(built.args, built.sendMode, { hostOpsCwd: HOST_OPS_CHAT_CWD, remoteHostOpsCwd: REMOTE_HOST_OPS_CHAT_CWD, codexCwd: CODEX_CHAT_CWD, oneOffCwd: ONE_OFF_CWD })
-  const args = wrapPlainCodexRequest(built.args, `portal-codex-${randomUUID()}`, { threadKey, cwd })
+  const args = built.sendMode === 'chat'
+    ? wrapPlainCodexRealtimeInput(built.args, { sessionId: threadKey, threadKey, cwd, streamTopic: buildPortalRealtimeStreamTopic(threadKey) })
+    : wrapPlainCodexRequest(built.args, `portal-codex-${randomUUID()}`, { threadKey, cwd })
   const sentAt = Date.now()
   const res = await sendChannel!.callTool('a2a_send', args)
   let parsed: any = null

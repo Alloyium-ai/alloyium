@@ -16,6 +16,32 @@ import { RedisClient } from 'bun'
 import { planReply, fitTruncate, putBlob, delBlob, truncateToBytes, utf8ByteLength, sentOk, resolveJobInput, type WrapFn, type BlobRef } from './output_transport.ts'
 import { authorizeWriteJob } from './codex_build_authz.ts'
 import { CODEX_DETACHED_NO_INTERACTIVE_PROMPT_DIRECTIVE, buildCodexA2AToolsConfigArgs, buildCodexAgentPrompt, codexA2AToolsEnabled, codexA2AToolsMode } from './codex_agent_tools.ts'
+import {
+  CODEX_SESSION_CREATE_SCHEMA,
+  CODEX_SESSION_INPUT_SCHEMA,
+  CODEX_SESSION_READY_SCHEMA,
+  CODEX_SESSION_STATE_SCHEMA,
+  CODEX_THREAD_INJECT_ITEMS_SCHEMA,
+  CODEX_THREAD_INJECTED_SCHEMA,
+  CODEX_TURN_INTERRUPT_SCHEMA,
+  CODEX_TURN_INTERRUPTED_SCHEMA,
+  CODEX_TURN_COMPLETED_SCHEMA,
+  CODEX_TURN_FAILED_SCHEMA,
+  CODEX_TURN_START_SCHEMA,
+  CODEX_TURN_STARTED_SCHEMA,
+  CODEX_TURN_STEER_SCHEMA,
+  CODEX_TURN_STEERED_SCHEMA,
+  CodexRealtimeSessionRegistry,
+  buildCodexInjectedTextItem,
+  buildCodexRealtimeEvent,
+  buildCodexUserTextInput,
+  extractRealtimeText,
+  isCodexRealtimeSchema,
+  normalizeSessionId,
+  sessionPublicState,
+  type CodexRealtimeEvent,
+  type CodexRealtimeSession,
+} from './codex_realtime.ts'
 
 const AGENT_ID = process.env.A2A_AGENT_ID ?? 'codex-gw'
 const APPROVER = process.env.CODEX_GW_APPROVER ?? '' // who approves command/edit escalations; '' => the requester
@@ -38,6 +64,9 @@ const A2A_TOOLS_MODE = codexA2AToolsMode()
 const A2A_TOOLS_STARTUP_TIMEOUT_SEC = positiveNumber(process.env.CODEX_GW_A2A_TOOLS_STARTUP_TIMEOUT_SEC)
 const A2A_TOOLS_TOOL_TIMEOUT_SEC = positiveNumber(process.env.CODEX_GW_A2A_TOOLS_TOOL_TIMEOUT_SEC)
 const AGENT_PREAMBLE = process.env.CODEX_GW_AGENT_PREAMBLE?.trim()
+const HTTP_PORT = Math.max(0, Number(process.env.CODEX_GW_HTTP_PORT ?? 0) || 0)
+const HTTP_BIND = process.env.CODEX_GW_HTTP_BIND ?? '127.0.0.1'
+const HTTP_TOKEN = process.env.CODEX_GW_HTTP_TOKEN ?? ''
 // Output transport (RCA Issue 1): the completed reply is byte-sized to THIS agent's
 // A2A send cap (a2a.getMaxSendBytes()). Large output is delivered LOSSLESSLY by
 // claim-check (TTL'd Redis blob + ref + marked preview) or, if Redis is down, by
@@ -307,6 +336,8 @@ class CodexAppServer {
   private idc = 0
   private handlers = new Set<(m: any) => void>()
   private threads = new GatewayThreadCache()
+  private realtime = new CodexRealtimeSessionRegistry()
+  private realtimeHandlers = new Set<(ev: CodexRealtimeEvent, session: CodexRealtimeSession) => void>()
   private stderrRing: string[] = []
   onApproval: ApprovalFn = async () => 'decline'
   constructor() {
@@ -361,6 +392,7 @@ class CodexAppServer {
           log(`mcp elicitation ${result.action}: server=${params.serverName ?? '?'} kind=${params._meta?.codex_approval_kind ?? '?'} tool=${params._meta?.tool_description ?? '?'}`)
           this.send({ id: m.id, result })
         } else {
+          this.handleRealtimeNotification(m)
           for (const h of this.handlers) h(m)
         }
       }
@@ -385,6 +417,78 @@ class CodexAppServer {
     await this.req('initialize', { clientInfo: { name: 'codex-gateway', title: 'A2A Codex Gateway', version: '0.2.0' }, capabilities: { experimentalApi: true, requestAttestation: false } })
     this.notify('initialized'); log('app-server initialized')
   }
+  onRealtimeEvent(handler: (ev: CodexRealtimeEvent, session: CodexRealtimeSession) => void): () => void {
+    this.realtimeHandlers.add(handler)
+    return () => this.realtimeHandlers.delete(handler)
+  }
+  private emitRealtimeEvent(session: CodexRealtimeSession, event: string, opts: Omit<Partial<CodexRealtimeEvent>, 'schema' | 'session_id' | 'thread_id' | 'seq' | 'event' | 'ts'> = {}): void {
+    const ev = buildCodexRealtimeEvent(this.realtime, session, event, opts)
+    for (const h of this.realtimeHandlers) h(ev, session)
+  }
+  private handleRealtimeNotification(m: any): void {
+    const method = String(m?.method ?? '')
+    const params = m?.params ?? {}
+    const threadId = typeof params.threadId === 'string'
+      ? params.threadId
+      : typeof params.thread?.id === 'string'
+        ? params.thread.id
+        : ''
+    if (!threadId) return
+    const session = this.realtime.getByThreadId(threadId)
+    if (!session) return
+
+    if (method === 'turn/started') {
+      const turnId = String(params.turn?.id ?? params.turnId ?? '')
+      if (turnId) this.realtime.setActiveTurn(session.session_id, turnId, 'running')
+      this.emitRealtimeEvent(session, 'turn_started', { method, turn_id: turnId || undefined, status: params.turn?.status })
+      return
+    }
+
+    if (method === 'item/agentMessage/delta') {
+      this.emitRealtimeEvent(session, 'agent_text_delta', {
+        method,
+        turn_id: typeof params.turnId === 'string' ? params.turnId : session.active_turn_id,
+        item_id: typeof params.itemId === 'string' ? params.itemId : undefined,
+        text: typeof params.delta === 'string' ? params.delta : undefined,
+      })
+      return
+    }
+
+    if (method === 'item/started' || method === 'item/completed') {
+      this.emitRealtimeEvent(session, method === 'item/started' ? 'item_started' : 'item_completed', {
+        method,
+        turn_id: typeof params.turnId === 'string' ? params.turnId : session.active_turn_id,
+        item_id: typeof params.item?.id === 'string' ? params.item.id : undefined,
+      })
+      return
+    }
+
+    if (method === 'turn/completed') {
+      const turnId = String(params.turn?.id ?? params.turnId ?? session.active_turn_id ?? '')
+      const status = String(params.status ?? params.turn?.status ?? 'completed')
+      const finalStatus = status === 'failed' ? 'failed' : status === 'interrupted' ? 'interrupted' : 'completed'
+      this.realtime.clearActiveTurn(session.session_id, finalStatus)
+      this.emitRealtimeEvent(session, finalStatus === 'failed' ? 'turn_failed' : finalStatus === 'interrupted' ? 'turn_interrupted' : 'turn_completed', {
+        method,
+        turn_id: turnId || undefined,
+        status,
+      })
+      return
+    }
+
+    if (method === 'turn/failed') {
+      const turnId = String(params.turn?.id ?? params.turnId ?? session.active_turn_id ?? '')
+      this.realtime.clearActiveTurn(session.session_id, 'failed')
+      this.emitRealtimeEvent(session, 'turn_failed', { method, turn_id: turnId || undefined, status: 'failed', payload: { error: extractTurnError(params) } })
+      return
+    }
+
+    if (method === 'thread/status/changed') {
+      const rawStatus = params.status?.type
+      if (rawStatus === 'idle' && session.active_turn_id) this.realtime.clearActiveTurn(session.session_id, session.status === 'interrupting' ? 'interrupted' : 'completed')
+      this.emitRealtimeEvent(session, 'thread_status_changed', { method, status: typeof rawStatus === 'string' ? rawStatus : undefined })
+    }
+  }
   private async thread(threadKey: string | undefined, opts: { sandbox: string; approvalPolicy: string; cwd: string }): Promise<string> {
     const codexSandbox = resolveCodexExecutionSandbox(opts.sandbox, {
       defaultSandbox: CODEX_EXEC_SANDBOX,
@@ -405,6 +509,86 @@ class CodexAppServer {
     const id = th.threadId ?? th.thread?.id ?? th.id
     this.threads.set(threadKey, id, ctx)
     return id
+  }
+  async createRealtimeSession(opts: { sessionId?: string; threadKey?: string; resumeThreadId?: string; sandbox?: string; approvalPolicy?: string; cwd?: string; owner?: string; streamTopic?: string }): Promise<CodexRealtimeSession> {
+    const sandbox = opts.sandbox ?? 'read-only'
+    const approvalPolicy = opts.approvalPolicy ?? 'never'
+    const cwd = opts.cwd ?? '/tmp'
+    let threadId = opts.resumeThreadId
+    if (threadId) {
+      const resumed = await this.req('thread/resume', { threadId, cwd, approvalPolicy, ...codexDetachedThreadOverrides() })
+      threadId = resumed.threadId ?? resumed.thread?.id ?? resumed.id ?? threadId
+    } else {
+      threadId = await this.thread(opts.threadKey, { sandbox, approvalPolicy, cwd })
+    }
+    return this.realtime.create({
+      sessionId: opts.sessionId,
+      threadId,
+      threadKey: opts.threadKey,
+      owner: opts.owner,
+      cwd,
+      sandbox,
+      approvalPolicy,
+      streamTopic: opts.streamTopic,
+    })
+  }
+  getRealtimeSession(sessionId: string): CodexRealtimeSession | null {
+    return this.realtime.get(sessionId)
+  }
+  listRealtimeSessions(): CodexRealtimeSession[] {
+    return this.realtime.list()
+  }
+  async startRealtimeTurn(sessionId: string, text: string, opts: { clientUserMessageId?: string; effort?: string } = {}): Promise<{ session: CodexRealtimeSession; turnId: string }> {
+    const session = this.realtime.get(normalizeSessionId(sessionId))
+    if (!session) throw new Error('session_not_found')
+    if (session.active_turn_id) throw new Error('active_turn_exists')
+    const turn: any = {
+      threadId: session.thread_id,
+      ...(opts.clientUserMessageId ? { clientUserMessageId: opts.clientUserMessageId } : {}),
+      input: buildCodexUserTextInput(text),
+    }
+    const effort = opts.effort ?? EFFORT
+    if (effort) turn.effort = effort
+    const res = await this.req('turn/start', turn)
+    const turnId = String(res?.turn?.id ?? res?.turnId ?? '')
+    if (!turnId) throw new Error('turn_start_missing_id')
+    this.realtime.setActiveTurn(session.session_id, turnId, 'running')
+    return { session, turnId }
+  }
+  async steerRealtimeTurn(sessionId: string, text: string, opts: { clientUserMessageId?: string } = {}): Promise<{ session: CodexRealtimeSession; turnId: string }> {
+    const session = this.realtime.get(normalizeSessionId(sessionId))
+    if (!session) throw new Error('session_not_found')
+    if (!session.active_turn_id) throw new Error('no_active_turn')
+    this.realtime.updateStatus(session.session_id, 'steering')
+    const res = await this.req('turn/steer', {
+      threadId: session.thread_id,
+      expectedTurnId: session.active_turn_id,
+      ...(opts.clientUserMessageId ? { clientUserMessageId: opts.clientUserMessageId } : {}),
+      input: buildCodexUserTextInput(text),
+    })
+    const turnId = String(res?.turnId ?? session.active_turn_id)
+    this.realtime.setActiveTurn(session.session_id, turnId, 'running')
+    this.emitRealtimeEvent(session, 'turn_steered', { method: 'turn/steer', turn_id: turnId })
+    return { session, turnId }
+  }
+  async injectRealtimeItems(sessionId: string, items: Array<Record<string, unknown>>): Promise<CodexRealtimeSession> {
+    const session = this.realtime.get(normalizeSessionId(sessionId))
+    if (!session) throw new Error('session_not_found')
+    this.realtime.updateStatus(session.session_id, 'injecting_context')
+    await this.req('thread/inject_items', { threadId: session.thread_id, items })
+    this.realtime.updateStatus(session.session_id, session.active_turn_id ? 'running' : 'ready')
+    this.emitRealtimeEvent(session, 'thread_items_injected', { method: 'thread/inject_items', payload: { count: items.length } })
+    return session
+  }
+  async interruptRealtimeTurn(sessionId: string, turnId?: string): Promise<{ session: CodexRealtimeSession; turnId: string }> {
+    const session = this.realtime.get(normalizeSessionId(sessionId))
+    if (!session) throw new Error('session_not_found')
+    const activeTurnId = turnId ?? session.active_turn_id
+    if (!activeTurnId) throw new Error('no_active_turn')
+    this.realtime.updateStatus(session.session_id, 'interrupting')
+    await this.req('turn/interrupt', { threadId: session.thread_id, turnId: activeTurnId })
+    this.emitRealtimeEvent(session, 'turn_interrupt_requested', { method: 'turn/interrupt', turn_id: activeTurnId })
+    return { session, turnId: activeTurnId }
   }
   async runTurn(prompt: string, opts: { threadKey?: string; sandbox?: string; approvalPolicy?: string; cwd?: string; onDelta?: (s: string) => void } = {}): Promise<{ text: string; status: string; timedOut: boolean; timeoutMs: number; error?: string }> {
     const threadId = await this.thread(opts.threadKey, { sandbox: opts.sandbox ?? 'read-only', approvalPolicy: opts.approvalPolicy ?? 'never', cwd: opts.cwd ?? '/tmp' })
@@ -440,6 +624,8 @@ let codex: CodexAppServer
 const pendingApprovals = new Map<string, (d: 'accept' | 'decline') => void>()
 let a2a: A2AChannel
 const peerInbox: PeerInboxEvent[] = []
+type PendingRealtimeTurn = { to: string; corr: string; sessionId: string; turnId: string; text: string }
+const pendingRealtimeTurns = new Map<string, PendingRealtimeTurn>()
 
 const sendMsg = (to: string, body: any, extra: any = {}) =>
   a2a.callTool('a2a_send', { to, body: typeof body === 'string' ? body : JSON.stringify(body), ...extra })
@@ -481,6 +667,375 @@ function configureApprovals() {
   }
 }
 
+function configureRealtimeEvents() {
+  codex.onRealtimeEvent((ev, session) => {
+    if (session.stream_topic) void sendMsg(`topic:${session.stream_topic}`, ev)
+    if (ev.turn_id && ev.event === 'agent_text_delta' && typeof ev.text === 'string') {
+      const pending = pendingRealtimeTurns.get(ev.turn_id)
+      if (pending) pending.text += ev.text
+    }
+    if (ev.turn_id && ['turn_completed', 'turn_failed', 'turn_interrupted'].includes(ev.event)) {
+      const pending = pendingRealtimeTurns.get(ev.turn_id)
+      if (!pending) return
+      pendingRealtimeTurns.delete(ev.turn_id)
+      const schema = ev.event === 'turn_failed'
+        ? CODEX_TURN_FAILED_SCHEMA
+        : ev.event === 'turn_interrupted'
+          ? CODEX_TURN_INTERRUPTED_SCHEMA
+          : CODEX_TURN_COMPLETED_SCHEMA
+      void sendMsg(pending.to, {
+        schema,
+        session_id: pending.sessionId,
+        thread_id: ev.thread_id,
+        turn_id: ev.turn_id,
+        status: ev.status ?? (ev.event === 'turn_failed' ? 'failed' : ev.event === 'turn_interrupted' ? 'interrupted' : 'completed'),
+        ...(pending.text ? { output: pending.text.trim() } : {}),
+        seq: ev.seq,
+      }, { type: 'reply', corr: pending.corr }).catch(() => {})
+    }
+  })
+}
+
+type RealtimeContext =
+  | { ok: true; sessionId?: string; threadKey?: string; resumeThreadId?: string; streamTopic?: string; sandbox: string; approvalPolicy: string; cwd: string; effectiveCwd: string }
+  | { ok: false; reason: string; detail?: string }
+
+async function resolveRealtimeContext(req: Record<string, any>, from: string): Promise<RealtimeContext> {
+  const sandbox = req.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only'
+  const approvalPolicy = typeof req.approval_policy === 'string' ? req.approval_policy : 'never'
+  const cwd = typeof req.cwd === 'string' && req.cwd ? req.cwd : '/tmp'
+  const sessionId = typeof req.session_id === 'string' && req.session_id ? req.session_id : undefined
+  const threadKey = typeof req.thread_key === 'string' && req.thread_key ? req.thread_key : sessionId
+  const resumeThreadId = typeof req.resume_thread_id === 'string' && req.resume_thread_id ? req.resume_thread_id : undefined
+  const streamTopic = typeof req.stream_topic === 'string' && req.stream_topic ? req.stream_topic : undefined
+
+  if (!approvalPolicyAllowed(approvalPolicy, WRITE_ENABLED)) {
+    return { ok: false, reason: 'write-unauthorized', detail: 'approval-policy-not-never' }
+  }
+
+  if (sandbox !== 'workspace-write') {
+    return { ok: true, sessionId, threadKey, resumeThreadId, streamTopic, sandbox, approvalPolicy, cwd, effectiveCwd: cwd }
+  }
+
+  const writeJob = validateWorkspaceWriteJob({ thread_key: threadKey }, approvalPolicy, a2a.signingEnabled)
+  if (!writeJob.ok) return { ok: false, reason: writeJob.reason, detail: writeJob.detail }
+  const authz = await authorizeWriteJob(getRedis(), { requesterId: from, cwd, threadKey: writeJob.threadKey }, {
+    allowWrite: WRITE_ENABLED, allowlist: WRITE_ALLOWLIST, cwdRoots: CWD_ROOTS,
+  })
+  if (!authz.ok) return { ok: false, reason: 'write-unauthorized', detail: authz.reason }
+  return { ok: true, sessionId, threadKey: writeJob.threadKey, resumeThreadId, streamTopic, sandbox, approvalPolicy, cwd, effectiveCwd: authz.realpath }
+}
+
+async function ensureRealtimeSession(req: Record<string, any>, from: string): Promise<{ ok: true; session: CodexRealtimeSession } | { ok: false; reason: string; detail?: string }> {
+  const ctx = await resolveRealtimeContext(req, from)
+  if (!ctx.ok) return ctx
+  try {
+    const session = await codex.createRealtimeSession({
+      sessionId: ctx.sessionId,
+      threadKey: ctx.threadKey,
+      resumeThreadId: ctx.resumeThreadId,
+      sandbox: ctx.sandbox,
+      approvalPolicy: ctx.approvalPolicy,
+      cwd: ctx.effectiveCwd,
+      owner: from,
+      streamTopic: ctx.streamTopic,
+    })
+    return { ok: true, session }
+  } catch (e) {
+    return { ok: false, reason: describeGatewayError(e) }
+  }
+}
+
+async function onRealtimeInbound(req: Record<string, any>, from: string, corr: string) {
+  const schema = req.schema
+
+  if (schema === CODEX_SESSION_CREATE_SCHEMA) {
+    const created = await ensureRealtimeSession(req, from)
+    if (!created.ok) {
+      await sendMsg(from, { schema: 'codex.session.rejected.v1', reason: created.reason, detail: created.detail }, { type: 'reply', corr })
+      return
+    }
+    await sendMsg(from, { schema: CODEX_SESSION_READY_SCHEMA, ...sessionPublicState(created.session) }, { type: 'reply', corr })
+    return
+  }
+
+  if (schema === CODEX_SESSION_STATE_SCHEMA) {
+    const sessionId = typeof req.session_id === 'string' ? req.session_id : ''
+    const session = sessionId ? codex.getRealtimeSession(sessionId) : null
+    if (!session) {
+      await sendMsg(from, { schema: 'codex.session.not_found.v1', session_id: sessionId || null }, { type: 'reply', corr })
+      return
+    }
+    await sendMsg(from, { schema: CODEX_SESSION_STATE_SCHEMA, ...sessionPublicState(session) }, { type: 'reply', corr })
+    return
+  }
+
+  if (schema === CODEX_SESSION_INPUT_SCHEMA || schema === CODEX_TURN_START_SCHEMA) {
+    const created = await ensureRealtimeSession(req, from)
+    if (!created.ok) {
+      await sendMsg(from, { schema: 'codex.session.rejected.v1', reason: created.reason, detail: created.detail }, { type: 'reply', corr })
+      return
+    }
+    const session = created.session
+    const text = extractRealtimeText(req)
+    if (!text.trim()) {
+      await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: session.session_id, error: 'empty_input' }, { type: 'reply', corr })
+      return
+    }
+    const mode = schema === CODEX_SESSION_INPUT_SCHEMA ? String(req.mode ?? 'auto') : 'start_turn'
+    try {
+      if ((mode === 'auto' || mode === 'steer') && session.active_turn_id) {
+        const steered = await codex.steerRealtimeTurn(session.session_id, text, { clientUserMessageId: typeof req.event_id === 'string' ? req.event_id : undefined })
+        await sendMsg(from, { schema: CODEX_TURN_STEERED_SCHEMA, session_id: session.session_id, thread_id: session.thread_id, turn_id: steered.turnId, status: 'running' }, { type: 'reply', corr })
+        return
+      }
+      if (mode === 'steer') {
+        await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: session.session_id, error: 'no_active_turn' }, { type: 'reply', corr })
+        return
+      }
+      if (mode === 'inject') {
+        const injected = await codex.injectRealtimeItems(session.session_id, [buildCodexInjectedTextItem(text)])
+        await sendMsg(from, { schema: CODEX_THREAD_INJECTED_SCHEMA, ...sessionPublicState(injected), injected: 1 }, { type: 'reply', corr })
+        return
+      }
+      const prompt = buildCodexAgentPrompt(text, {
+        agentId: AGENT_ID,
+        requester: from,
+        jobId: typeof req.job_id === 'string' ? req.job_id : undefined,
+        streamTopic: session.stream_topic,
+        toolsEnabled: A2A_TOOLS_ENABLED,
+      })
+      const started = await codex.startRealtimeTurn(session.session_id, prompt, { clientUserMessageId: typeof req.event_id === 'string' ? req.event_id : undefined })
+      pendingRealtimeTurns.set(started.turnId, { to: from, corr, sessionId: session.session_id, turnId: started.turnId, text: '' })
+      await sendMsg(from, { schema: CODEX_TURN_STARTED_SCHEMA, ...sessionPublicState(session), turn_id: started.turnId }, { type: 'reply', corr })
+      return
+    } catch (e) {
+      await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: session.session_id, error: describeGatewayError(e) }, { type: 'reply', corr })
+      return
+    }
+  }
+
+  if (schema === CODEX_TURN_STEER_SCHEMA) {
+    const sessionId = typeof req.session_id === 'string' ? req.session_id : ''
+    const text = extractRealtimeText(req)
+    try {
+      const steered = await codex.steerRealtimeTurn(sessionId, text, { clientUserMessageId: typeof req.event_id === 'string' ? req.event_id : undefined })
+      await sendMsg(from, { schema: CODEX_TURN_STEERED_SCHEMA, session_id: sessionId, thread_id: steered.session.thread_id, turn_id: steered.turnId, status: 'running' }, { type: 'reply', corr })
+    } catch (e) {
+      await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: sessionId || null, error: describeGatewayError(e) }, { type: 'reply', corr })
+    }
+    return
+  }
+
+  if (schema === CODEX_THREAD_INJECT_ITEMS_SCHEMA) {
+    const sessionId = typeof req.session_id === 'string' ? req.session_id : ''
+    const items = Array.isArray(req.items)
+      ? req.items.filter((x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x))
+      : extractRealtimeText(req).trim()
+        ? [buildCodexInjectedTextItem(extractRealtimeText(req))]
+        : []
+    try {
+      const session = await codex.injectRealtimeItems(sessionId, items)
+      await sendMsg(from, { schema: CODEX_THREAD_INJECTED_SCHEMA, ...sessionPublicState(session), injected: items.length }, { type: 'reply', corr })
+    } catch (e) {
+      await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: sessionId || null, error: describeGatewayError(e) }, { type: 'reply', corr })
+    }
+    return
+  }
+
+  if (schema === CODEX_TURN_INTERRUPT_SCHEMA) {
+    const sessionId = typeof req.session_id === 'string' ? req.session_id : ''
+    const turnId = typeof req.turn_id === 'string' ? req.turn_id : undefined
+    try {
+      const interrupted = await codex.interruptRealtimeTurn(sessionId, turnId)
+      await sendMsg(from, { schema: CODEX_TURN_INTERRUPTED_SCHEMA, session_id: sessionId, thread_id: interrupted.session.thread_id, turn_id: interrupted.turnId, status: 'interrupting' }, { type: 'reply', corr })
+    } catch (e) {
+      await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: sessionId || null, error: describeGatewayError(e) }, { type: 'reply', corr })
+    }
+  }
+}
+
+const httpSseClients = new Map<string, Set<ReadableStreamDefaultController>>()
+
+export function isCodexHttpLoopbackBind(host: string): boolean {
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]'
+}
+
+export function codexHttpGatewayStartAllowed(bind: string, token: string): boolean {
+  return isCodexHttpLoopbackBind(bind) || !!token
+}
+
+function httpJson(body: unknown, init: ResponseInit = {}): Response {
+  return new Response(JSON.stringify(body), { ...init, headers: { 'content-type': 'application/json', ...(init.headers ?? {}) } })
+}
+
+function httpErr(error: string, status = 400, detail?: unknown): Response {
+  return httpJson({ ok: false, error, ...(detail === undefined ? {} : { detail }) }, { status })
+}
+
+function httpAuthorized(req: Request): boolean {
+  if (!HTTP_TOKEN) return true
+  const auth = req.headers.get('authorization') ?? ''
+  return auth === `Bearer ${HTTP_TOKEN}`
+}
+
+async function readJsonBody(req: Request): Promise<Record<string, any>> {
+  try {
+    const body = await req.json()
+    return body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, any> : {}
+  } catch {
+    return {}
+  }
+}
+
+function sseFrame(ev: CodexRealtimeEvent): Uint8Array {
+  return new TextEncoder().encode(`event: ${ev.event}\ndata: ${JSON.stringify(ev)}\n\n`)
+}
+
+function registerHttpRealtimeRelay() {
+  codex.onRealtimeEvent((ev, session) => {
+    const clients = httpSseClients.get(session.session_id)
+    if (!clients?.size) return
+    const frame = sseFrame(ev)
+    for (const c of [...clients]) {
+      try { c.enqueue(frame) } catch { clients.delete(c) }
+    }
+  })
+}
+
+async function ensureHttpSession(reqBody: Record<string, any>, owner = 'http'): Promise<{ ok: true; session: CodexRealtimeSession } | { ok: false; response: Response }> {
+  const created = await ensureRealtimeSession(reqBody, owner)
+  if (!created.ok) return { ok: false, response: httpErr(created.reason, 403, created.detail) }
+  return { ok: true, session: created.session }
+}
+
+async function handleHttpSessionEvent(sessionId: string, body: Record<string, any>): Promise<Response> {
+  const session = codex.getRealtimeSession(sessionId)
+  if (!session) return httpErr('session_not_found', 404)
+  const mode = String(body.mode ?? 'auto')
+  const text = extractRealtimeText(body)
+  try {
+    if (mode === 'interrupt') {
+      const interrupted = await codex.interruptRealtimeTurn(sessionId, typeof body.turn_id === 'string' ? body.turn_id : undefined)
+      return httpJson({ ok: true, schema: CODEX_TURN_INTERRUPTED_SCHEMA, session_id: sessionId, thread_id: interrupted.session.thread_id, turn_id: interrupted.turnId, status: 'interrupting' })
+    }
+    if (mode === 'inject') {
+      const items = Array.isArray(body.items)
+        ? body.items.filter((x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x))
+        : text.trim()
+          ? [buildCodexInjectedTextItem(text)]
+          : []
+      const injected = await codex.injectRealtimeItems(sessionId, items)
+      return httpJson({ ok: true, schema: CODEX_THREAD_INJECTED_SCHEMA, ...sessionPublicState(injected), injected: items.length })
+    }
+    if ((mode === 'auto' || mode === 'steer') && session.active_turn_id) {
+      const steered = await codex.steerRealtimeTurn(sessionId, text, { clientUserMessageId: typeof body.event_id === 'string' ? body.event_id : undefined })
+      return httpJson({ ok: true, schema: CODEX_TURN_STEERED_SCHEMA, session_id: sessionId, thread_id: steered.session.thread_id, turn_id: steered.turnId, status: 'running' })
+    }
+    if (mode === 'steer') return httpErr('no_active_turn', 409)
+    if (!text.trim()) return httpErr('empty_input', 400)
+    const prompt = buildCodexAgentPrompt(text, {
+      agentId: AGENT_ID,
+      requester: 'http',
+      streamTopic: session.stream_topic,
+      toolsEnabled: A2A_TOOLS_ENABLED,
+    })
+    const started = await codex.startRealtimeTurn(sessionId, prompt, { clientUserMessageId: typeof body.event_id === 'string' ? body.event_id : undefined })
+    return httpJson({ ok: true, schema: CODEX_TURN_STARTED_SCHEMA, ...sessionPublicState(started.session), turn_id: started.turnId })
+  } catch (e) {
+    return httpErr(describeGatewayError(e), 400)
+  }
+}
+
+function startHttpGateway() {
+  if (HTTP_PORT <= 0) return
+  if (!codexHttpGatewayStartAllowed(HTTP_BIND, HTTP_TOKEN)) {
+    log(`FATAL: CODEX_GW_HTTP_BIND=${HTTP_BIND} requires CODEX_GW_HTTP_TOKEN; refusing unauthenticated non-loopback HTTP gateway`)
+    process.exit(1)
+  }
+  registerHttpRealtimeRelay()
+  Bun.serve({
+    hostname: HTTP_BIND,
+    port: HTTP_PORT,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname === '/readyz') return httpJson({ ok: true, service: 'codex-gateway', agent_id: AGENT_ID })
+      if (!httpAuthorized(req)) return httpErr('unauthorized', 401)
+
+      if (url.pathname === '/v1/codex/sessions' && req.method === 'GET') {
+        return httpJson({ ok: true, sessions: codex.listRealtimeSessions().map(sessionPublicState) })
+      }
+
+      if (url.pathname === '/v1/codex/sessions' && req.method === 'POST') {
+        const body = await readJsonBody(req)
+        const created = await ensureHttpSession({
+          ...body,
+          schema: CODEX_SESSION_CREATE_SCHEMA,
+          session_id: body.session_id,
+          thread_key: body.thread_key ?? body.session_id,
+          sandbox: body.sandbox ?? 'read-only',
+          approval_policy: body.approval_policy ?? 'never',
+          cwd: body.cwd ?? '/tmp',
+        }, 'http')
+        if (!created.ok) return created.response
+        return httpJson({ ok: true, schema: CODEX_SESSION_READY_SCHEMA, ...sessionPublicState(created.session) })
+      }
+
+      const m = url.pathname.match(/^\/v1\/codex\/sessions\/([^/]+)(?:\/([^/]+))?$/)
+      if (!m) return httpErr('not_found', 404)
+      const sessionId = decodeURIComponent(m[1])
+      const action = m[2] ?? ''
+
+      if (!action && req.method === 'GET') {
+        const session = codex.getRealtimeSession(sessionId)
+        return session ? httpJson({ ok: true, schema: CODEX_SESSION_STATE_SCHEMA, ...sessionPublicState(session) }) : httpErr('session_not_found', 404)
+      }
+
+      if (action === 'events' && req.method === 'GET') {
+        if (!codex.getRealtimeSession(sessionId)) return httpErr('session_not_found', 404)
+        let streamController: ReadableStreamDefaultController | null = null
+        const stream = new ReadableStream({
+          start(controller) {
+            streamController = controller
+            let clients = httpSseClients.get(sessionId)
+            if (!clients) { clients = new Set(); httpSseClients.set(sessionId, clients) }
+            clients.add(controller)
+            controller.enqueue(new TextEncoder().encode(': connected\n\n'))
+          },
+          cancel() {
+            const clients = httpSseClients.get(sessionId)
+            if (clients && streamController) clients.delete(streamController)
+            if (clients && !clients.size) httpSseClients.delete(sessionId)
+            streamController = null
+          },
+        })
+        return new Response(stream, {
+          headers: {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            connection: 'keep-alive',
+          },
+        })
+      }
+
+      if (action === 'turns' && req.method === 'POST') {
+        return handleHttpSessionEvent(sessionId, { ...(await readJsonBody(req)), mode: 'start_turn' })
+      }
+
+      if (action === 'events' && req.method === 'POST') {
+        return handleHttpSessionEvent(sessionId, await readJsonBody(req))
+      }
+
+      if (action === 'interrupt' && req.method === 'POST') {
+        return handleHttpSessionEvent(sessionId, { ...(await readJsonBody(req)), mode: 'interrupt' })
+      }
+
+      return httpErr('not_found', 404)
+    },
+  })
+  log(`HTTP realtime gateway listening on ${HTTP_BIND}:${HTTP_PORT} (auth=${HTTP_TOKEN ? 'bearer' : 'loopback-open'})`)
+}
+
 async function onInbound(content: string, attrs: any) {
   if (attrs?.feed !== 'a2a' || attrs?.kind !== 'direct') return
   // approval decisions come back as direct replies/msgs
@@ -497,6 +1052,10 @@ async function onInbound(content: string, attrs: any) {
   }
   const from = attrs.from, corr = attrs.id
   lastRequester = from
+  if (isCodexRealtimeSchema(parsed?.schema)) {
+    await onRealtimeInbound(parsed, from, corr)
+    return
+  }
 
   // parse the canonical job, or fall back to a plain-text prompt
   const isJob = parsed?.schema === 'codex.job.request.v1'
@@ -678,6 +1237,7 @@ async function onInbound(content: string, attrs: any) {
 async function main() {
   codex = new CodexAppServer()
   configureApprovals()
+  configureRealtimeEvents()
   a2a = new A2AChannel(onInbound, { enabled: true, agentId: AGENT_ID })
   if (WRITE_ENABLED && !a2a.signingEnabled) {
     log(`FATAL: CODEX_GW_ALLOW_WRITE is set but the A2A channel is running with signing OFF (A2A_DEV_NO_AUTH). workspace-write requires a cryptographically verified sender — env.from is spoofable under signing-off (write + allowlist bypass). Refusing to start.`)
@@ -689,6 +1249,7 @@ async function main() {
     log(`FATAL: could not join the bus as '${AGENT_ID}' (duplicate agent-id? another instance alive, or stale presence). Exiting.`)
     codex.stop(); process.exit(1)
   }
+  startHttpGateway()
   const used = await codex.primaryUsedPct()
   log(`bus joined as '${AGENT_ID}' (codex primary budget ${used ?? '?'}%). canonical codex.job.* contract ready.`)
 
