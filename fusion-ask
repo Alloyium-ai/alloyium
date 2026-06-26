@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# fusion-ask "your question" [input_file]
+# Ask the standing Alloyium Cortex fusion service and print the fused answer.
+#
+# Portable defaults:
+#   - Repo path: $CHANNELS overrides; otherwise this script's directory is used.
+#   - Seed path: $FUSION_SEED overrides; otherwise $CHANNELS/a2a/fusion.seed.
+#   - Bus URLs: $NATS_URL and $REDIS_URL override compose-service defaults.
+#   - Input files are sent by fusion_client.ts through a Redis claim-check blob.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")"
+fi
+
+CH="${CHANNELS:-$(cd "$(dirname "$SELF")" && pwd)}"
+SEED="${FUSION_SEED:-$CH/a2a/fusion.seed}"
+AID="${A2A_AGENT_ID:-fusion}"
+NATS_URL="${NATS_URL:-nats://nats:4222}"
+REDIS_URL="${REDIS_URL:-redis://redis:6379}"
+
+Q="${1:?usage: fusion-ask \"question\" [input_file]}"
+INPUT="${2:-}"
+TQ="$(mktemp /tmp/fusion_ask.XXXX.txt)"
+printf '%s\n' "$Q" > "$TQ"
+
+# Clear stale requester presence using the configured Redis endpoint. This is best-effort
+# and intentionally quiet so the actual fusion request controls the final exit status.
+_rhp="${REDIS_URL#redis://}"
+_rhp="${_rhp#rediss://}"
+_rhp="${_rhp%%/*}"
+_rhp="${_rhp##*@}"
+RHOST="${_rhp%%:*}"
+RPORT="${_rhp##*:}"
+if [ "$RPORT" = "$RHOST" ]; then RPORT=6379; fi
+redis-cli -h "$RHOST" -p "$RPORT" DEL "alloyium:a2a:presence:$AID" >/dev/null 2>&1 || true
+
+exec env \
+  A2A_AGENT_ID="$AID" \
+  A2A_SIG_ALG="${A2A_SIG_ALG:-ed25519}" \
+  A2A_TRANSPORT_AUTH="${A2A_TRANSPORT_AUTH:-none}" \
+  A2A_SIGNING_KEY="$SEED" \
+  NATS_URL="$NATS_URL" \
+  REDIS_URL="$REDIS_URL" \
+  bun "$CH/fusion_client.ts" "$TQ" ${INPUT:+"$INPUT"} "${FUSION_ASK_TIMEOUT_MS:-1200000}"
