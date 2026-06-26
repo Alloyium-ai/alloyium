@@ -125,6 +125,18 @@ export function wrapPlainCodexRealtimeInput(args: PortalSendArgs, opts: { sessio
   }
 }
 
+export function routePortalCodexTarget(
+  args: PortalSendArgs,
+  sendMode: PortalSendMode,
+  opts: { jobTarget?: string | null; sessionTarget?: string | null } = {},
+): PortalSendArgs {
+  if (args.type !== 'request' || sendMode !== 'chat' || !isCodexJobRecipient(args.to)) return args
+  const jobTarget = normalizePortalRecipient(opts.jobTarget ?? 'codex-gw')
+  const sessionTarget = normalizePortalRecipient(opts.sessionTarget)
+  if (!jobTarget || !sessionTarget || args.to !== jobTarget || sessionTarget === args.to) return args
+  return { ...args, to: sessionTarget }
+}
+
 export function buildPortalDefaultCwd(
   args: PortalSendArgs,
   sendMode: PortalSendMode,

@@ -60,6 +60,25 @@ describe('codex realtime session registry', () => {
     })).toThrow('session_context_mismatch')
   })
 
+  test('refuses rebinding a Codex thread to a different external session id', () => {
+    const registry = new CodexRealtimeSessionRegistry()
+    registry.create({
+      sessionId: 's1',
+      threadId: 'thread-1',
+      cwd: '/app',
+      sandbox: 'read-only',
+      approvalPolicy: 'never',
+    })
+
+    expect(() => registry.create({
+      sessionId: 's2',
+      threadId: 'thread-1',
+      cwd: '/app',
+      sandbox: 'read-only',
+      approvalPolicy: 'never',
+    })).toThrow('thread_already_bound')
+  })
+
   test('builds monotonic normalized realtime events', () => {
     const registry = new CodexRealtimeSessionRegistry()
     const session = registry.create({

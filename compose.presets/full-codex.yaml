@@ -14,6 +14,11 @@ services:
       A2A_LAUNCH_WORKSPACE_CONTAINER_PATH: ${A2A_LAUNCH_WORKSPACE_CONTAINER_PATH:-/workspace}
       CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${CODEX_WORKSPACE_ROOT:-${HOME}/git}}
 
+  a2a-portal:
+    environment:
+      A2A_PORTAL_CODEX_JOB_TARGET: ${A2A_PORTAL_CODEX_JOB_TARGET:-codex-gw}
+      A2A_PORTAL_CODEX_SESSION_TARGET: ${A2A_PORTAL_CODEX_SESSION_TARGET:-codex-rt-gw}
+
   codex-gw:
     environment:
       A2A_LAUNCHER_TOKEN: ${A2A_LAUNCHER_TOKEN:?run bin/alloyium init to generate A2A_LAUNCHER_TOKEN}

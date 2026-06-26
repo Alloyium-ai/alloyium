@@ -152,6 +152,8 @@ services:
       A2A_PORTAL_HOST_OPS_CHAT_CWD: ${A2A_PORTAL_HOST_OPS_CHAT_CWD:-/app}
       A2A_PORTAL_CODEX_CHAT_CWD: ${A2A_PORTAL_CODEX_CHAT_CWD:-/app}
       A2A_PORTAL_ONE_OFF_CWD: ${A2A_PORTAL_ONE_OFF_CWD:-/tmp}
+      A2A_PORTAL_CODEX_JOB_TARGET: ${A2A_PORTAL_CODEX_JOB_TARGET:-codex-gw}
+      A2A_PORTAL_CODEX_SESSION_TARGET: ${A2A_PORTAL_CODEX_SESSION_TARGET:-}
       A2A_PORTAL_KNOWN_HOSTS: ${A2A_PORTAL_KNOWN_HOSTS:-local,gpubox,srv01,homedevbox}
       A2A_PORTAL_HOST_ALIASES: ${A2A_PORTAL_HOST_ALIASES:-dev01=gpubox,devbox01=homedevbox}
       A2A_PORTAL_CONTAINER_HOST_FALLBACK: ${A2A_PORTAL_CONTAINER_HOST_FALLBACK:-local}
@@ -209,6 +211,28 @@ services:
         mkdir -p /run/secrets/a2a
         chown -R bun:bun /run/secrets/a2a
         exec su bun -s /bin/sh -c 'bun onboard.ts codex-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
+
+  onboard-codex-rt-gw:
+    profiles: ["realtime"]
+    build: *build-bun
+    user: root
+    environment:
+      <<: *cc-env
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -lc
+      - |
+        mkdir -p /run/secrets/a2a
+        chown -R bun:bun /run/secrets/a2a
+        exec su bun -s /bin/sh -c 'bun onboard.ts ${CODEX_RT_GW_AGENT_ID:-codex-rt-gw} --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
 
   onboard-claude-gw:
     build: *build-bun
@@ -510,6 +534,71 @@ services:
       redis:
         condition: service_healthy
       onboard-codex-gw:
+        condition: service_completed_successfully
+      a2a-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -u \"$${REDIS_URL}\" GET \"alloyium:a2a:presence:$${A2A_AGENT_ID}\" | grep -q ."]
+      interval: 10s
+      timeout: 3s
+      retries: 18
+      start_period: 20s
+    command: ["bun", "codex_gateway.ts"]
+
+  codex-rt-gw:
+    profiles: ["realtime"]
+    build:
+      context: .
+      dockerfile: docker/gateway-codex/Dockerfile
+      args:
+        <<: *cc-build-args
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.141.0}
+    user: "${CC_UID:-1000}:${CC_GID:-1000}"
+    environment:
+      <<: *cc-env
+      HOME: /home/bun
+      A2A_ENABLED: "1"
+      A2A_AGENT_ID: ${CODEX_RT_GW_AGENT_ID:-codex-rt-gw}
+      A2A_SIG_ALG: ed25519
+      A2A_SIGNING_KEY: /run/secrets/a2a/${CODEX_RT_GW_AGENT_ID:-codex-rt-gw}.seed
+      A2A_TRANSPORT_AUTH: none
+      A2A_MAX_SEND_BYTES: ${A2A_MAX_SEND_BYTES:-8192}
+      CODEX_GW_ROLE: session
+      CODEX_GW_EFFORT: ${CODEX_RT_GW_EFFORT:-xhigh}
+      CODEX_GW_MODEL: ${CODEX_RT_GW_MODEL:-}
+      CODEX_GW_BUDGET_MAX_PCT: ${CODEX_RT_GW_BUDGET_MAX_PCT:-99}
+      CODEX_GW_ALLOW_WRITE: "0"
+      CODEX_GW_CODEX_SANDBOX: ${CODEX_RT_GW_CODEX_SANDBOX:-read-only}
+      CODEX_GW_THREAD_STORE_PREFIX: ${CODEX_RT_GW_THREAD_STORE_PREFIX:-alloyium:codex:rt:thread:}
+      CODEX_GW_HTTP_PORT: ${CODEX_RT_GW_HTTP_PORT:-0}
+      CODEX_GW_HTTP_BIND: ${CODEX_RT_GW_HTTP_BIND:-127.0.0.1}
+      CODEX_GW_HTTP_TOKEN: ${CODEX_RT_GW_HTTP_TOKEN:-}
+      CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${HOME}/git}
+      CODEX_GW_ENABLE_A2A_TOOLS: ${CODEX_GW_ENABLE_A2A_TOOLS:-1}
+      CODEX_GW_A2A_TOOLS_MODE: ${CODEX_GW_A2A_TOOLS_MODE:-shim}
+      CODEX_GW_A2A_SHIM_BIN: /usr/local/bin/a2a-shim
+      CODEX_GW_A2A_TOOLS_REQUIRED: ${CODEX_GW_A2A_TOOLS_REQUIRED:-1}
+      A2A_CORE_SOCK: /run/a2a-core/core.sock
+      BRAIN_URL: ${BRAIN_URL:-http://brain:8787}
+      BRAIN_API_TOKEN: ${BRAIN_API_TOKEN:-}
+      VAULT_URL: ${VAULT_URL:-http://vault:8484}
+      KAI_HTTP_URL: ${KAI_HTTP_URL:-}
+      KAI_WS_URL: ${KAI_WS_URL:-}
+      KAI_TOKEN_PATH: ${KAI_TOKEN_PATH:-}
+    networks:
+      - a2a-net
+    volumes:
+      - a2a_secrets:/run/secrets/a2a:ro
+      - *a2a-core-run-bind
+      - ${CODEX_HOST_HOME:-${HOME}/.codex}:/home/bun/.codex
+      - ${CODEX_SSH_DIR:-${HOME}/.ssh}:/home/bun/.ssh:ro
+      - ${CODEX_WORKSPACE_ROOT:-${HOME}/git}:${CODEX_WORKSPACE_ROOT:-${HOME}/git}
+      - codex_workspaces:/workspaces
+      - *workspace-bind
+    depends_on:
+      redis:
+        condition: service_healthy
+      onboard-codex-rt-gw:
         condition: service_completed_successfully
       a2a-core:
         condition: service_healthy

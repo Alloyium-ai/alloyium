@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, normalizePortalRecipient, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, normalizePortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
 
 describe('a2a portal send helpers', () => {
   test('normalizes dm and topic recipients from UI notation', () => {
@@ -97,6 +97,26 @@ describe('a2a portal send helpers', () => {
     expect(isCodexJobRecipient('codex-gw')).toBe(true)
     expect(isCodexJobRecipient('host-ops-gw-1')).toBe(true)
     expect(isCodexJobRecipient('agent-1')).toBe(false)
+  })
+
+  test('can route default portal codex chat to a realtime session peer without changing one-off sends', () => {
+    expect(routePortalCodexTarget(
+      { to: 'codex-gw', type: 'request', body: 'hello' },
+      'chat',
+      { jobTarget: 'codex-gw', sessionTarget: 'codex-rt-gw' },
+    )).toEqual({ to: 'codex-rt-gw', type: 'request', body: 'hello' })
+
+    expect(routePortalCodexTarget(
+      { to: 'codex-gw', type: 'request', body: 'hello' },
+      'one-off',
+      { jobTarget: 'codex-gw', sessionTarget: 'codex-rt-gw' },
+    )).toEqual({ to: 'codex-gw', type: 'request', body: 'hello' })
+
+    expect(routePortalCodexTarget(
+      { to: 'codex-gw-sub-review', type: 'request', body: 'hello' },
+      'chat',
+      { jobTarget: 'codex-gw', sessionTarget: 'codex-rt-gw' },
+    )).toEqual({ to: 'codex-gw-sub-review', type: 'request', body: 'hello' })
   })
 
   test('builds chat thread keys only for codex request chats', () => {

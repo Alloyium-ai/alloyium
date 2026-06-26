@@ -56,9 +56,9 @@ compose_full() {
     token="$(running_launcher_token)"
   fi
   if [ -n "$token" ]; then
-    A2A_LAUNCHER_TOKEN="$token" docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion "$@"
+    A2A_LAUNCHER_TOKEN="$token" docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion --profile realtime "$@"
   else
-    docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion "$@"
+    docker compose -f compose.yaml -f "$FULL_PRESET" --profile launcher --profile fleet --profile fusion --profile realtime "$@"
   fi
 }
 

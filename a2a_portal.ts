@@ -13,7 +13,7 @@ import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
 import { randomUUID } from 'node:crypto'
 import { A2AChannel } from './a2a-channel.ts'
-import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
 import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
@@ -28,6 +28,8 @@ const HOST_OPS_CHAT_CWD = process.env.A2A_PORTAL_HOST_OPS_CHAT_CWD ?? '/srv/git/
 const REMOTE_HOST_OPS_CHAT_CWD = process.env.A2A_PORTAL_REMOTE_HOST_OPS_CHAT_CWD ?? '/srv/remote/alloyium'
 const CODEX_CHAT_CWD = process.env.A2A_PORTAL_CODEX_CHAT_CWD ?? '/app'
 const ONE_OFF_CWD = process.env.A2A_PORTAL_ONE_OFF_CWD ?? '/tmp'
+const CODEX_JOB_TARGET = process.env.A2A_PORTAL_CODEX_JOB_TARGET ?? 'codex-gw'
+const CODEX_SESSION_TARGET = process.env.A2A_PORTAL_CODEX_SESSION_TARGET ?? ''
 const INTERACTIVE_ACK_TIMEOUT_MS = envMs('A2A_PORTAL_INTERACTIVE_ACK_TIMEOUT_MS', 120_000)
 const INTERACTIVE_ACK_POLL_MS = envMs('A2A_PORTAL_INTERACTIVE_ACK_POLL_MS', 250)
 const INTERACTIVE_REPLY_SETTLE_MS = envMs('A2A_PORTAL_INTERACTIVE_REPLY_SETTLE_MS', 15_000)
@@ -333,17 +335,18 @@ async function waitForPortalReply(fromPeer: string, corr: string, sinceT: number
 }
 
 async function publishPortalSend(built: Extract<PortalSendBuildResult, { ok: true }>): Promise<SendOk> {
-  const threadKey = buildPortalThreadKey(built.args, PORTAL_AGENT_ID, built.sendMode, { chatContext: built.chatContext })
-  const cwd = buildPortalDefaultCwd(built.args, built.sendMode, { hostOpsCwd: HOST_OPS_CHAT_CWD, remoteHostOpsCwd: REMOTE_HOST_OPS_CHAT_CWD, codexCwd: CODEX_CHAT_CWD, oneOffCwd: ONE_OFF_CWD })
+  const routedArgs = routePortalCodexTarget(built.args, built.sendMode, { jobTarget: CODEX_JOB_TARGET, sessionTarget: CODEX_SESSION_TARGET })
+  const threadKey = buildPortalThreadKey(routedArgs, PORTAL_AGENT_ID, built.sendMode, { chatContext: built.chatContext })
+  const cwd = buildPortalDefaultCwd(routedArgs, built.sendMode, { hostOpsCwd: HOST_OPS_CHAT_CWD, remoteHostOpsCwd: REMOTE_HOST_OPS_CHAT_CWD, codexCwd: CODEX_CHAT_CWD, oneOffCwd: ONE_OFF_CWD })
   const args = built.sendMode === 'chat'
-    ? wrapPlainCodexRealtimeInput(built.args, { sessionId: threadKey, threadKey, cwd, streamTopic: buildPortalRealtimeStreamTopic(threadKey) })
-    : wrapPlainCodexRequest(built.args, `portal-codex-${randomUUID()}`, { threadKey, cwd })
+    ? wrapPlainCodexRealtimeInput(routedArgs, { sessionId: threadKey, threadKey, cwd, streamTopic: buildPortalRealtimeStreamTopic(threadKey) })
+    : wrapPlainCodexRequest(routedArgs, `portal-codex-${randomUUID()}`, { threadKey, cwd })
   const sentAt = Date.now()
   const res = await sendChannel!.callTool('a2a_send', args)
   let parsed: any = null
   try { parsed = JSON.parse(res?.content?.[0]?.text ?? '') } catch {}
   if (!parsed?.ok) throw { status: 400, body: { ok: false, error: parsed?.error ?? 'send_failed', detail: parsed?.detail } }
-  const out = { ok: true, send_mode: built.sendMode, chat_context: built.chatContext, thread_key: threadKey, cwd, ...parsed }
+  const out = { ok: true, send_mode: built.sendMode, chat_context: built.chatContext, thread_key: threadKey, cwd, routed_to: routedArgs.to, ...parsed }
   if (!shouldSerializeInteractiveSend(built)) return out
   const deliveryWait = await waitForPortalReply(built.args.to, parsed.id, sentAt)
   const settleMs = deliveryWait.status === 'reply' ? INTERACTIVE_REPLY_SETTLE_MS : deliveryWait.status === 'timeout' ? INTERACTIVE_TIMEOUT_SETTLE_MS : 0
@@ -871,7 +874,7 @@ function channelForTarget(v){const t=normalizedTarget(v);if(!t||t===portalAgent)
   const btn=$('#sendBtn'),state=$('#sendState');btn.disabled=true;state.className='sendstate';state.textContent='sending';
   const next=channelForTarget(payload.to);if(!next){state.className='sendstate err';state.textContent='choose another agent; this portal sends as '+portalAgent;btn.disabled=!sendReady;return}
   let out;try{const r=await fetch('/api/send',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});out=await r.json()}catch(e){out={ok:false,error:String(e)}}
-  if(out.ok){$('#sendBody').value='';state.className='sendstate ok';const dw=out.delivery_wait;const ds=dw&&dw.status==='reply'?' · replied':(dw&&dw.status==='timeout'?' · no reply yet':'');state.textContent='sent '+out.id+(out.thread_key?' · chat':'')+ds;setTimeout(()=>open_(next),300);setTimeout(loadChannels,700)}
+  if(out.ok){const routedTarget=normalizedTarget(out.routed_to||payload.to);if(target&&routedTarget&&target!==routedTarget&&chatContexts[target]&&!chatContexts[routedTarget]){chatContexts[routedTarget]=chatContexts[target];saveChatContexts()}$('#sendBody').value='';state.className='sendstate ok';const dw=out.delivery_wait;const ds=dw&&dw.status==='reply'?' · replied':(dw&&dw.status==='timeout'?' · no reply yet':'');state.textContent='sent '+out.id+(out.thread_key?' · chat':'')+ds;const routedNext=channelForTarget(out.routed_to||payload.to)||next;setTimeout(()=>open_(routedNext),300);setTimeout(loadChannels,700)}
     else{state.className='sendstate err';state.textContent=out.error+(out.detail?': '+out.detail:'')}
     btn.disabled=!sendReady}
   async function sendLangChainNow(){const body=$('#sendBody').value;if(!body.trim())return;const btn=$('#sendBtn'),state=$('#sendState');btn.disabled=true;state.className='sendstate';state.textContent='thinking';

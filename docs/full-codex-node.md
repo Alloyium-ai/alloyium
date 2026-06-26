@@ -28,8 +28,9 @@ bin/alloyium verify
 `CC_GID` to the current host user, records `A2A_LAUNCH_PROJECT_DIR`, and prepares
 `data/workspace`.
 
-`bin/alloyium up full-codex` starts the default stack plus the `launcher`, `fleet`, and
-`fusion` profiles, then asks the launcher to start `codex-a2a-full-1`.
+`bin/alloyium up full-codex` starts the default stack plus the `launcher`, `fleet`,
+`fusion`, and `realtime` profiles, then asks the launcher to start
+`codex-a2a-full-1`.
 
 ## What The Preset Adds
 
@@ -41,6 +42,9 @@ bin/alloyium verify
   `A2A_LAUNCH_ALLOWED_IDS=codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops,codex-a2a-full-1`.
 - Launcher-spawned Codex peers inherit the shared workspace mount at `/workspace` and
   `CODEX_BUILD_CWD_ROOTS=/workspace,<legacy host git root>`.
+- The `realtime` profile adds `codex-rt-gw`, a read-only `CODEX_GW_ROLE=session`
+  peer for long-running portal chat sessions. Portal one-off sends still target
+  `codex-gw`; portal chat can route through `codex-rt-gw`.
 
 Both allowlists matter. `A2A_AGENT_LAUNCH_ALLOWED_IDS` controls whether a peer sees the
 launch tool in its MCP surface. `A2A_LAUNCH_ALLOWED_IDS` controls whether the launcher
@@ -84,6 +88,9 @@ Alloyium exposes two Codex execution shapes:
   or reuses a long-lived app-server thread, starts a turn when idle, steers an active
   turn when possible, and streams normalized `codex.session.event.v1` events to a
   deterministic portal topic.
+- In the full-Codex preset, general Codex chat sent to `codex-gw` is routed to
+  `codex-rt-gw` through `A2A_PORTAL_CODEX_SESSION_TARGET`. Explicit sends to another
+  Codex-like peer still go to that selected peer.
 
 The gateway also accepts the lower-level realtime A2A schemas:
 
@@ -115,6 +122,10 @@ POST /v1/codex/sessions/{session_id}/interrupt
 
 Do not expose the HTTP gateway publicly. Non-loopback binds require
 `CODEX_GW_HTTP_TOKEN`; clients must send `Authorization: Bearer <token>`.
+
+For the proposed eval that keeps `codex-gw` as the batch/job worker and adds a
+session-first `codex-rt-gw` role, see
+[`docs/codex-realtime-role.md`](codex-realtime-role.md).
 
 ## Useful Commands
 

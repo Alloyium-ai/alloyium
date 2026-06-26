@@ -77,6 +77,8 @@ export class CodexRealtimeSessionRegistry {
   create(args: CodexRealtimeSessionCreate): CodexRealtimeSession {
     const sessionId = normalizeSessionId(args.sessionId ?? args.threadKey ?? `session-${crypto.randomUUID()}`)
     const existing = this.sessions.get(sessionId)
+    const boundSessionId = this.byThreadId.get(args.threadId)
+    if (boundSessionId && boundSessionId !== sessionId) throw new Error('thread_already_bound')
     const now = args.now ?? new Date().toISOString()
     if (existing) {
       if (existing.thread_id !== args.threadId || existing.cwd !== args.cwd || existing.sandbox !== args.sandbox || existing.approval_policy !== args.approvalPolicy) {

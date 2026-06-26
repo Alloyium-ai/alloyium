@@ -1,5 +1,23 @@
 import { describe, expect, test } from 'bun:test'
-import { GatewayThreadCache, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides, codexHttpGatewayStartAllowed, isCodexHttpLoopbackBind } from '../codex_gateway.ts'
+import { GatewayThreadCache, GatewayThreadStore, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides, codexHttpGatewayStartAllowed, isCodexHttpLoopbackBind, gatewayThreadStoreKey, codexNotificationThreadId, codexNotificationTurnId, codexNotificationItemId, codexAgentTextDelta, codexCompletedAgentText, normalizeCodexGatewayRole, codexGatewayRoleAllowsJobs, codexGatewayRoleAllowsRealtime } from '../codex_gateway.ts'
+
+class FakeRedis {
+  data = new Map<string, string>()
+  async get(key: string): Promise<string | null> {
+    return this.data.get(key) ?? null
+  }
+  async send(cmd: string, args: string[]): Promise<any> {
+    if (cmd === 'SET') {
+      this.data.set(args[0]!, args[1]!)
+      return 'OK'
+    }
+    if (cmd === 'DEL') {
+      const existed = this.data.delete(args[0]!)
+      return existed ? 1 : 0
+    }
+    throw new Error(`bad redis cmd ${cmd}`)
+  }
+}
 
 describe('codex gateway workspace-write preflight', () => {
   test('formats structured app-server errors without [object Object]', () => {
@@ -142,6 +160,20 @@ describe('codex gateway workspace-write preflight', () => {
     expect(codexHttpGatewayStartAllowed('0.0.0.0', '')).toBe(false)
     expect(codexHttpGatewayStartAllowed('0.0.0.0', 'token')).toBe(true)
   })
+
+  test('gateway role defaults to hybrid and can split job vs realtime contracts', () => {
+    expect(normalizeCodexGatewayRole(undefined)).toBe('hybrid')
+    expect(normalizeCodexGatewayRole('batch')).toBe('job')
+    expect(normalizeCodexGatewayRole('realtime')).toBe('session')
+    expect(normalizeCodexGatewayRole('unknown')).toBe('hybrid')
+
+    expect(codexGatewayRoleAllowsJobs('hybrid')).toBe(true)
+    expect(codexGatewayRoleAllowsRealtime('hybrid')).toBe(true)
+    expect(codexGatewayRoleAllowsJobs('job')).toBe(true)
+    expect(codexGatewayRoleAllowsRealtime('job')).toBe(false)
+    expect(codexGatewayRoleAllowsJobs('session')).toBe(false)
+    expect(codexGatewayRoleAllowsRealtime('session')).toBe(true)
+  })
 })
 
 describe('codex gateway thread cache isolation', () => {
@@ -193,5 +225,51 @@ describe('codex gateway thread cache isolation', () => {
     expect(cache.get('b', { sandbox: 'read-only', cwd: '/tmp/b' })).toBeNull()
     expect(cache.get('a', { sandbox: 'read-only', cwd: '/tmp/a' })).toBe('thread-a')
     expect(cache.get('c', { sandbox: 'read-only', cwd: '/tmp/c' })).toBe('thread-c')
+  })
+})
+
+describe('codex gateway persisted thread session router', () => {
+  test('stores thread_key mappings in Redis and reloads them after process-local cache loss', async () => {
+    const redis = new FakeRedis()
+    const ctx = { sandbox: 'read-only->read-only', cwd: '/app' }
+    const first = new GatewayThreadStore({ redis, agentId: 'codex-gw', ttlMs: 60_000, opTimeoutMs: 100 })
+    await first.set('portal:chat:a2a-portal:codex-gw', 'thread-1', ctx)
+
+    const second = new GatewayThreadStore({ redis, agentId: 'codex-gw', ttlMs: 60_000, opTimeoutMs: 100 })
+    expect(await second.get('portal:chat:a2a-portal:codex-gw', ctx)).toBe('thread-1')
+    expect(await second.getWithSource('portal:chat:a2a-portal:codex-gw', ctx)).toEqual({ threadId: 'thread-1', source: 'memory' })
+    const third = new GatewayThreadStore({ redis, agentId: 'codex-gw', ttlMs: 60_000, opTimeoutMs: 100 })
+    expect(await third.getWithSource('portal:chat:a2a-portal:codex-gw', ctx)).toEqual({ threadId: 'thread-1', source: 'persistent' })
+    expect(gatewayThreadStoreKey('codex-gw', 'portal:chat:a2a-portal:codex-gw').startsWith('alloyium:codex:thread:')).toBe(true)
+  })
+
+  test('fails closed and deletes a persisted mapping when sandbox or cwd drift', async () => {
+    const redis = new FakeRedis()
+    const store = new GatewayThreadStore({ redis, agentId: 'codex-gw', ttlMs: 60_000, opTimeoutMs: 100 })
+    await store.set('same-thread', 'thread-1', { sandbox: 'workspace-write->danger-full-access', cwd: '/workspace/a' })
+
+    expect(await store.get('same-thread', { sandbox: 'read-only->read-only', cwd: '/workspace/a' })).toBeNull()
+    expect(redis.data.size).toBe(0)
+  })
+})
+
+describe('codex app-server notification extraction', () => {
+  test('extracts thread/turn/item ids across notification shapes', () => {
+    expect(codexNotificationThreadId({ params: { threadId: 'thread-1' } })).toBe('thread-1')
+    expect(codexNotificationThreadId({ params: { thread: { id: 'thread-2' } } })).toBe('thread-2')
+    expect(codexNotificationTurnId({ params: { turnId: 'turn-1' } })).toBe('turn-1')
+    expect(codexNotificationTurnId({ params: { turn: { id: 'turn-2' } } })).toBe('turn-2')
+    expect(codexNotificationItemId({ params: { itemId: 'item-1' } })).toBe('item-1')
+    expect(codexNotificationItemId({ params: { item: { id: 'item-2' } } })).toBe('item-2')
+  })
+
+  test('extracts streamed and completed assistant text without accepting unrelated items', () => {
+    expect(codexAgentTextDelta({ method: 'item/agentMessage/delta', params: { delta: 'hello' } })).toBe('hello')
+    expect(codexCompletedAgentText({ method: 'item/completed', params: { item: { type: 'agentMessage', text: 'final' } } })).toBe('final')
+    expect(codexCompletedAgentText({
+      method: 'item/completed',
+      params: { item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'fallback' }] } },
+    })).toBe('fallback')
+    expect(codexCompletedAgentText({ method: 'item/completed', params: { item: { type: 'userMessage', text: 'nope' } } })).toBe('')
   })
 })

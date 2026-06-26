@@ -13,7 +13,7 @@
 // Capital fire is never on the bus. Env from the agent's *.a2a.env (A2A_AGENT_ID, keys, NATS/REDIS, SUBS_KEY).
 import { A2AChannel } from './a2a-channel.ts'
 import { RedisClient } from 'bun'
-import { planReply, fitTruncate, putBlob, delBlob, truncateToBytes, utf8ByteLength, sentOk, resolveJobInput, type WrapFn, type BlobRef } from './output_transport.ts'
+import { planReply, fitTruncate, putBlob, delBlob, truncateToBytes, utf8ByteLength, sentOk, resolveJobInput, type WrapFn, type BlobRef, type BlobRedis } from './output_transport.ts'
 import { authorizeWriteJob } from './codex_build_authz.ts'
 import { CODEX_DETACHED_NO_INTERACTIVE_PROMPT_DIRECTIVE, buildCodexA2AToolsConfigArgs, buildCodexAgentPrompt, codexA2AToolsEnabled, codexA2AToolsMode } from './codex_agent_tools.ts'
 import {
@@ -44,6 +44,7 @@ import {
 } from './codex_realtime.ts'
 
 const AGENT_ID = process.env.A2A_AGENT_ID ?? 'codex-gw'
+const CODEX_GW_ROLE = normalizeCodexGatewayRole(process.env.CODEX_GW_ROLE)
 const APPROVER = process.env.CODEX_GW_APPROVER ?? '' // who approves command/edit escalations; '' => the requester
 const BUDGET_MAX = Number(process.env.CODEX_GW_BUDGET_MAX_PCT ?? 92) // reject admission above this primary used%
 const MODEL = process.env.CODEX_GW_MODEL
@@ -56,6 +57,9 @@ const CODEX_EXEC_SANDBOX = normalizeCodexSandboxMode(process.env.CODEX_GW_CODEX_
 const CODEX_WORKSPACE_WRITE_EXEC_SANDBOX = normalizeCodexSandboxMode(process.env.CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX)
 const THREAD_CACHE_MAX = Math.max(1, Number(process.env.CODEX_GW_THREAD_CACHE_MAX ?? 256) || 256)
 const THREAD_CACHE_TTL_MS = Math.max(1, Number(process.env.CODEX_GW_THREAD_CACHE_TTL_MS ?? 2 * 60 * 60 * 1000) || 2 * 60 * 60 * 1000)
+const THREAD_STORE_PREFIX = process.env.CODEX_GW_THREAD_STORE_PREFIX ?? 'alloyium:codex:thread:'
+const THREAD_STORE_OP_TIMEOUT_MS = Math.max(50, Number(process.env.CODEX_GW_THREAD_STORE_TIMEOUT_MS ?? 750) || 750)
+const CODEX_RPC_TIMEOUT_MS = Math.max(1_000, Number(process.env.CODEX_GW_RPC_TIMEOUT_MS ?? 120_000) || 120_000)
 const PEER_INBOX_MAX = Math.max(0, Number(process.env.CODEX_GW_PEER_INBOX_MAX ?? 20) || 20)
 const PEER_INBOX_ITEM_MAX_BYTES = Math.max(256, Number(process.env.CODEX_GW_PEER_INBOX_ITEM_MAX_BYTES ?? 2048) || 2048)
 const CHANNELS_DIR = process.env.CHANNELS ?? import.meta.dir
@@ -94,6 +98,23 @@ export function describeGatewayError(e: unknown): string {
 }
 
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export type CodexGatewayRole = 'hybrid' | 'job' | 'session'
+
+export function normalizeCodexGatewayRole(value: unknown): CodexGatewayRole {
+  if (typeof value !== 'string') return 'hybrid'
+  const v = value.trim().toLowerCase()
+  if (v === 'job' || v === 'jobs' || v === 'batch') return 'job'
+  if (v === 'session' || v === 'sessions' || v === 'realtime' || v === 'rt') return 'session'
+  return 'hybrid'
+}
+
+export function codexGatewayRoleAllowsJobs(role: CodexGatewayRole): boolean {
+  return role !== 'session'
+}
+
+export function codexGatewayRoleAllowsRealtime(role: CodexGatewayRole): boolean {
+  return role !== 'job'
+}
 
 /**
  * Normalize Codex sandbox names plus the common "yolo"/"no sandbox" aliases.
@@ -141,6 +162,35 @@ export interface GatewayThreadCacheOptions {
 }
 
 type CachedThread = GatewayThreadContext & { threadId: string; lastUsedMs: number }
+export type GatewayThreadRecord = GatewayThreadContext & { threadId: string }
+
+function timeoutOp<T>(p: Promise<T> | T, ms: number, label: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout>
+  const timeout = new Promise<T>((_, rej) => { t = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms) })
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(t)), timeout])
+}
+
+function keyPart(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url')
+}
+
+export function gatewayThreadStoreKey(agentId: string, threadKey: string, prefix = THREAD_STORE_PREFIX): string {
+  return `${prefix}${keyPart(agentId)}:${keyPart(threadKey)}`
+}
+
+function parseThreadRecord(raw: string | null): GatewayThreadRecord | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    if (typeof parsed.threadId !== 'string' || !parsed.threadId) return null
+    if (typeof parsed.sandbox !== 'string' || !parsed.sandbox) return null
+    if (typeof parsed.cwd !== 'string' || !parsed.cwd) return null
+    return { threadId: parsed.threadId, sandbox: parsed.sandbox, cwd: parsed.cwd }
+  } catch {
+    return null
+  }
+}
 
 /**
  * In-process thread_key cache with fail-closed reuse semantics.
@@ -211,6 +261,105 @@ export class GatewayThreadCache {
   size(): number {
     this.cleanup()
     return this.entries.size
+  }
+}
+
+export interface GatewayThreadStoreOptions extends GatewayThreadCacheOptions {
+  redis?: BlobRedis | null
+  agentId?: string
+  prefix?: string
+  opTimeoutMs?: number
+  log?: (message: string) => void
+}
+
+/**
+ * Session-router storage for `thread_key -> Codex threadId`.
+ *
+ * The in-memory cache keeps the hot path cheap, while Redis persistence keeps portal
+ * chat/session continuity across gateway restarts. Reuse remains fail-closed: the
+ * stored sandbox/cwd context must exactly match the requested context.
+ */
+export class GatewayThreadStore {
+  private readonly memory: GatewayThreadCache
+  private readonly redis: BlobRedis | null
+  private readonly agentId: string
+  private readonly prefix: string
+  private readonly ttlMs: number
+  private readonly opTimeoutMs: number
+  private readonly log?: (message: string) => void
+
+  constructor(opts: GatewayThreadStoreOptions = {}) {
+    this.memory = new GatewayThreadCache(opts)
+    this.redis = opts.redis ?? null
+    this.agentId = opts.agentId ?? AGENT_ID
+    this.prefix = opts.prefix ?? THREAD_STORE_PREFIX
+    this.ttlMs = Number.isFinite(opts.ttlMs) && opts.ttlMs! > 0 ? opts.ttlMs! : THREAD_CACHE_TTL_MS
+    this.opTimeoutMs = Number.isFinite(opts.opTimeoutMs) && opts.opTimeoutMs! > 0 ? opts.opTimeoutMs! : THREAD_STORE_OP_TIMEOUT_MS
+    this.log = opts.log
+  }
+
+  async get(threadKey: string | undefined, ctx: GatewayThreadContext): Promise<string | null> {
+    return (await this.getWithSource(threadKey, ctx))?.threadId ?? null
+  }
+
+  async getWithSource(threadKey: string | undefined, ctx: GatewayThreadContext): Promise<{ threadId: string; source: 'memory' | 'persistent' } | null> {
+    if (!threadKey) return null
+    const local = this.memory.get(threadKey, ctx)
+    if (local) return { threadId: local, source: 'memory' }
+    if (!this.redis) return null
+
+    const key = gatewayThreadStoreKey(this.agentId, threadKey, this.prefix)
+    let raw: string | null
+    try {
+      raw = await timeoutOp(this.redis.get(key), this.opTimeoutMs, 'codex.thread_store.get')
+    } catch (e) {
+      this.log?.(`thread store get failed: ${describeGatewayError(e)}`)
+      return null
+    }
+    const record = parseThreadRecord(raw)
+    if (!record) return null
+    if (record.sandbox !== ctx.sandbox || record.cwd !== ctx.cwd) {
+      await this.delete(threadKey)
+      return null
+    }
+    this.memory.set(threadKey, record.threadId, ctx)
+    void this.persist(threadKey, record.threadId, ctx)
+    return { threadId: record.threadId, source: 'persistent' }
+  }
+
+  async set(threadKey: string | undefined, threadId: string, ctx: GatewayThreadContext): Promise<void> {
+    if (!threadKey || !threadId) return
+    this.memory.set(threadKey, threadId, ctx)
+    await this.persist(threadKey, threadId, ctx)
+  }
+
+  async delete(threadKey: string | undefined): Promise<boolean> {
+    if (!threadKey) return false
+    const local = this.memory.delete(threadKey)
+    if (!this.redis) return local
+    try {
+      const n = await timeoutOp(this.redis.send('DEL', [gatewayThreadStoreKey(this.agentId, threadKey, this.prefix)]), this.opTimeoutMs, 'codex.thread_store.del')
+      return local || Number(n) > 0
+    } catch (e) {
+      this.log?.(`thread store delete failed: ${describeGatewayError(e)}`)
+      return local
+    }
+  }
+
+  size(): number {
+    return this.memory.size()
+  }
+
+  private async persist(threadKey: string, threadId: string, ctx: GatewayThreadContext): Promise<void> {
+    if (!this.redis) return
+    const key = gatewayThreadStoreKey(this.agentId, threadKey, this.prefix)
+    const value = JSON.stringify({ threadId, sandbox: ctx.sandbox, cwd: ctx.cwd, updated_at: new Date().toISOString() })
+    const ttlS = String(Math.max(1, Math.ceil(this.ttlMs / 1000)))
+    try {
+      await timeoutOp(this.redis.send('SET', [key, value, 'EX', ttlS]), this.opTimeoutMs, 'codex.thread_store.set')
+    } catch (e) {
+      this.log?.(`thread store set failed: ${describeGatewayError(e)}`)
+    }
   }
 }
 
@@ -330,17 +479,66 @@ function extractTurnError(params: any): string {
   if (typeof e === 'string') return e.slice(0, 400)
   return String(e.message ?? e.detail ?? e.code ?? JSON.stringify(e)).slice(0, 400)
 }
+
+export function codexNotificationThreadId(m: unknown): string {
+  const params = m && typeof m === 'object' ? (m as any).params ?? {} : {}
+  return typeof params.threadId === 'string'
+    ? params.threadId
+    : typeof params.thread?.id === 'string'
+      ? params.thread.id
+      : ''
+}
+
+export function codexNotificationTurnId(m: unknown): string {
+  const params = m && typeof m === 'object' ? (m as any).params ?? {} : {}
+  return typeof params.turnId === 'string'
+    ? params.turnId
+    : typeof params.turn?.id === 'string'
+      ? params.turn.id
+      : ''
+}
+
+export function codexNotificationItemId(m: unknown): string {
+  const params = m && typeof m === 'object' ? (m as any).params ?? {} : {}
+  return typeof params.itemId === 'string'
+    ? params.itemId
+    : typeof params.item?.id === 'string'
+      ? params.item.id
+      : ''
+}
+
+export function codexAgentTextDelta(m: unknown): string {
+  const msg = m && typeof m === 'object' ? m as any : {}
+  if (msg.method !== 'item/agentMessage/delta') return ''
+  const delta = msg.params?.delta ?? msg.params?.text
+  return typeof delta === 'string' ? delta : ''
+}
+
+export function codexCompletedAgentText(m: unknown): string {
+  const msg = m && typeof m === 'object' ? m as any : {}
+  if (msg.method !== 'item/completed') return ''
+  const item = msg.params?.item
+  if (!item || typeof item !== 'object') return ''
+  if (item.type === 'agentMessage' && typeof item.text === 'string') return item.text
+  if (item.type === 'message' && item.role === 'assistant' && Array.isArray(item.content)) {
+    return item.content.map((c: any) => c?.type === 'output_text' && typeof c.text === 'string' ? c.text : '').filter(Boolean).join('')
+  }
+  return ''
+}
+
 class CodexAppServer {
   private proc: ReturnType<typeof Bun.spawn>
-  private pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>()
+  private pending = new Map<number, { method: string; timer: ReturnType<typeof setTimeout>; resolve: (v: any) => void; reject: (e: any) => void }>()
   private idc = 0
   private handlers = new Set<(m: any) => void>()
-  private threads = new GatewayThreadCache()
+  private threads = new GatewayThreadStore({ redis: getRedis(), agentId: AGENT_ID, log: (message) => log(message) })
   private realtime = new CodexRealtimeSessionRegistry()
   private realtimeHandlers = new Set<(ev: CodexRealtimeEvent, session: CodexRealtimeSession) => void>()
   private stderrRing: string[] = []
+  private stopped = false
+  private exited = false
   onApproval: ApprovalFn = async () => 'decline'
-  constructor() {
+  constructor(private opts: { onExit?: (code: number | null) => void } = {}) {
     const args = ['codex', 'app-server', ...buildCodexA2AToolsConfigArgs({
       enabled: A2A_TOOLS_ENABLED,
       channelsDir: CHANNELS_DIR,
@@ -366,37 +564,83 @@ class CodexAppServer {
     })]
     this.proc = Bun.spawn(args, { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
     log(`app-server spawned (a2a_tools=${A2A_TOOLS_ENABLED ? 'on' : 'off'}, mode=${A2A_TOOLS_MODE})`)
-    void this.readLoop(); void this.stderrLoop()
+    void this.readLoop(); void this.stderrLoop(); void this.watchExit()
   }
-  private send(o: any) { this.proc.stdin.write(JSON.stringify(o) + '\n'); this.proc.stdin.flush() }
+  private send(o: any) {
+    if (this.exited) throw new Error('codex_app_server_exited')
+    this.proc.stdin.write(JSON.stringify(o) + '\n')
+    this.proc.stdin.flush()
+  }
   private req(method: string, params?: any): Promise<any> {
-    const id = this.idc++; this.send({ id, method, params })
-    return new Promise((res, rej) => this.pending.set(id, { resolve: res, reject: rej }))
-  }
-  private notify(method: string, params?: any) { this.send({ method, params }) }
-  private async readLoop() {
-    const dec = new TextDecoder(); let buf = ''
-    for await (const chunk of this.proc.stdout) {
-      buf += dec.decode(chunk); let nl: number
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
-        if (!line) continue
-        let m: any; try { m = JSON.parse(line) } catch { continue }
-        if (m.id !== undefined && (m.result !== undefined || m.error !== undefined)) {
-          const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); m.error ? p.reject(new Error(describeGatewayError(m.error))) : p.resolve(m.result) }
-        } else if (typeof m.method === 'string' && m.method.includes('requestApproval') && m.id !== undefined) {
-          // route to the human approver over the bus; default decline on any failure
-          this.onApproval(m).then((d) => this.send({ id: m.id, result: { decision: d } })).catch(() => this.send({ id: m.id, result: { decision: 'decline' } }))
-        } else if (m.method === 'mcpServer/elicitation/request' && m.id !== undefined) {
-          const result = codexMcpElicitationResult(m)
-          const params = m.params ?? {}
-          log(`mcp elicitation ${result.action}: server=${params.serverName ?? '?'} kind=${params._meta?.codex_approval_kind ?? '?'} tool=${params._meta?.tool_description ?? '?'}`)
-          this.send({ id: m.id, result })
-        } else {
-          this.handleRealtimeNotification(m)
-          for (const h of this.handlers) h(m)
+    if (this.exited) return Promise.reject(new Error('codex_app_server_exited'))
+    const id = this.idc++
+    return new Promise((res, rej) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) rej(new Error(`codex_rpc_timeout:${method}`))
+      }, CODEX_RPC_TIMEOUT_MS)
+      this.pending.set(id, {
+        method,
+        timer,
+        resolve: (v) => { clearTimeout(timer); res(v) },
+        reject: (e) => { clearTimeout(timer); rej(e) },
+      })
+      try {
+        this.send({ id, method, params })
+      } catch (e) {
+        const p = this.pending.get(id)
+        if (p) {
+          this.pending.delete(id)
+          p.reject(e)
         }
       }
+    })
+  }
+  private notify(method: string, params?: any) { this.send({ method, params }) }
+  private failPending(e: Error): void {
+    for (const [id, p] of this.pending) {
+      this.pending.delete(id)
+      p.reject(e)
+    }
+  }
+  private async watchExit() {
+    const code = await this.proc.exited.catch(() => null)
+    this.exited = true
+    this.failPending(new Error(`codex_app_server_exited${code == null ? '' : `:${code}`}`))
+    if (!this.stopped) {
+      log(`app-server exited unexpectedly code=${code ?? 'unknown'}`)
+      this.opts.onExit?.(typeof code === 'number' ? code : null)
+    }
+  }
+  private async readLoop() {
+    try {
+      const dec = new TextDecoder(); let buf = ''
+      for await (const chunk of this.proc.stdout) {
+        buf += dec.decode(chunk); let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+          if (!line) continue
+          let m: any; try { m = JSON.parse(line) } catch { continue }
+          if (m.id !== undefined && (m.result !== undefined || m.error !== undefined)) {
+            const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); m.error ? p.reject(new Error(describeGatewayError(m.error))) : p.resolve(m.result) }
+          } else if (typeof m.method === 'string' && m.method.includes('requestApproval') && m.id !== undefined) {
+            // route to the human approver over the bus; default decline on any failure
+            this.onApproval(m).then((d) => this.send({ id: m.id, result: { decision: d } })).catch(() => this.send({ id: m.id, result: { decision: 'decline' } }))
+          } else if (m.method === 'mcpServer/elicitation/request' && m.id !== undefined) {
+            const result = codexMcpElicitationResult(m)
+            const params = m.params ?? {}
+            log(`mcp elicitation ${result.action}: server=${params.serverName ?? '?'} kind=${params._meta?.codex_approval_kind ?? '?'} tool=${params._meta?.tool_description ?? '?'}`)
+            this.send({ id: m.id, result })
+          } else {
+            this.handleRealtimeNotification(m)
+            for (const h of this.handlers) h(m)
+          }
+        }
+      }
+    } catch (e) {
+      if (!this.stopped) log(`app-server stdout loop failed: ${describeGatewayError(e)}`)
+    } finally {
+      this.exited = true
+      this.failPending(new Error('codex_app_server_stdout_closed'))
     }
   }
   private async stderrLoop() {
@@ -429,17 +673,13 @@ class CodexAppServer {
   private handleRealtimeNotification(m: any): void {
     const method = String(m?.method ?? '')
     const params = m?.params ?? {}
-    const threadId = typeof params.threadId === 'string'
-      ? params.threadId
-      : typeof params.thread?.id === 'string'
-        ? params.thread.id
-        : ''
+    const threadId = codexNotificationThreadId(m)
     if (!threadId) return
     const session = this.realtime.getByThreadId(threadId)
     if (!session) return
 
     if (method === 'turn/started') {
-      const turnId = String(params.turn?.id ?? params.turnId ?? '')
+      const turnId = codexNotificationTurnId(m)
       if (turnId) this.realtime.setActiveTurn(session.session_id, turnId, 'running')
       this.emitRealtimeEvent(session, 'turn_started', { method, turn_id: turnId || undefined, status: params.turn?.status })
       return
@@ -448,9 +688,9 @@ class CodexAppServer {
     if (method === 'item/agentMessage/delta') {
       this.emitRealtimeEvent(session, 'agent_text_delta', {
         method,
-        turn_id: typeof params.turnId === 'string' ? params.turnId : session.active_turn_id,
-        item_id: typeof params.itemId === 'string' ? params.itemId : undefined,
-        text: typeof params.delta === 'string' ? params.delta : undefined,
+        turn_id: codexNotificationTurnId(m) || session.active_turn_id,
+        item_id: codexNotificationItemId(m) || undefined,
+        text: codexAgentTextDelta(m) || undefined,
       })
       return
     }
@@ -458,14 +698,15 @@ class CodexAppServer {
     if (method === 'item/started' || method === 'item/completed') {
       this.emitRealtimeEvent(session, method === 'item/started' ? 'item_started' : 'item_completed', {
         method,
-        turn_id: typeof params.turnId === 'string' ? params.turnId : session.active_turn_id,
-        item_id: typeof params.item?.id === 'string' ? params.item.id : undefined,
+        turn_id: codexNotificationTurnId(m) || session.active_turn_id,
+        item_id: codexNotificationItemId(m) || undefined,
+        text: method === 'item/completed' ? codexCompletedAgentText(m) || undefined : undefined,
       })
       return
     }
 
     if (method === 'turn/completed') {
-      const turnId = String(params.turn?.id ?? params.turnId ?? session.active_turn_id ?? '')
+      const turnId = codexNotificationTurnId(m) || session.active_turn_id || ''
       const status = String(params.status ?? params.turn?.status ?? 'completed')
       const finalStatus = status === 'failed' ? 'failed' : status === 'interrupted' ? 'interrupted' : 'completed'
       this.realtime.clearActiveTurn(session.session_id, finalStatus)
@@ -478,9 +719,14 @@ class CodexAppServer {
     }
 
     if (method === 'turn/failed') {
-      const turnId = String(params.turn?.id ?? params.turnId ?? session.active_turn_id ?? '')
+      const turnId = codexNotificationTurnId(m) || session.active_turn_id || ''
       this.realtime.clearActiveTurn(session.session_id, 'failed')
       this.emitRealtimeEvent(session, 'turn_failed', { method, turn_id: turnId || undefined, status: 'failed', payload: { error: extractTurnError(params) } })
+      return
+    }
+
+    if (method === 'thread/compacted') {
+      this.emitRealtimeEvent(session, 'context_compacted', { method, turn_id: codexNotificationTurnId(m) || undefined })
       return
     }
 
@@ -490,14 +736,31 @@ class CodexAppServer {
       this.emitRealtimeEvent(session, 'thread_status_changed', { method, status: typeof rawStatus === 'string' ? rawStatus : undefined })
     }
   }
-  private async thread(threadKey: string | undefined, opts: { sandbox: string; approvalPolicy: string; cwd: string }): Promise<string> {
+  private threadContext(opts: { sandbox: string; cwd: string }): { codexSandbox: CodexSandboxMode; ctx: GatewayThreadContext } {
     const codexSandbox = resolveCodexExecutionSandbox(opts.sandbox, {
       defaultSandbox: CODEX_EXEC_SANDBOX,
       workspaceWriteSandbox: CODEX_WORKSPACE_WRITE_EXEC_SANDBOX,
     })
     const ctx = { sandbox: `${opts.sandbox}->${codexSandbox}`, cwd: opts.cwd }
-    const cached = this.threads.get(threadKey, ctx)
-    if (cached) return cached
+    return { codexSandbox, ctx }
+  }
+  private async thread(threadKey: string | undefined, opts: { sandbox: string; approvalPolicy: string; cwd: string }): Promise<string> {
+    const { codexSandbox, ctx } = this.threadContext(opts)
+    const cached = await this.threads.getWithSource(threadKey, ctx)
+    if (cached?.source === 'memory') return cached.threadId
+    if (cached?.source === 'persistent') {
+      if (codexSandbox !== opts.sandbox) log(`codex sandbox override for resumed cached thread: request=${opts.sandbox} app-server=${codexSandbox} cwd=${opts.cwd}`)
+      const resumed = await this.req('thread/resume', {
+        threadId: cached.threadId,
+        cwd: opts.cwd,
+        approvalPolicy: opts.approvalPolicy,
+        sandbox: codexSandbox,
+        ...codexDetachedThreadOverrides(),
+      })
+      const id = resumed.threadId ?? resumed.thread?.id ?? resumed.id ?? cached.threadId
+      await this.threads.set(threadKey, id, ctx)
+      return id
+    }
     if (codexSandbox !== opts.sandbox) log(`codex sandbox override for thread: request=${opts.sandbox} app-server=${codexSandbox} cwd=${opts.cwd}`)
     const start: any = {
       approvalPolicy: opts.approvalPolicy,
@@ -508,22 +771,42 @@ class CodexAppServer {
     if (MODEL) start.model = MODEL
     const th = await this.req('thread/start', start)
     const id = th.threadId ?? th.thread?.id ?? th.id
-    this.threads.set(threadKey, id, ctx)
+    await this.threads.set(threadKey, id, ctx)
     return id
   }
   async createRealtimeSession(opts: { sessionId?: string; threadKey?: string; resumeThreadId?: string; sandbox?: string; approvalPolicy?: string; cwd?: string; owner?: string; streamTopic?: string }): Promise<CodexRealtimeSession> {
     const sandbox = opts.sandbox ?? 'read-only'
     const approvalPolicy = opts.approvalPolicy ?? 'never'
     const cwd = opts.cwd ?? '/tmp'
+    const { codexSandbox, ctx } = this.threadContext({ sandbox, cwd })
+    const normalizedSessionId = opts.sessionId ? normalizeSessionId(opts.sessionId) : undefined
+    const existing = normalizedSessionId ? this.realtime.get(normalizedSessionId) : null
+    if (existing) {
+      if (existing.cwd !== cwd || existing.sandbox !== sandbox || existing.approval_policy !== approvalPolicy) throw new Error('session_context_mismatch')
+      if (opts.resumeThreadId && opts.resumeThreadId !== existing.thread_id) throw new Error('session_context_mismatch')
+      await this.threads.set(opts.threadKey ?? existing.thread_key, existing.thread_id, ctx)
+      return this.realtime.create({
+        sessionId: normalizedSessionId,
+        threadId: existing.thread_id,
+        threadKey: opts.threadKey ?? existing.thread_key,
+        owner: opts.owner,
+        cwd,
+        sandbox,
+        approvalPolicy,
+        streamTopic: opts.streamTopic,
+      })
+    }
     let threadId = opts.resumeThreadId
     if (threadId) {
-      const resumed = await this.req('thread/resume', { threadId, cwd, approvalPolicy, ...codexDetachedThreadOverrides() })
+      if (codexSandbox !== sandbox) log(`codex sandbox override for resumed thread: request=${sandbox} app-server=${codexSandbox} cwd=${cwd}`)
+      const resumed = await this.req('thread/resume', { threadId, cwd, approvalPolicy, sandbox: codexSandbox, ...codexDetachedThreadOverrides() })
       threadId = resumed.threadId ?? resumed.thread?.id ?? resumed.id ?? threadId
+      await this.threads.set(opts.threadKey, threadId, ctx)
     } else {
       threadId = await this.thread(opts.threadKey, { sandbox, approvalPolicy, cwd })
     }
     return this.realtime.create({
-      sessionId: opts.sessionId,
+      sessionId: normalizedSessionId,
       threadId,
       threadKey: opts.threadKey,
       owner: opts.owner,
@@ -594,21 +877,52 @@ class CodexAppServer {
   async runTurn(prompt: string, opts: { threadKey?: string; sandbox?: string; approvalPolicy?: string; cwd?: string; onDelta?: (s: string) => void } = {}): Promise<{ text: string; status: string; timedOut: boolean; timeoutMs: number; error?: string }> {
     const threadId = await this.thread(opts.threadKey, { sandbox: opts.sandbox ?? 'read-only', approvalPolicy: opts.approvalPolicy ?? 'never', cwd: opts.cwd ?? '/tmp' })
     let text = ''; let status = 'unknown'; let done = false; let errorDetail = ''
+    let turnId = ''
+    const deltaItems = new Set<string>()
     const h = (m: any) => {
       const mm: string = m.method ?? ''
-      if (mm.includes('agentMessage')) { const d = m.params?.delta ?? m.params?.text; if (typeof d === 'string') { text += d; opts.onDelta?.(d) } }
-      else if (mm === 'turn/completed') { status = m.params?.status ?? m.params?.turn?.status ?? 'completed'; errorDetail ||= extractTurnError(m.params); done = true }
-      else if (mm === 'turn/failed') { errorDetail ||= extractTurnError(m.params); status = (m.params?.status as string) || 'failed'; done = true }
+      const eventThreadId = codexNotificationThreadId(m)
+      if (eventThreadId && eventThreadId !== threadId) return
+      const eventTurnId = codexNotificationTurnId(m)
+      if (turnId && eventTurnId && eventTurnId !== turnId) return
+      if (!turnId && eventTurnId) turnId = eventTurnId
+
+      if (mm === 'turn/started') return
+      if (mm === 'item/agentMessage/delta') {
+        const d = codexAgentTextDelta(m)
+        if (d) {
+          const itemId = codexNotificationItemId(m)
+          if (itemId) deltaItems.add(itemId)
+          text += d
+          opts.onDelta?.(d)
+        }
+      } else if (mm === 'item/completed') {
+        const itemId = codexNotificationItemId(m)
+        const completedText = codexCompletedAgentText(m)
+        if (completedText && (itemId ? !deltaItems.has(itemId) : deltaItems.size === 0 && !text)) {
+          text += completedText
+          opts.onDelta?.(completedText)
+        }
+      } else if (mm === 'turn/completed') {
+        status = m.params?.status ?? m.params?.turn?.status ?? 'completed'
+        errorDetail ||= extractTurnError(m.params)
+        done = true
+      } else if (mm === 'turn/failed') {
+        errorDetail ||= extractTurnError(m.params)
+        status = (m.params?.status as string) || 'failed'
+        done = true
+      }
     }
     this.handlers.add(h)
     try {
       const turn: any = { threadId, input: [{ type: 'text', text: prompt, text_elements: [] }] }
       if (EFFORT) turn.effort = EFFORT
-      await this.req('turn/start', turn)
+      const started = await this.req('turn/start', turn)
+      turnId ||= String(started?.turn?.id ?? started?.turnId ?? '')
       const TURN_TIMEOUT_MS = Number(process.env.CODEX_GW_TURN_TIMEOUT_MS ?? 28_800_000) // 8h ceiling: ML/deep-analysis turns must never be prematurely killed; per-job/client bounds override DOWNWARD
       const t0 = Date.now(); while (!done && Date.now() - t0 < TURN_TIMEOUT_MS) await Bun.sleep(50)
       if (!done) status = 'timeout'
-      if (!done) this.threads.delete(opts.threadKey)
+      if (!done) await this.threads.delete(opts.threadKey)
       // codex sometimes reports an in-band failure (e.g. usage-limit/quota) as status=failed with no
       // JSON-RPC error + zero output — recover the reason from recent app-server stderr so the failure
       // is never silent.
@@ -617,7 +931,7 @@ class CodexAppServer {
     } finally { this.handlers.delete(h) }
   }
   async primaryUsedPct(): Promise<number | null> { try { const r = await this.req('account/rateLimits/read'); return r?.rateLimits?.primary?.usedPercent ?? null } catch { return null } }
-  stop() { try { this.proc.kill() } catch {} }
+  stop() { this.stopped = true; try { this.proc.kill() } catch {} }
 }
 
 // ── A2A bridge ────────────────────────────────────────────────────────────────
@@ -625,8 +939,9 @@ let codex: CodexAppServer
 const pendingApprovals = new Map<string, (d: 'accept' | 'decline') => void>()
 let a2a: A2AChannel
 const peerInbox: PeerInboxEvent[] = []
-type PendingRealtimeTurn = { to: string; corr: string; sessionId: string; turnId: string; text: string }
-const pendingRealtimeTurns = new Map<string, PendingRealtimeTurn>()
+type PendingRealtimeTurn = { to: string; corr: string; sessionId: string; turnId?: string; text: string; deltaItems: Set<string> }
+const pendingRealtimeBySession = new Map<string, PendingRealtimeTurn>()
+const pendingRealtimeByTurn = new Map<string, PendingRealtimeTurn>()
 
 const sendMsg = (to: string, body: any, extra: any = {}) =>
   a2a.callTool('a2a_send', { to, body: typeof body === 'string' ? body : JSON.stringify(body), ...extra })
@@ -671,30 +986,54 @@ function configureApprovals() {
 function configureRealtimeEvents() {
   codex.onRealtimeEvent((ev, session) => {
     if (session.stream_topic) void sendMsg(`topic:${session.stream_topic}`, ev)
-    if (ev.turn_id && ev.event === 'agent_text_delta' && typeof ev.text === 'string') {
-      const pending = pendingRealtimeTurns.get(ev.turn_id)
-      if (pending) pending.text += ev.text
+    const pending = pendingRealtimePendingFor(ev, session)
+    if (ev.turn_id && pending && !pending.turnId) bindPendingRealtimeTurn(pending, ev.turn_id)
+    if (pending && ev.event === 'agent_text_delta' && typeof ev.text === 'string') {
+      if (ev.item_id) pending.deltaItems.add(ev.item_id)
+      pending.text += ev.text
     }
-    if (ev.turn_id && ['turn_completed', 'turn_failed', 'turn_interrupted'].includes(ev.event)) {
-      const pending = pendingRealtimeTurns.get(ev.turn_id)
-      if (!pending) return
-      pendingRealtimeTurns.delete(ev.turn_id)
+    if (pending && ev.event === 'item_completed' && typeof ev.text === 'string' && ev.text) {
+      if (ev.item_id ? !pending.deltaItems.has(ev.item_id) : pending.deltaItems.size === 0 && !pending.text) pending.text += ev.text
+    }
+    if (pending && ['turn_completed', 'turn_failed', 'turn_interrupted'].includes(ev.event)) {
+      clearPendingRealtimeTurn(pending)
       const schema = ev.event === 'turn_failed'
         ? CODEX_TURN_FAILED_SCHEMA
         : ev.event === 'turn_interrupted'
           ? CODEX_TURN_INTERRUPTED_SCHEMA
           : CODEX_TURN_COMPLETED_SCHEMA
+      const turnId = ev.turn_id ?? pending.turnId
       void sendMsg(pending.to, {
         schema,
         session_id: pending.sessionId,
         thread_id: ev.thread_id,
-        turn_id: ev.turn_id,
+        ...(turnId ? { turn_id: turnId } : {}),
         status: ev.status ?? (ev.event === 'turn_failed' ? 'failed' : ev.event === 'turn_interrupted' ? 'interrupted' : 'completed'),
         ...(pending.text ? { output: pending.text.trim() } : {}),
         seq: ev.seq,
       }, { type: 'reply', corr: pending.corr }).catch(() => {})
     }
   })
+}
+
+function pendingRealtimePendingFor(ev: CodexRealtimeEvent, session: CodexRealtimeSession): PendingRealtimeTurn | undefined {
+  return (ev.turn_id ? pendingRealtimeByTurn.get(ev.turn_id) : undefined) ?? pendingRealtimeBySession.get(session.session_id)
+}
+
+function rememberPendingRealtimeTurn(pending: PendingRealtimeTurn): void {
+  pendingRealtimeBySession.set(pending.sessionId, pending)
+  if (pending.turnId) pendingRealtimeByTurn.set(pending.turnId, pending)
+}
+
+function bindPendingRealtimeTurn(pending: PendingRealtimeTurn, turnId: string): void {
+  if (pending.turnId && pending.turnId !== turnId) pendingRealtimeByTurn.delete(pending.turnId)
+  pending.turnId = turnId
+  pendingRealtimeByTurn.set(turnId, pending)
+}
+
+function clearPendingRealtimeTurn(pending: PendingRealtimeTurn): void {
+  pendingRealtimeBySession.delete(pending.sessionId)
+  if (pending.turnId) pendingRealtimeByTurn.delete(pending.turnId)
 }
 
 type RealtimeContext =
@@ -806,11 +1145,15 @@ async function onRealtimeInbound(req: Record<string, any>, from: string, corr: s
         streamTopic: session.stream_topic,
         toolsEnabled: A2A_TOOLS_ENABLED,
       })
+      const pending: PendingRealtimeTurn = { to: from, corr, sessionId: session.session_id, text: '', deltaItems: new Set() }
+      rememberPendingRealtimeTurn(pending)
       const started = await codex.startRealtimeTurn(session.session_id, prompt, { clientUserMessageId: typeof req.event_id === 'string' ? req.event_id : undefined })
-      pendingRealtimeTurns.set(started.turnId, { to: from, corr, sessionId: session.session_id, turnId: started.turnId, text: '' })
+      bindPendingRealtimeTurn(pending, started.turnId)
       await sendMsg(from, { schema: CODEX_TURN_STARTED_SCHEMA, ...sessionPublicState(session), turn_id: started.turnId }, { type: 'reply', corr })
       return
     } catch (e) {
+      const pending = pendingRealtimeBySession.get(session.session_id)
+      if (pending?.corr === corr) clearPendingRealtimeTurn(pending)
       await sendMsg(from, { schema: CODEX_TURN_FAILED_SCHEMA, session_id: session.session_id, error: describeGatewayError(e) }, { type: 'reply', corr })
       return
     }
@@ -950,6 +1293,10 @@ async function handleHttpSessionEvent(sessionId: string, body: Record<string, an
 
 function startHttpGateway() {
   if (HTTP_PORT <= 0) return
+  if (!codexGatewayRoleAllowsRealtime(CODEX_GW_ROLE)) {
+    log(`FATAL: CODEX_GW_HTTP_PORT requires realtime support, but CODEX_GW_ROLE=${CODEX_GW_ROLE}`)
+    process.exit(1)
+  }
   if (!codexHttpGatewayStartAllowed(HTTP_BIND, HTTP_TOKEN)) {
     log(`FATAL: CODEX_GW_HTTP_BIND=${HTTP_BIND} requires CODEX_GW_HTTP_TOKEN; refusing unauthenticated non-loopback HTTP gateway`)
     process.exit(1)
@@ -1054,6 +1401,10 @@ async function onInbound(content: string, attrs: any) {
   const from = attrs.from, corr = attrs.id
   lastRequester = from
   if (isCodexRealtimeSchema(parsed?.schema)) {
+    if (!codexGatewayRoleAllowsRealtime(CODEX_GW_ROLE)) {
+      await sendMsg(from, { schema: 'codex.session.rejected.v1', reason: 'unsupported_schema_for_role', detail: `role=${CODEX_GW_ROLE}` }, { type: 'reply', corr })
+      return
+    }
     await onRealtimeInbound(parsed, from, corr)
     return
   }
@@ -1062,6 +1413,11 @@ async function onInbound(content: string, attrs: any) {
   const isJob = parsed?.schema === 'codex.job.request.v1'
   const job = isJob ? parsed : { job_id: jid(), input: [{ type: 'text', text: content }], stream_topic: null, sandbox: 'read-only' }
   const job_id = job.job_id || jid()
+  if (!codexGatewayRoleAllowsJobs(CODEX_GW_ROLE)) {
+    log(`REJECT ${job_id}: job request unsupported by CODEX_GW_ROLE=${CODEX_GW_ROLE} from ${from}`)
+    await sendMsg(from, { schema: 'codex.job.rejected.v1', job_id, reason: 'unsupported_schema_for_role', detail: `role=${CODEX_GW_ROLE}` }, { type: 'reply', corr })
+    return
+  }
   // Resolve a possibly claim-checked input: a large prompt rides a Redis blob + tiny
   // `input_ref` (the bus caps `args.body`); recover the FULL prompt here. No `input_ref`
   // → the inline join, unchanged (triage / eval callers are byte-for-byte identical).
@@ -1236,7 +1592,12 @@ async function onInbound(content: string, attrs: any) {
 }
 
 async function main() {
-  codex = new CodexAppServer()
+  codex = new CodexAppServer({
+    onExit: (code) => {
+      log(`FATAL: codex app-server exited code=${code ?? 'unknown'}; stopping gateway so supervisor can restart with clean session state`)
+      void a2a?.stop().catch(() => {}).finally(() => process.exit(1))
+    },
+  })
   configureApprovals()
   configureRealtimeEvents()
   a2a = new A2AChannel(onInbound, { enabled: true, agentId: AGENT_ID })
@@ -1252,7 +1613,7 @@ async function main() {
   }
   startHttpGateway()
   const used = await codex.primaryUsedPct()
-  log(`bus joined as '${AGENT_ID}' (codex primary budget ${used ?? '?'}%). canonical codex.job.* contract ready.`)
+  log(`bus joined as '${AGENT_ID}' (role=${CODEX_GW_ROLE}, codex primary budget ${used ?? '?'}%). contracts: jobs=${codexGatewayRoleAllowsJobs(CODEX_GW_ROLE) ? 'on' : 'off'} realtime=${codexGatewayRoleAllowsRealtime(CODEX_GW_ROLE) ? 'on' : 'off'}.`)
 
   for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, async () => { await a2a.stop().catch(() => {}); codex.stop(); process.exit(0) })
 }
