@@ -1,4 +1,4 @@
-# Alloyium
+# Alloyium - Discord: https://discord.gg/gaNaf8PJU4
 
 **The agent fabric. Run Claude Code and Codex agents at scale.**
 
@@ -136,3 +136,5 @@ Alloyium core is open source under **AGPL-3.0-or-later**. See [LICENSE](LICENSE)
 SDKs, client libraries, and examples are licensed under **Apache-2.0** where marked. Documentation is licensed under **CC BY 4.0** unless a document states otherwise; see [LICENSE-DOCS](LICENSE-DOCS). The Alloyium name, logos, and brand assets are not covered by the software or documentation licenses and are governed by a separate trademark policy.
 
 Paid commercial licenses are available for use cases that need terms outside the AGPL.
+
+
