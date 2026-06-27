@@ -48,8 +48,8 @@ describe('T-S8 — A2A disabled ⇒ wire-identical to the read-only bridge', () 
   }, 10_000)
 })
 
-describe('A2A enabled (dev bypass) ⇒ a2a + brain + kai + vault tools, stdout stays pure JSON-RPC', () => {
-  test('tools/list returns the A2A tools plus the agent-brain memory, kai bridge, and vault guidance tools, and instructions carry the A2A + brain + kai + vault text', async () => {
+describe('A2A enabled (dev bypass) ⇒ a2a + brain + kai + vault + access issuer tools, stdout stays pure JSON-RPC', () => {
+  test('tools/list returns the A2A tools plus the agent-brain memory, kai bridge, vault guidance, and access issuer tools, and instructions carry their text', async () => {
     const { initResp, toolsResp } = await boot({ A2A_ENABLED: '1', A2A_DEV_NO_AUTH: '1', A2A_AGENT_ID: 'selftest-stdio' })
     expect(initResp.result.capabilities?.tools).toBeDefined()
     expect(initResp.result.instructions).toContain('feed="a2a"')
@@ -59,6 +59,8 @@ describe('A2A enabled (dev bypass) ⇒ a2a + brain + kai + vault tools, stdout s
     expect(initResp.result.instructions).toContain('agent-kai bridge tools')
     // vault_tools.ts appends its guidance instruction sentence too.
     expect(initResp.result.instructions).toContain('vault guidance tool')
+    // access_token_issuer.ts appends its signed scoped-access instruction sentence too.
+    expect(initResp.result.instructions).toContain('signed access-token issuer tool')
     const names = (toolsResp?.result?.tools ?? []).map((t: any) => t.name).sort()
     expect(names).toEqual([
       // a2a messaging tools (a2a-channel.ts)
@@ -69,6 +71,8 @@ describe('A2A enabled (dev bypass) ⇒ a2a + brain + kai + vault tools, stdout s
       'kai_history', 'kai_schedule', 'kai_send', 'kai_sessions',
       // agent-vault guidance tool (vault_tools.ts)
       'vault_howto',
+      // signed scoped-access issuer (access_token_issuer.ts)
+      'a2a_issue_scoped_token',
     ].sort())
   }, 10_000)
 })

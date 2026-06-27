@@ -35,6 +35,7 @@ import { A2AChannel, type A2AChannelOpts, type VerifyKey, importEd25519Seed, typ
 import { BrainTools } from './brain_tools.ts'
 import { KaiTools } from './kai_tools.ts'
 import { VaultTools } from './vault_tools.ts'
+import { AccessTokenIssuerTools } from './access_token_issuer.ts'
 import { AgentLauncherTools } from './agent_launcher_tools.ts'
 import { StatusPlane, type CoreSigner } from './status_plane.ts'
 import { PresenceClaimer } from './presence.ts'
@@ -115,6 +116,7 @@ type Session = {
   a2a: A2AChannel
   inject: Inject
   launcher: AgentLauncherTools
+  access: AccessTokenIssuerTools
   toolList?: any[]
   toolOnly?: boolean
   epoch?: number
@@ -371,6 +373,7 @@ export class A2ACore {
   private async _doAddSession(agentId: string, inject: Inject, opts: Partial<A2AChannelOpts>): Promise<AddSessionResult> {
     const a2a = new A2AChannel(inject, this.buildSessionOpts(agentId, opts))
     const launcher = new AgentLauncherTools({ agentId })
+    const access = new AccessTokenIssuerTools({ redis: this.redis!, runtimeId: agentId })
     // Wrap start() in try/catch: A2AChannel.start() self-heals + returns today, but the
     // AddSessionResult contract must not depend on "start never throws" (GPT5.5-1).
     let startErr: unknown
@@ -385,7 +388,7 @@ export class A2ACore {
       log('warn', 'a2a_core_session_start_failed', { agent_id: agentId, ...(startErr ? errFields(startErr) : {}) })
       return { ok: false, agentId, error: 'session_start_failed' }
     }
-    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher) })
+    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher, access, toolList: this.makeToolList(a2a, launcher, access) })
     log('info', 'a2a_core_session_added', { agent_id: agentId, sessions: this.sessions.size })
     return { ok: true, agentId }
   }
@@ -410,6 +413,7 @@ export class A2ACore {
     // sanitizeBody is applied HERE (A2AChannel passes RAW body to inject) for byte-parity with webhook.ts.
     let serverRef: Server | undefined
     const launcher = new AgentLauncherTools({ agentId })
+    const access = new AccessTokenIssuerTools({ redis: this.redis!, runtimeId: agentId })
     const inject: Inject = async (content, attrs) => {
       if (!serverRef) throw new Error('a2a-core: session mcp server not ready')
       const meta = attrs && attrs.kind === 'direct' && typeof attrs.id === 'string'
@@ -434,6 +438,7 @@ export class A2ACore {
           brain: this.brain,
           kai: this.kai,
           vault: this.vault,
+          access,
           launcher,
           inject: wiring.ctxInject,
         })
@@ -454,7 +459,7 @@ export class A2ACore {
       return { ok: false, agentId, error: 'session_start_failed' }
     }
 
-    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
+    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher, access, toolList: this.makeToolList(a2a, launcher, access), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
     log('info', 'a2a_core_uds_session_added', { agent_id: agentId, session_key: sessionKey, tool_only: toolOnly, epoch: wiring.epoch, sessions: this.sessions.size })
     return { ok: true, agentId, epoch: wiring.epoch }
   }
@@ -489,11 +494,11 @@ export class A2ACore {
   listTools(agentId: string): any[] {
     const s = this.getSession(agentId)
     if (!s) return []
-    return [...(s.toolList ?? this.makeToolList(s.a2a, s.launcher))]
+    return [...(s.toolList ?? this.makeToolList(s.a2a, s.launcher, s.access))]
   }
 
-  private makeToolList(a2a: A2AChannel, launcher: AgentLauncherTools): any[] {
-    return [...a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...launcher.listTools()]
+  private makeToolList(a2a: A2AChannel, launcher: AgentLauncherTools, access: AccessTokenIssuerTools): any[] {
+    return [...a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...access.listTools(), ...launcher.listTools()]
   }
 
   // Dispatch a tool call for a session. Routing mirrors webhook.ts exactly: kai tools
@@ -525,13 +530,14 @@ export class A2ACore {
       return res
     }
     if (this.vault.handles(name)) return this.vault.callTool(name, args)
+    if (s.access.handles(name)) return s.access.callTool(name, args)
     if (s.launcher.handles(name)) return s.launcher.callTool(name, args)
     return s.a2a.callTool(name, args)
   }
 
   // The combined MCP server instructions a session advertises.
   instructions(): string {
-    return BASE_INSTRUCTIONS + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS
+    return BASE_INSTRUCTIONS + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS + AccessTokenIssuerTools.INSTRUCTIONS
   }
 
   // Graceful shutdown: stop every session first (each releases presence + its consumer

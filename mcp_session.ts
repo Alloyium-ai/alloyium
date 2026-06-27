@@ -5,6 +5,7 @@ import { BrainTools } from './brain_tools.ts'
 import { KaiTools } from './kai_tools.ts'
 import { VaultTools } from './vault_tools.ts'
 import { AgentLauncherTools } from './agent_launcher_tools.ts'
+import { AccessTokenIssuerTools } from './access_token_issuer.ts'
 
 const baseInstructions =
   'Events on this channel arrive as <channel source="alloyium" feed="..." ...>. ' +
@@ -27,6 +28,7 @@ export interface SessionCtx {
   brain: BrainTools
   kai: KaiTools
   vault?: VaultTools
+  access?: AccessTokenIssuerTools
   launcher?: AgentLauncherTools
   inject: (notif: unknown) => void | Promise<void>
 }
@@ -42,6 +44,7 @@ export function buildSessionMcpServer(ctx: SessionCtx): Server {
     ...ctx.brain.listTools(),
     ...ctx.kai.listTools(),
     ...(ctx.vault?.listTools() ?? []),
+    ...(ctx.access?.listTools() ?? []),
     ...launcherTools,
   ]
   const pendingInjectCap = positiveIntEnv('A2A_MCP_PENDING_INJECT_CAP', 256)
@@ -58,6 +61,7 @@ export function buildSessionMcpServer(ctx: SessionCtx): Server {
         BrainTools.INSTRUCTIONS +
         KaiTools.INSTRUCTIONS +
         (ctx.vault ? VaultTools.INSTRUCTIONS : '') +
+        (ctx.access ? AccessTokenIssuerTools.INSTRUCTIONS : '') +
         (launcherTools.length ? AgentLauncherTools.INSTRUCTIONS : ''),
     },
   )
@@ -154,6 +158,7 @@ export function buildSessionMcpServer(ctx: SessionCtx): Server {
       return res
     }
     if (ctx.vault?.handles(name)) return ctx.vault.callTool(name, args)
+    if (ctx.access?.handles(name)) return ctx.access.callTool(name, args)
     if (ctx.launcher?.handles(name)) return ctx.launcher.callTool(name, args)
     return ctx.channel.callTool(name, args)
   })

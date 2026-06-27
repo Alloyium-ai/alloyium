@@ -12,6 +12,7 @@ import { A2AChannel } from './a2a-channel.ts'
 import { BrainTools } from './brain_tools.ts'
 import { KaiTools } from './kai_tools.ts'
 import { VaultTools } from './vault_tools.ts'
+import { AccessTokenIssuerTools } from './access_token_issuer.ts'
 
 // A2A (agent-to-agent messaging) is additive and OFF by default. When disabled,
 // nothing below changes the server's wire behavior — no tools capability, no
@@ -39,7 +40,7 @@ const mcp = new Server(
       ...(A2A_ENABLED ? { tools: {} } : {}),
     },
     // added to Claude's system prompt so it knows how to handle these events
-    instructions: A2A_ENABLED ? baseInstructions + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS : baseInstructions,
+    instructions: A2A_ENABLED ? baseInstructions + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS + AccessTokenIssuerTools.INSTRUCTIONS : baseInstructions,
   },
 )
 
@@ -99,9 +100,13 @@ const kai = A2A_ENABLED ? new KaiTools() : undefined
 // Agent-vault guidance tools (vault_howto). These are fail-soft advisory guidance
 // tools with no executor authority, exposed alongside A2A/brain/kai when enabled.
 const vault = A2A_ENABLED ? new VaultTools() : undefined
+
+// Signed scoped-access issuer. It verifies requests against A2A pubkeys in Redis
+// and returns only brokered lease references, never raw credential material.
+const access = A2A_ENABLED ? new AccessTokenIssuerTools() : undefined
 if (a2a) {
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [...a2a.listTools(), ...(brain?.listTools() ?? []), ...(kai?.listTools() ?? []), ...(vault?.listTools() ?? [])],
+    tools: [...a2a.listTools(), ...(brain?.listTools() ?? []), ...(kai?.listTools() ?? []), ...(vault?.listTools() ?? []), ...(access?.listTools() ?? [])],
   }))
   mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name
@@ -130,6 +135,7 @@ if (a2a) {
       return res
     }
     if (vault?.handles(name)) return vault.callTool(name, args)
+    if (access?.handles(name)) return access.callTool(name, args)
     return a2a.callTool(name, args)
   })
   void a2a.start().catch((e) => console.error('[webhook] A2AChannel.start failed', e))

@@ -4,6 +4,7 @@ import { A2AChannel } from '../a2a-channel.ts'
 import { BrainTools } from '../brain_tools.ts'
 import { KaiTools } from '../kai_tools.ts'
 import { VaultTools } from '../vault_tools.ts'
+import { AccessTokenIssuerTools } from '../access_token_issuer.ts'
 import { AgentLauncherTools } from '../agent_launcher_tools.ts'
 import { buildSessionMcpServer, type SessionCtx } from '../mcp_session.ts'
 import { UdsServerTransport } from '../uds_transport.ts'
@@ -20,6 +21,7 @@ const channelTool = { name: 'a2a_send', description: 'send', inputSchema: { type
 const brainTool = { name: 'a2a_remember', description: 'remember', inputSchema: { type: 'object' } }
 const kaiTool = { name: 'kai_sessions', description: 'sessions', inputSchema: { type: 'object' } }
 const vaultTool = { name: 'vault_howto', description: 'vault', inputSchema: { type: 'object' } }
+const accessTool = { name: 'a2a_issue_scoped_token', description: 'issuer', inputSchema: { type: 'object' } }
 const launcherTool = { name: 'a2a_launch_codex_agent', description: 'launch', inputSchema: { type: 'object' } }
 
 function makeCtx(overrides: Partial<SessionCtx> = {}): SessionCtx {
@@ -52,6 +54,13 @@ function makeCtx(overrides: Partial<SessionCtx> = {}): SessionCtx {
       handles: (name: string) => name === vaultTool.name,
       callTool: async (name: string, args: Record<string, unknown>) => ({
         content: [{ type: 'text', text: `vault:${name}:${JSON.stringify(args)}` }],
+      }),
+    },
+    access: {
+      listTools: () => [accessTool],
+      handles: (name: string) => name === accessTool.name,
+      callTool: async (name: string, args: Record<string, unknown>) => ({
+        content: [{ type: 'text', text: `access:${name}:${JSON.stringify(args)}` }],
       }),
     },
     ...overrides,
@@ -97,19 +106,19 @@ describe('buildSessionMcpServer', () => {
     expect(res.serverInfo).toEqual({ name: 'alloyium', version: '0.1.0' })
     expect(res.capabilities.experimental['claude/channel']).toEqual({})
     expect(res.capabilities.tools).toEqual({})
-    expect(res.instructions).toBe(baseInstructions + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS)
+    expect(res.instructions).toBe(baseInstructions + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS + AccessTokenIssuerTools.INSTRUCTIONS)
   })
 
-  test('tools/list returns channel, brain, kai, and vault tools', async () => {
+  test('tools/list returns channel, brain, kai, vault, and access issuer tools', async () => {
     const server = buildSessionMcpServer(makeCtx())
 
     const res = await request(server, 'tools/list', {})
 
-    expect(res.tools).toEqual([channelTool, brainTool, kaiTool, vaultTool])
+    expect(res.tools).toEqual([channelTool, brainTool, kaiTool, vaultTool, accessTool])
   })
 
   test('tools/list uses the cached per-session tool surface', async () => {
-    const calls = { channel: 0, brain: 0, kai: 0, vault: 0 }
+    const calls = { channel: 0, brain: 0, kai: 0, vault: 0, access: 0 }
     const server = buildSessionMcpServer(makeCtx({
       channel: {
         listTools: () => { calls.channel++; return [channelTool] },
@@ -131,15 +140,20 @@ describe('buildSessionMcpServer', () => {
         handles: (name: string) => name === vaultTool.name,
         callTool: async () => ({ content: [] }),
       },
+      access: {
+        listTools: () => { calls.access++; return [accessTool] },
+        handles: (name: string) => name === accessTool.name,
+        callTool: async () => ({ content: [] }),
+      },
     } as Partial<SessionCtx>))
 
     await request(server, 'tools/list', {})
     await request(server, 'tools/list', {})
 
-    expect(calls).toEqual({ channel: 1, brain: 1, kai: 1, vault: 1 })
+    expect(calls).toEqual({ channel: 1, brain: 1, kai: 1, vault: 1, access: 1 })
   })
 
-  test('tools/call dispatches kai before brain before vault before channel', async () => {
+  test('tools/call dispatches kai before brain before vault before access before channel', async () => {
     const server = buildSessionMcpServer(makeCtx())
 
     await expect(request(server, 'tools/call', { name: kaiTool.name, arguments: { x: 1 } }))
@@ -150,6 +164,9 @@ describe('buildSessionMcpServer', () => {
 
     await expect(request(server, 'tools/call', { name: vaultTool.name, arguments: { topic: 'policy' } }))
       .resolves.toEqual({ content: [{ type: 'text', text: 'vault:vault_howto:{"topic":"policy"}' }] })
+
+    await expect(request(server, 'tools/call', { name: accessTool.name, arguments: { agent_id: 'agent-a' } }))
+      .resolves.toEqual({ content: [{ type: 'text', text: 'access:a2a_issue_scoped_token:{"agent_id":"agent-a"}' }] })
 
     await expect(request(server, 'tools/call', { name: channelTool.name, arguments: { z: 3 } }))
       .resolves.toEqual({ content: [{ type: 'text', text: 'channel:a2a_send:{"z":3}' }] })
@@ -167,7 +184,7 @@ describe('buildSessionMcpServer', () => {
     } as Partial<SessionCtx>))
 
     const listed = await request(server, 'tools/list', {})
-    expect(listed.tools).toEqual([channelTool, brainTool, kaiTool, vaultTool, launcherTool])
+    expect(listed.tools).toEqual([channelTool, brainTool, kaiTool, vaultTool, accessTool, launcherTool])
     await expect(request(server, 'tools/call', { name: launcherTool.name, arguments: { agent_id: 'codex-worker-1' } }))
       .resolves.toEqual({ content: [{ type: 'text', text: 'launcher:a2a_launch_codex_agent:{"agent_id":"codex-worker-1"}' }] })
   })

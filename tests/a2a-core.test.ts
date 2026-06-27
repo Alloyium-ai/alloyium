@@ -224,7 +224,7 @@ describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned 
     expect(ra.length).toBe(0) // not delivered to the wrong session
   }, 40_000)
 
-  test('tool surface + routing: listTools spans a2a+brain+kai+vault; a2a_peers runs on the session; unknown session errors', async () => {
+  test('tool surface + routing: listTools spans a2a+brain+kai+vault+access; a2a_peers runs on the session; unknown session errors', async () => {
     const f = newFleet(); const A = `cpa-${uid}`, B = `cpb-${uid}`
     const core = newCore(f)
     await core.start()
@@ -232,7 +232,7 @@ describe.skipIf(!available)('A2ACore skeleton — multiplex sessions over owned 
     await core.addSession(B, async () => {})
 
     const names = core.listTools(A).map((t: any) => t.name)
-    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_join_topic', 'a2a_remember', 'a2a_recall', 'kai_send', 'vault_howto']))
+    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_join_topic', 'a2a_remember', 'a2a_recall', 'kai_send', 'vault_howto', 'a2a_issue_scoped_token']))
 
     // a2a_peers is dispatched to A's own channel → sees B as a live peer.
     const pr = JSON.parse((await core.callTool(A, 'a2a_peers', {})).content[0].text)

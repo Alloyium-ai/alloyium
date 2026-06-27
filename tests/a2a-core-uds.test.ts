@@ -139,7 +139,7 @@ describe.skipIf(!available)('A2ACore UDS sessions', () => {
     expect(await core.addUdsSession(agentId, wiring)).toMatchObject({ ok: true, agentId, epoch: 1 })
 
     const names = core.listTools(agentId).map((t: any) => t.name)
-    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'a2a_recall', 'kai_send', 'vault_howto']))
+    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'a2a_recall', 'kai_send', 'vault_howto', 'a2a_issue_scoped_token']))
   }, 35_000)
 
   test('removeSession CAS refuses a stale older epoch', async () => {
@@ -194,7 +194,7 @@ describe.skipIf(!available)('A2ACore UDS sessions', () => {
     expect(core.hasSession(agentId)).toBe(true)
 
     const names = core.listTools(agentId).map((t: any) => t.name)
-    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'vault_howto']))
+    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'vault_howto', 'a2a_issue_scoped_token']))
 
     expect(await core.removeSession(agentId, 1)).toBe(true)
     expect(core.sessionCount()).toBe(1)
@@ -215,6 +215,6 @@ describe.skipIf(!available)('A2ACore UDS sessions', () => {
     expect(await core.addUdsSession(agentId, wiring, { toolOnly: true })).toMatchObject({ ok: true, agentId, epoch: 1 })
 
     const names = core.listTools(agentId).map((t: any) => t.name)
-    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'vault_howto']))
+    expect(names).toEqual(expect.arrayContaining(['a2a_send', 'a2a_peers', 'a2a_remember', 'vault_howto', 'a2a_issue_scoped_token']))
   }, 35_000)
 })
