@@ -153,7 +153,9 @@ const GUIDANCE = {
     'If you are a spawned a2a agent with no token, you CANNOT self-resolve role ' +
     'tokens. Escalate to the orchestrator (agent-1). When you escalate, state: ' +
     "the task action you're blocked on, the role/secret-path you believe you " +
-    'need, and why — so agent-1 gets an actionable ask, not "I am stuck".',
+    'need, and why. Prefer an explicit signed-token scope lease, or a token label ' +
+    'plus normalized role, over guessed paths or raw token material — so agent-1 ' +
+    'gets an actionable ask, not "I am stuck".',
 } as const
 
 // Advisory framing carried on every response: the no-fire-authority note plus the

@@ -232,14 +232,19 @@ services:
         exec su bun -s /bin/sh -c 'bun onboard.ts claude-gw --transport none --dir /run/secrets/a2a --redis redis://redis:6379 --nats "$${NATS_URL}"'
 
   materialize-kai-token:
-    # Opt-in only (kai integration). Requires the excluded `materialize_kai_token.ts` and a
-    # host vault-tokens file; NOT part of the core path. a2a-core degrades gracefully without it.
+    # Opt-in only (kai integration). Uses a host vault-tokens file and a canonical
+    # token label; NOT part of the core path. a2a-core degrades gracefully without it.
     profiles: ["gateways", "launcher", "kai"]
     build: *build-bun
     user: root
     environment:
       CC_UID: ${CC_UID:-1000}
       CC_GID: ${CC_GID:-1000}
+      KAI_VAULT_URL: ${KAI_VAULT_URL:-http://vault:8484}
+      KAI_TOKEN_LABEL: ${KAI_TOKEN_LABEL:-kai}
+      KAI_TOKEN_AUTH_ROLE: ${KAI_TOKEN_AUTH_ROLE:-}
+      KAI_VAULT_FIELD: ${KAI_VAULT_FIELD:-password}
+      KAI_TOKEN_DIAGNOSTICS: ${KAI_TOKEN_DIAGNOSTICS:-0}
     volumes:
       - kai_token_secret:/run/secrets
       - ${KAI_VAULT_TOKENS_FILE:-./secrets/vault-tokens.json}:/run/bootstrap-vault-tokens.json:ro
@@ -251,6 +256,10 @@ services:
         bun materialize_kai_token.ts \
           --tokens /run/bootstrap-vault-tokens.json \
           --out /run/secrets/kai-token \
+          --vault-url "$${KAI_VAULT_URL}" \
+          --label "$${KAI_TOKEN_LABEL}" \
+          --auth-role "$${KAI_TOKEN_AUTH_ROLE}" \
+          --field "$${KAI_VAULT_FIELD}" \
           --uid "$${CC_UID}" \
           --gid "$${CC_GID}"
 
