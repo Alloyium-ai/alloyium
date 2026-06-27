@@ -147,6 +147,7 @@ services:
       <<: *cc-env
       A2A_PORTAL_PORT: "8900"
       A2A_PORTAL_STORE: /var/lib/alloyium/portal/a2a_portal.jsonl
+      A2A_ACI_DB: /var/lib/alloyium/portal/a2a_aci.sqlite3
       A2A_PORTAL_SEND_ENABLED: ${A2A_PORTAL_SEND_ENABLED:-1}
       A2A_PORTAL_AGENT_ID: ${A2A_PORTAL_AGENT_ID:-a2a-portal}
       A2A_PORTAL_HOST_OPS_CHAT_CWD: ${A2A_PORTAL_HOST_OPS_CHAT_CWD:-/app}

@@ -17,11 +17,14 @@ import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendA
 import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
+import { ACIStore } from './a2a_conversation_intelligence.ts'
 
 const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
 const PORT = Number(process.env.A2A_PORTAL_PORT ?? 8900)
 const STORE = process.env.A2A_PORTAL_STORE ?? '/srv/git/alloyium/logs/a2a_portal.jsonl'
+const ACI_DB = process.env.A2A_ACI_DB ?? '/var/lib/alloyium/portal/a2a_aci.sqlite3'
+const ACI_BACKFILL_INBOX_DB = process.env.A2A_ACI_BACKFILL_INBOX_DB ?? process.env.A2A_INBOX_DB
 const PORTAL_AGENT_ID = process.env.A2A_PORTAL_AGENT_ID ?? process.env.A2A_AGENT_ID ?? 'a2a-portal'
 const SEND_ENABLED = (process.env.A2A_PORTAL_SEND_ENABLED ?? '0') === '1' || process.env.A2A_PORTAL_SEND_ENABLED?.toLowerCase() === 'true'
 const HOST_OPS_CHAT_CWD = process.env.A2A_PORTAL_HOST_OPS_CHAT_CWD ?? '/srv/git/alloyium'
@@ -178,7 +181,24 @@ async function loadHistory() {
 
 async function onMessage(subject: string, data: Uint8Array) {
   const ch = channelOf(subject); if (!ch) return
-  let env: any; try { env = JSON.parse(dec.decode(data)) } catch { return }
+  const rawEnvelope = dec.decode(data)
+  let env: any
+  try {
+    env = JSON.parse(rawEnvelope)
+  } catch {
+    try {
+      aciStore?.ingestRawEnvelope({
+        rawEnvelope,
+        subject,
+        sourceKind: 'a2a',
+        sourceStream: 'portal_nats',
+        routeKind: ch.kind === 'topic' ? 'topic' : 'direct',
+      })
+    } catch (e) {
+      console.error('[portal] aci malformed ingest failed', e instanceof Error ? e.message : String(e))
+    }
+    return
+  }
   if (!env || typeof env !== 'object' || !env.id) return
   const m: Msg = {
     id: env.id, channel: ch.name, kind: ch.kind, from: env.from ?? '?', to: env.to ?? '',
@@ -191,6 +211,19 @@ async function onMessage(subject: string, data: Uint8Array) {
   if (existing && existing.msgs.some((x) => x.id === m.id)) return
   record(m, false)
   append(JSON.stringify(m))
+  try {
+    aciStore?.ingestA2AEnvelope({
+      envelope: env,
+      rawEnvelope,
+      subject,
+      sourceKind: 'a2a',
+      sourceStream: 'portal_nats',
+      routeKind: ch.kind === 'topic' ? 'topic' : 'direct',
+      observedAt: new Date(m.t || Date.now()).toISOString(),
+    })
+  } catch (e) {
+    console.error('[portal] aci ingest failed', e instanceof Error ? e.message : String(e))
+  }
   projectSkillEvent(m)
 }
 
@@ -198,6 +231,7 @@ let redis: RedisClient
 let sendChannel: A2AChannel | null = null
 let sendStatus: { enabled: boolean; agent_id: string; error: string } = { enabled: false, agent_id: PORTAL_AGENT_ID, error: SEND_ENABLED ? 'not_started' : 'disabled' }
 let langchainAgent: PortalLangChainAgent | null = null
+let aciStore: ACIStore | null = null
 
 function portalHostOptions(): { knownHosts: LogicalHost[]; aliases: Record<string, LogicalHost>; containerHostFallback: LogicalHost } {
   const knownHosts = parseKnownHosts(process.env.A2A_PORTAL_KNOWN_HOSTS)
@@ -443,6 +477,31 @@ async function readSkills(): Promise<any[]> {
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 const json = (o: any, init: ResponseInit = {}) => new Response(JSON.stringify(o), { ...init, headers: { 'content-type': 'application/json', ...(init.headers ?? {}) } })
 
+function spString(url: URL, name: string): string | null {
+  const v = url.searchParams.get(name)
+  return v == null || v.trim() === '' ? null : v.trim()
+}
+
+function spNumber(url: URL, name: string): number | undefined {
+  const v = url.searchParams.get(name)
+  if (v == null || v.trim() === '') return undefined
+  const n = Number(v)
+  return Number.isFinite(n) ? Math.trunc(n) : undefined
+}
+
+function aciTime(url: URL): { since?: string | null; until?: string | null; limit?: number } {
+  return { since: spString(url, 'since'), until: spString(url, 'until'), limit: spNumber(url, 'limit') }
+}
+
+function withACI(fn: (store: ACIStore) => any): Response {
+  if (!aciStore) return json({ ok: false, error: 'aci_unavailable' }, { status: 503 })
+  try {
+    return json(fn(aciStore))
+  } catch (e) {
+    return json({ ok: false, error: 'aci_query_failed', detail: e instanceof Error ? e.message : String(e) }, { status: 500 })
+  }
+}
+
 Bun.serve({
   port: PORT, hostname: '0.0.0.0',
   idleTimeout: 255,
@@ -450,6 +509,26 @@ Bun.serve({
     const url = new URL(req.url)
     const p = url.pathname
     if (p === '/') return new Response(HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } })
+    if (p === '/api/aci/summary') return withACI((store) => store.summary(aciTime(url)))
+    if (p === '/api/aci/agents') return withACI((store) => store.agents(aciTime(url)))
+    if (p === '/api/aci/graph') return withACI((store) => store.graph({ ...aciTime(url), edgeKind: spString(url, 'edge_kind') }))
+    if (p === '/api/aci/timeline') return withACI((store) => store.timeline({
+      ...aciTime(url),
+      thread: spString(url, 'thread'),
+      threadKey: spString(url, 'thread_key'),
+      sessionId: spString(url, 'session_id'),
+      agent: spString(url, 'agent'),
+      jobId: spString(url, 'job_id'),
+      topic: spString(url, 'topic'),
+      corr: spString(url, 'corr'),
+    }))
+    if (p === '/api/aci/jobs') return withACI((store) => store.jobs({ ...aciTime(url), jobId: spString(url, 'job_id') }))
+    if (p === '/api/aci/backfill' && req.method === 'POST') {
+      if (!ACI_BACKFILL_INBOX_DB) return json({ ok: false, error: 'aci_backfill_inbox_unconfigured' }, { status: 404 })
+      let body: any = {}
+      try { body = await req.json() } catch {}
+      return withACI((store) => ({ ok: true, ...store.backfillFromInboxDb(ACI_BACKFILL_INBOX_DB, { limit: Number(body?.limit) || spNumber(url, 'limit'), since: body?.since ?? spString(url, 'since') }) }))
+    }
     if (p === '/api/send-status') return json({ send: sendStatus })
     if (p === '/api/send' && req.method === 'POST') {
       if (!sendChannel || !sendStatus.enabled) return json({ ok: false, error: 'send_disabled', detail: sendStatus.error }, { status: 503 })
@@ -638,6 +717,7 @@ body.nav-open .scrim{opacity:1;pointer-events:auto}
 .tabpanel{display:none;flex:1;min-height:0;overflow:auto}
 body:not(.tab-chat) #msgs,body:not(.tab-chat) .composer,body:not(.tab-chat) .chat-only{display:none}
 body.tab-brain #brainPanel{display:block;overflow:auto}
+body.tab-intelligence #aciPanel{display:block;overflow:auto}
 .brain-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex:0 0 auto}
 .brain-head h2{font-size:16px}
 .panel-sub{color:var(--mut);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -660,8 +740,14 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 .fi .ic{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:0 0 8px}
 .fi .ft{flex:1;min-width:0}.fi .ft .h{font-size:12px;color:var(--tx)}.fi .ft .s{font-size:11px;color:var(--mut);margin-top:2px;word-break:break-word}
 .fi .ts2{color:var(--mut);font-size:10px;white-space:nowrap}
+#aciPanel{padding:14px 18px}
+.aci-grid{display:grid;grid-template-columns:repeat(6,minmax(96px,1fr));gap:8px;margin:0 0 14px}
+.aci-panels{display:grid;grid-template-columns:1fr 1.2fr 1fr;gap:12px}
+.aci-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:8px 0;border-top:1px solid #171b24}
+.aci-row:first-child{border-top:0}.aci-main{min-width:0}.aci-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.aci-meta{color:var(--mut);font-size:11px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.aci-num{font-weight:800;color:#eef2f8;font-variant-numeric:tabular-nums}
 @container (max-width:980px){.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.dash-panels{grid-template-columns:1fr}}
 @media(max-width:760px){.tab{padding:8px 12px}.brain-grid{grid-template-columns:1fr}#brainPanel{padding:10px 12px}}
+@media(max-width:900px){.aci-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.aci-panels{grid-template-columns:1fr}}
 @media(max-width:760px){.fleet .metric{padding:9px 5px}.homebtn{min-height:44px;padding:12px 16px}.dash{padding-bottom:18px}.dash-head{align-items:flex-start;flex-direction:column;margin-top:2px}.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.dash-card{padding:10px 9px}.dash-card .num{font-size:20px}.dash-card .lab{font-size:9px}.panel{padding:12px}.chart{height:132px}.row{gap:8px}}
 </style></head><body class="tab-chat">
 <div class="side">
@@ -674,7 +760,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 <div class="resizer" id="sideResizer" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" tabindex="0"></div>
 <div class="scrim" id="scrim"></div>
 <div class="main">
-  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
+  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="intelligence">Intelligence</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
   <div class="msgs" id="msgs"><div class="empty">Loading fleet dashboard</div></div>
   <div class="composer">
     <input id="sendTo" autocomplete="off" spellcheck="false" aria-label="Recipient" placeholder="@agent or #topic">
@@ -692,13 +778,22 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
       <div><div class="sec2">Memory &amp; Activity</div><div class="feed" id="feed"></div></div>
     </div>
   </div>
+  <div class="tabpanel" id="aciPanel">
+    <div class="brain-head"><h2>Agent Conversation Intelligence</h2></div>
+    <div class="aci-grid" id="aciStats"></div>
+    <div class="aci-panels">
+      <div class="panel"><h3>Top Edges</h3><div id="aciEdges" class="rows"></div></div>
+      <div class="panel"><h3>Recent Events</h3><div id="aciEvents" class="rows"></div></div>
+      <div class="panel"><h3>Jobs</h3><div id="aciJobs" class="rows"></div></div>
+    </div>
+  </div>
 </div>
   <script>
   const $=s=>document.querySelector(s)
   const LANGCHAIN_CHANNEL='${PORTAL_LANGCHAIN_CHANNEL}'
   const HOME='__fleet_dashboard__'
   let active=HOME, chans=[], presenceList=[], fleetStats=null, fleetData=null, sendReady=false, portalAgent='', currentMsgs=[]
-  let activeTab='chat', skillsData=[], feedData=[], freshSkills={}
+  let activeTab='chat', skillsData=[], feedData=[], freshSkills={}, aciData=null
   let langchainReady=false, langchainError='', langchainModel=''
   let renderOutput=localStorage.getItem('a2a.portal.renderOutput')==='1'
   let sendMode=localStorage.getItem('a2a.portal.sendMode')||'chat'
@@ -885,10 +980,17 @@ $('#sendBody').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==
   function activePath(){if(active===HOME)return '/api/fleet';return isLangChainChannel()?'/api/langchain/messages':(active&&active[0]==='@'?'/api/dm/'+encodeURIComponent(active.slice(1)):'/api/channels/'+encodeURIComponent(active))}
   function messageTouchesActive(d){if(!active||active===HOME)return false;if(d.channel===active)return true;if(active[0]!=='@')return false;const peer=active.slice(1);const m=d.message||{};return d.channel==='@'+portalAgent&&m.from===peer}
   function setupTabs(){document.body.classList.add('tab-chat');var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++){(function(b){b.onclick=function(){setTab(b.dataset.tab)}})(bs[i])}}
-  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain');document.body.classList.add('tab-'+name);
+  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain','tab-intelligence');document.body.classList.add('tab-'+name);
     var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++)bs[i].classList.toggle('active',bs[i].dataset.tab===name);
-    closeNavOnMobile();if(name==='brain')loadBrain()}
+    closeNavOnMobile();if(name==='brain')loadBrain();if(name==='intelligence')loadIntelligence()}
   async function loadBrain(){try{var r=await(await fetch('/api/skills')).json();if(r){skillsData=r.skills||[];feedData=r.feed||[]}}catch(e){}renderSkills();renderFeed()}
+  async function loadIntelligence(){try{var rs=await Promise.all([fetch('/api/aci/summary'),fetch('/api/aci/graph?limit=12'),fetch('/api/aci/timeline?limit=12'),fetch('/api/aci/jobs?limit=12')]);aciData={summary:await rs[0].json(),graph:await rs[1].json(),timeline:await rs[2].json(),jobs:await rs[3].json()}}catch(e){aciData={error:String(e)}}renderIntelligence()}
+  function aciCells(s){s=s||{};return [['EVENTS',s.events],['AGENTS',s.agents],['EDGES',s.edges],['JOBS',s.jobs],['TOPICS',s.topics],['FAILS',s.failures]].map(function(x){return '<div class="dash-card'+(x[0]==='FAILS'&&Number(x[1])>0?' warn':'')+'"><span class="num">'+esc(metricValue(x[1]))+'</span><span class="lab">'+esc(x[0])+'</span></div>'}).join('')}
+  function aciEdgeRows(edges){edges=edges||[];if(!edges.length)return '<div class="dash-empty">No graph edges yet</div>';return edges.map(function(e){return '<div class="aci-row"><div class="aci-main"><div class="aci-name">'+esc(e.from_node_id)+' → '+esc(e.to_node_id)+'</div><div class="aci-meta">'+esc(e.edge_kind)+' · '+esc(e.from_node_type)+' to '+esc(e.to_node_type)+' · '+(e.last_seen_at?esc(ago(Date.parse(e.last_seen_at)))+' ago':'')+'</div></div><div class="aci-num">'+esc(e.count)+'</div></div>'}).join('')}
+  function aciEventRows(events){events=events||[];if(!events.length)return '<div class="dash-empty">No metadata events yet</div>';return events.map(function(e){var peer=e.route_kind==='topic'?'#'+(e.topic||''):(e.from_agent||'?')+' → '+(e.to_agent||'?');var job=e.job_id?' · '+e.job_id:'';return '<div class="aci-row"><div class="aci-main"><div class="aci-name">'+esc(peer)+'</div><div class="aci-meta">'+esc(e.msg_type||'event')+' · '+esc(e.body_schema||'plain')+job+' · '+esc(e.status||e.route_status||'observed')+'</div></div><div class="aci-num">'+(e.observed_at?esc(ago(Date.parse(e.observed_at))):'')+'</div></div>'}).join('')}
+  function aciJobRows(jobs){jobs=jobs||[];if(!jobs.length)return '<div class="dash-empty">No jobs yet</div>';return jobs.map(function(j){return '<div class="aci-row"><div class="aci-main"><div class="aci-name">'+esc(j.job_id)+'</div><div class="aci-meta">'+esc(j.job_system||'job')+' · '+esc(j.requester||'?')+' → '+esc(j.assignee||'?')+(j.task_id?' · task '+esc(j.task_id):'')+'</div></div><div class="aci-num">'+esc(j.status||'seen')+'</div></div>'}).join('')}
+  function renderIntelligence(){var stats=$('#aciStats'),edges=$('#aciEdges'),events=$('#aciEvents'),jobs=$('#aciJobs');if(!stats||!edges||!events||!jobs)return;if(!aciData||aciData.error){stats.innerHTML='<div class="dash-empty">'+esc(aciData&&aciData.error||'Loading')+'</div>';edges.innerHTML=events.innerHTML=jobs.innerHTML='';return}
+    stats.innerHTML=aciCells(aciData.summary);edges.innerHTML=aciEdgeRows((aciData.graph&&aciData.graph.edges)||[]);events.innerHTML=aciEventRows((aciData.timeline&&aciData.timeline.events)||[]);jobs.innerHTML=aciJobRows((aciData.jobs&&aciData.jobs.jobs)||[])}
   function renderSkills(){var el=$('#skills');if(!el)return;var cnt=$('#skillCount');if(cnt)cnt.textContent=skillsData.length;
     if(!skillsData.length){el.innerHTML='<div class="col-empty">No skills learned yet</div>';return}
     el.innerHTML=skillsData.map(function(s){var fresh=freshSkills[s.name]&&freshSkills[s.name]>Date.now();
@@ -910,6 +1012,7 @@ es.onmessage=e=>{const d=JSON.parse(e.data);
   if(d.kind!=='msg')return;
   const c=chans.find(x=>x.name===d.channel);if(c){c.count++;c.lastT=d.message.t}else loadChannels();renderSidebar();
   if(active===HOME)loadFleet();
+  if(activeTab==='intelligence')loadIntelligence();
   if(messageTouchesActive(d)){const el=$('#msgs');const stick=el.scrollTop+el.clientHeight>el.scrollHeight-40;
     fetch(activePath()).then(r=>r.json()).then(r=>{render(r.messages);if(!stick)el.scrollTop=el.scrollTop})}}
   async function init(){setupNav();setupTabs();setupSidebarResize();setupPresenceClicks();setupChannelClicks();setupHome();setupRenderToggle();setupSendMode();await loadSendStatus();await loadLangChainStatus();await loadChannels();await loadFleet();setInterval(loadPresence,5000);setInterval(loadChannels,8000);setInterval(loadSendStatus,10000);setInterval(loadLangChainStatus,10000)}
@@ -925,6 +1028,7 @@ async function shutdown(code = 0) {
     shutdownPromise = (async () => {
       await sendChannel?.stop().catch(() => {})
       await nc?.drain().catch(() => {})
+      try { aciStore?.close() } catch {}
     })()
   }
   await shutdownPromise
@@ -937,6 +1041,13 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 
 ;(async () => {
   redis = new RedisClient(REDIS_URL)
+  try {
+    aciStore = new ACIStore(ACI_DB)
+    console.error(`[portal] aci metadata store ${ACI_DB}`)
+  } catch (e) {
+    aciStore = null
+    console.error('[portal] aci metadata store disabled', e instanceof Error ? e.message : String(e))
+  }
   await persistInit(); await loadHistory()
   await startSendChannel()
   langchainAgent = new PortalLangChainAgent({
