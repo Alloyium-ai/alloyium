@@ -21,7 +21,7 @@ import {
   type JetStreamClient,
 } from 'nats'
 import { RedisClient } from 'bun'
-import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto'
+import { createHmac, createHash, timingSafeEqual, randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import { sanitizeBody, decode, makeGate, type Inject } from './nats-channel.ts'
 import { A2AInboxStore, type InboxMessageRow } from './a2a_inbox_store.ts'
@@ -128,6 +128,9 @@ const PRESENCE_HEARTBEAT_SCRIPT =
 const PRESENCE_RELEASE_SCRIPT =
   "local v=redis.call('GET',KEYS[1]); if v==false then return 0 end; " +
   "local ok,d=pcall(cjson.decode,v); if ok and type(d)=='table' and d.token==ARGV[1] then redis.call('DEL',KEYS[1]); return 1 end; return 0"
+const DIRECT_ENC_CAP_RELEASE_SCRIPT =
+  "local v=redis.call('GET',KEYS[1]); if v==false then return 0 end; " +
+  "local ok,d=pcall(cjson.decode,v); if ok and type(d)=='table' and d.token==ARGV[1] then redis.call('DEL',KEYS[1]); return 1 end; return 0"
 
 // ── structured, leveled, stderr-only logger (stdout is the MCP stdio pipe) ──
 type Level = 'debug' | 'info' | 'warn' | 'error'
@@ -162,6 +165,16 @@ const isNotFound = (e: any): boolean => /not found|404/i.test(String(e?.message 
 
 // ── P2 · envelope + canonical serialization + sign/verify (spec §6, §6.3) ───
 
+export const DIRECT_ENC_ALG = 'x25519-ed25519-hkdf-sha256-aes-256-gcm-v1'
+export type DirectEncryptionMode = 'off' | 'opportunistic' | 'required'
+export type DirectEncryptionMetadata = {
+  alg: typeof DIRECT_ENC_ALG
+  kid: string
+  epk: string
+  salt: string
+  iv: string
+}
+
 export type Envelope = {
   v: number
   id: string
@@ -174,6 +187,7 @@ export type Envelope = {
   ttl_ms?: number
   body: string
   attrs?: Record<string, string>
+  enc?: DirectEncryptionMetadata
   alg?: SigAlg
   sig?: string
 }
@@ -183,9 +197,11 @@ export type Envelope = {
 // every field is escaped (\ → \\ then | → \|) before joining with '|' so no
 // body content can forge a field boundary. `alg`/`thread`/`attrs` are excluded —
 // the receiver's config (not the envelope) decides the required algorithm.
+// Encrypted direct envelopes append the `enc` metadata; plaintext envelopes keep
+// the original byte-for-byte canonical form for rolling compatibility.
 const escField = (s: string): string => s.replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
 export function canonical(e: Envelope): string {
-  return [
+  const fields = [
     String(e.v),
     e.id,
     e.from,
@@ -195,11 +211,151 @@ export function canonical(e: Envelope): string {
     e.ts,
     e.ttl_ms == null ? '' : String(e.ttl_ms),
     e.body,
-  ].map(escField).join('|')
+  ]
+  if (e.enc) fields.push(canonicalEnc(e.enc))
+  return fields.map(escField).join('|')
 }
 
 const b64 = (u8: Uint8Array): string => Buffer.from(u8).toString('base64')
 const fromB64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'base64'))
+const utf8 = new TextEncoder()
+const utf8dec = new TextDecoder()
+const randBytes = (n: number): Uint8Array => crypto.getRandomValues(new Uint8Array(n))
+
+const PKCS8_X25519_PREFIX = new Uint8Array([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20])
+const ED25519_FIELD_P = (1n << 255n) - 19n
+
+function mod(n: bigint): bigint {
+  const r = n % ED25519_FIELD_P
+  return r >= 0n ? r : r + ED25519_FIELD_P
+}
+function modPow(base: bigint, exp: bigint): bigint {
+  let b = mod(base), e = exp, out = 1n
+  while (e > 0n) {
+    if (e & 1n) out = mod(out * b)
+    b = mod(b * b)
+    e >>= 1n
+  }
+  return out
+}
+function modInv(n: bigint): bigint {
+  const x = mod(n)
+  if (x === 0n) throw new Error('ed25519 point has no montgomery mapping')
+  return modPow(x, ED25519_FIELD_P - 2n)
+}
+function bytesToBigIntLE(bytes: Uint8Array): bigint {
+  let out = 0n
+  for (let i = bytes.length - 1; i >= 0; i--) out = (out << 8n) + BigInt(bytes[i])
+  return out
+}
+function bigIntToBytesLE(n: bigint, len: number): Uint8Array {
+  let x = mod(n)
+  const out = new Uint8Array(len)
+  for (let i = 0; i < len; i++) { out[i] = Number(x & 0xffn); x >>= 8n }
+  return out
+}
+
+export function ed25519PublicToX25519Raw(edPub: Uint8Array): Uint8Array {
+  if (edPub.length !== 32) throw new Error(`ed25519 public key must be 32 bytes, got ${edPub.length}`)
+  const yBytes = new Uint8Array(edPub)
+  yBytes[31] &= 0x7f
+  const y = bytesToBigIntLE(yBytes)
+  if (y >= ED25519_FIELD_P) throw new Error('invalid ed25519 public key')
+  return bigIntToBytesLE((1n + y) * modInv(1n - y), 32)
+}
+
+export function ed25519SeedToX25519Scalar(seed: Uint8Array): Uint8Array {
+  if (seed.length !== 32) throw new Error(`ed25519 seed must be 32 bytes, got ${seed.length}`)
+  const h = new Uint8Array(createHash('sha512').update(seed).digest().subarray(0, 32))
+  h[0] &= 248
+  h[31] &= 127
+  h[31] |= 64
+  return h
+}
+
+export async function importX25519PrivateFromEd25519Seed(seed: Uint8Array): Promise<CryptoKey> {
+  const scalar = ed25519SeedToX25519Scalar(seed)
+  const pkcs8 = new Uint8Array(PKCS8_X25519_PREFIX.length + scalar.length)
+  pkcs8.set(PKCS8_X25519_PREFIX)
+  pkcs8.set(scalar, PKCS8_X25519_PREFIX.length)
+  return crypto.subtle.importKey('pkcs8', pkcs8, { name: 'X25519' }, false, ['deriveBits'])
+}
+
+async function importX25519Public(raw: Uint8Array): Promise<CryptoKey> {
+  if (raw.length !== 32) throw new Error(`x25519 public key must be 32 bytes, got ${raw.length}`)
+  return crypto.subtle.importKey('raw', raw, { name: 'X25519' }, false, [])
+}
+
+async function deriveX25519Bits(privateKey: CryptoKey, publicKey: CryptoKey): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: publicKey }, privateKey, 256))
+}
+
+async function deriveDirectAesKey(shared: Uint8Array, salt: Uint8Array, usages: KeyUsage[]): Promise<CryptoKey> {
+  const base = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey'])
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt, info: utf8.encode(DIRECT_ENC_ALG) },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    usages,
+  )
+}
+
+function sortedStringRecord(obj: Record<string, string> | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const k of Object.keys(obj ?? {}).sort()) out[k] = obj![k]
+  return out
+}
+
+function canonicalEnc(enc: DirectEncryptionMetadata): string {
+  return [enc.alg, enc.kid, enc.epk, enc.salt, enc.iv].map(escField).join('|')
+}
+
+function directEncAAD(env: Envelope, enc: DirectEncryptionMetadata): Uint8Array {
+  return utf8.encode(JSON.stringify({
+    v: env.v,
+    id: env.id,
+    from: env.from,
+    to: env.to,
+    type: env.type,
+    thread: env.thread ?? '',
+    corr: env.corr ?? '',
+    ts: env.ts,
+    ttl_ms: env.ttl_ms ?? null,
+    attrs: sortedStringRecord(env.attrs),
+    enc,
+  }))
+}
+
+function directEncKeyId(edPub: Uint8Array): string {
+  return createHash('sha256').update(edPub).digest('hex').slice(0, 24)
+}
+
+export async function encryptDirectEnvelopeBody(env: Envelope, plaintext: string, recipientEd25519PubB64: string): Promise<{ body: string; enc: DirectEncryptionMetadata }> {
+  const recipientEdPub = fromB64(recipientEd25519PubB64.trim())
+  const recipientXPub = await importX25519Public(ed25519PublicToX25519Raw(recipientEdPub))
+  const eph = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']) as CryptoKeyPair
+  const shared = await deriveX25519Bits(eph.privateKey, recipientXPub)
+  const salt = randBytes(16)
+  const iv = randBytes(12)
+  const epk = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey))
+  const enc: DirectEncryptionMetadata = { alg: DIRECT_ENC_ALG, kid: directEncKeyId(recipientEdPub), epk: b64(epk), salt: b64(salt), iv: b64(iv) }
+  const key = await deriveDirectAesKey(shared, salt, ['encrypt'])
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: directEncAAD(env, enc), tagLength: 128 }, key, utf8.encode(plaintext))
+  return { body: b64(new Uint8Array(ct)), enc }
+}
+
+export async function decryptDirectEnvelopeBody(env: Envelope, recipientEd25519Seed: Uint8Array): Promise<string> {
+  if (!env.enc) return env.body
+  const ephPub = await importX25519Public(fromB64(env.enc.epk))
+  const privateKey = await importX25519PrivateFromEd25519Seed(recipientEd25519Seed)
+  const shared = await deriveX25519Bits(privateKey, ephPub)
+  const salt = fromB64(env.enc.salt)
+  const iv = fromB64(env.enc.iv)
+  const key = await deriveDirectAesKey(shared, salt, ['decrypt'])
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: directEncAAD(env, env.enc), tagLength: 128 }, key, fromB64(env.body))
+  return utf8dec.decode(pt)
+}
 
 // Wrap a raw 32-byte ed25519 seed in the fixed PKCS8 header so Bun's WebCrypto
 // accepts it (raw private import is unsupported — verified). Returns a sign key.
@@ -241,6 +397,8 @@ export type SharedPool = {
 // NOT silently fall through to a working mode (it used to default to HMAC).
 export const SIG_ALGS = new Set<SigAlg>(['ed25519', 'hmac'])
 export const isSigAlg = (a: unknown): a is SigAlg => typeof a === 'string' && SIG_ALGS.has(a as SigAlg)
+export const DIRECT_ENC_MODES = new Set<DirectEncryptionMode>(['off', 'opportunistic', 'required'])
+export const isDirectEncryptionMode = (a: unknown): a is DirectEncryptionMode => typeof a === 'string' && DIRECT_ENC_MODES.has(a as DirectEncryptionMode)
 
 export async function signCanonical(alg: SigAlg, key: SignKey, canon: string): Promise<string> {
   const bytes = new TextEncoder().encode(canon)
@@ -304,6 +462,21 @@ export function validateSendArgs(args: Record<string, any>, ctx: { agentId: stri
   return { to, isTopic, target, type }
 }
 
+function b64Len(s: string, len: number): boolean {
+  if (typeof s !== 'string') return false
+  try { return fromB64(s).length === len } catch { return false }
+}
+
+export function isValidDirectEncryptionMetadata(enc: any): enc is DirectEncryptionMetadata {
+  if (!enc || typeof enc !== 'object' || Array.isArray(enc)) return false
+  if (enc.alg !== DIRECT_ENC_ALG) return false
+  if (typeof enc.kid !== 'string' || enc.kid.length < 1 || enc.kid.length > 64) return false
+  if (!b64Len(enc.epk, 32)) return false
+  if (!b64Len(enc.salt, 16)) return false
+  if (!b64Len(enc.iv, 12)) return false
+  return true
+}
+
 // Refilling token bucket; injectable clock for deterministic tests (spec §7.5 V7).
 export class TokenBucket {
   private tokens: number
@@ -338,6 +511,7 @@ export function isValidInbound(e: any): e is Envelope {
   if (e.thread != null && (typeof e.thread !== 'string' || e.thread.length > 128)) return false
   if (e.alg != null && typeof e.alg !== 'string') return false
   if (e.sig != null && typeof e.sig !== 'string') return false
+  if (e.enc != null && !isValidDirectEncryptionMetadata(e.enc)) return false
   if (e.attrs != null) {
     if (typeof e.attrs !== 'object' || Array.isArray(e.attrs)) return false
     for (const v of Object.values(e.attrs)) if (typeof v !== 'string') return false
@@ -518,6 +692,7 @@ export type A2AChannelOpts = {
   topicsKeyPrefix?: string
   secretKeyPrefix?: string
   pubkeyKeyPrefix?: string
+  directEncCapKeyPrefix?: string
   presenceKeyPrefix?: string
   keyCacheTtlS?: number
   maxSendBytes?: number
@@ -525,6 +700,7 @@ export type A2AChannelOpts = {
   ratePerPeerPerMin?: number
   pubTimeoutMs?: number
   presenceTtlS?: number
+  directEncCapTtlS?: number
   heartbeatMs?: number
   dedupLru?: number
   inboxMinIntervalMs?: number
@@ -549,6 +725,8 @@ export type A2AChannelOpts = {
   // Test injection — bypass file/Redis key loading for the OWN signing key, and
   // make the clock / id generator deterministic.
   signingKey?: SignKey
+  signingSeed?: Uint8Array
+  directEncryption?: DirectEncryptionMode
   // shim-signs (Q2): delegate per-send signing to an EXTERNAL signer (the shim that holds the
   // seed) instead of reading the seed in-process. When set, start() does NOT load an own key
   // and send() asks externalSign(canonical(env)) for the signature. Core-signs
@@ -577,7 +755,7 @@ export type A2AChannelOpts = {
   sharedKeyCache?: Map<string, { key: VerifyKey; exp: number }>
 }
 
-type Counters = { sent: number; rejected: number; denied: number; dup: number; expired: number; mal: number; self: number; misroute: number; badsig: number; downgrade: number }
+type Counters = { sent: number; rejected: number; denied: number; dup: number; expired: number; mal: number; self: number; misroute: number; badsig: number; downgrade: number; decryptfail: number }
 
 export class A2AChannel {
   private nc?: NatsConnection
@@ -592,7 +770,9 @@ export class A2AChannel {
   private presenceClaimed = false
   private startedAt = ''
   private signKey?: SignKey
+  private ownEd25519Seed?: Uint8Array
   private externalSign?: ExternalSign // shim-signs (Q2): when set, sign via this instead of an own key
+  private directEncCapable = false
 
   // shared-connection injection (a2a-core multiplex; spec §7.4). When set, start()
   // reuses these instead of opening its own, and stop() leaves them open.
@@ -628,13 +808,16 @@ export class A2AChannel {
   private topicsKeyPrefix: string
   private secretKeyPrefix: string
   private pubkeyKeyPrefix: string
+  private directEncCapKeyPrefix: string
   private presenceKeyPrefix: string
+  private directEncryption: DirectEncryptionMode
   private keyCacheTtlS: number
   private maxSendBytes: number
   private ratePerMin: number
   private ratePerPeerPerMin: number
   private pubTimeoutMs: number
   private presenceTtlS: number
+  private directEncCapTtlS: number
   private heartbeatMs: number
   private dedupLru: number
   private inboxMinIntervalMs: number
@@ -655,7 +838,7 @@ export class A2AChannel {
   // send-side rate limiting + counters
   private globalBucket?: TokenBucket
   private peerBuckets = new Map<string, TokenBucket>()
-  private counters: Counters = { sent: 0, rejected: 0, denied: 0, dup: 0, expired: 0, mal: 0, self: 0, misroute: 0, badsig: 0, downgrade: 0 }
+  private counters: Counters = { sent: 0, rejected: 0, denied: 0, dup: 0, expired: 0, mal: 0, self: 0, misroute: 0, badsig: 0, downgrade: 0, decryptfail: 0 }
 
   // receive-side state
   private inboxStop?: () => void
@@ -698,7 +881,11 @@ export class A2AChannel {
     this.topicsKeyPrefix = opts.topicsKeyPrefix ?? e.A2A_TOPICS_KEY_PREFIX ?? 'alloyium:a2a:topics:'
     this.secretKeyPrefix = opts.secretKeyPrefix ?? e.A2A_SECRET_KEY_PREFIX ?? 'alloyium:a2a:secret:'
     this.pubkeyKeyPrefix = opts.pubkeyKeyPrefix ?? e.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
+    this.directEncCapKeyPrefix = opts.directEncCapKeyPrefix ?? e.A2A_DIRECT_ENC_CAP_KEY_PREFIX ?? 'alloyium:a2a:direct-enc:'
     this.presenceKeyPrefix = opts.presenceKeyPrefix ?? 'alloyium:a2a:presence:'
+    const directEncryption = opts.directEncryption ?? e.A2A_DIRECT_ENCRYPTION ?? 'opportunistic'
+    if (!isDirectEncryptionMode(directEncryption)) throw new Error(`invalid A2A_DIRECT_ENCRYPTION '${directEncryption}'`)
+    this.directEncryption = directEncryption
     // Clamp env-derived limits to sane minimums so a misconfig (0, negative,
     // NaN) can't create pathological behavior (no eviction, no rate limit, etc.).
     const atLeast = (n: number, min: number) => (Number.isFinite(n) && n >= min ? n : min)
@@ -708,6 +895,7 @@ export class A2AChannel {
     this.ratePerPeerPerMin = atLeast(opts.ratePerPeerPerMin ?? envNum(e.A2A_SEND_RATE_PER_PEER_PER_MIN, 10), 1)
     this.pubTimeoutMs = atLeast(opts.pubTimeoutMs ?? envNum(e.A2A_PUB_TIMEOUT_MS, 5000), 100)
     this.presenceTtlS = atLeast(opts.presenceTtlS ?? envNum(e.A2A_PRESENCE_TTL_S, 90), 5)
+    this.directEncCapTtlS = atLeast(opts.directEncCapTtlS ?? envNum(e.A2A_DIRECT_ENC_CAP_TTL_S, this.presenceTtlS), 5)
     this.heartbeatMs = atLeast(opts.heartbeatMs ?? envNum(e.A2A_HEARTBEAT_MS, 30_000), 1000)
     this.dedupLru = atLeast(opts.dedupLru ?? envNum(e.A2A_DEDUP_LRU, 1024), 1)
     this.inboxMinIntervalMs = atLeast(opts.inboxMinIntervalMs ?? envNum(e.A2A_INBOX_MIN_INTERVAL_MS, 0), 0)
@@ -733,6 +921,7 @@ export class A2AChannel {
     this.now = opts.now ?? Date.now
     this.genId = opts.genId ?? randomUUID
     this.signKey = opts.signingKey
+    this.ownEd25519Seed = opts.signingSeed ? new Uint8Array(opts.signingSeed) : undefined
     this.externalSign = opts.externalSign
     // Shared-connection injection (a2a-core). ADDITIVE: when the host core owns one
     // NATS + one Redis and multiplexes many sessions, it injects them here; start()
@@ -857,7 +1046,8 @@ export class A2AChannel {
         this.ncPublish = this.nc; this.jsPublish = this.js; this.ncControl = this.nc // own conn: one class
       }
       if (!this.signingOff) await this.loadOwnSignKey()
-      log('info', 'a2a_startup', { agent_id: this.agentId, sig_alg: this.sigAlg, transport: this.transportNone ? 'none' : (this.nkeyPath ? 'nkey' : 'creds'), signing: this.signingOff ? 'off' : this.sigAlg, prefix: this.prefix, tool_only: this.toolOnly })
+      await this.refreshDirectEncryptionCapability()
+      log('info', 'a2a_startup', { agent_id: this.agentId, sig_alg: this.sigAlg, transport: this.transportNone ? 'none' : (this.nkeyPath ? 'nkey' : 'creds'), signing: this.signingOff ? 'off' : this.sigAlg, prefix: this.prefix, tool_only: this.toolOnly, direct_encryption: this.directEncryption, direct_enc_capable: this.directEncCapable })
 
       if (this.toolOnly) await this.ensureStream()
       else await this.afterConnect() // ensureStream (P3) + subscribeInbox (P4); topics (P6) on reload
@@ -887,6 +1077,7 @@ export class A2AChannel {
       this.ncPublish = undefined; this.jsPublish = undefined; this.ncControl = undefined
       // Release the presence claim we may have taken, else a restarted instance
       // is locked out as 'dup' for the full TTL (the new process has a new token).
+      if (this.directEncCapable) { try { await this.releaseDirectEncryptionCapability() } catch {} this.directEncCapable = false }
       if (this.presenceClaimed) { try { await this.releasePresence() } catch {} this.presenceClaimed = false }
       if (!this.sharedConns) { try { (this.redis as any)?.close?.() } catch {} } // never close a shared Redis
       this.redis = undefined
@@ -926,6 +1117,40 @@ export class A2AChannel {
     await this.redis.send('EVAL', [PRESENCE_RELEASE_SCRIPT, '1', this.presenceKeyPrefix + this.agentId, this.instanceToken])
   }
 
+  private canAdvertiseDirectEncryption(): boolean {
+    return !this.toolOnly &&
+      this.directEncryption !== 'off' &&
+      !this.signingOff &&
+      this.sigAlg === 'ed25519' &&
+      this.ownEd25519Seed != null &&
+      this.redis != null
+  }
+
+  private async refreshDirectEncryptionCapability(): Promise<void> {
+    if (!this.canAdvertiseDirectEncryption()) return
+    const value = JSON.stringify({
+      alg: DIRECT_ENC_ALG,
+      agent: this.agentId,
+      token: this.instanceToken,
+      ts: new Date(this.now()).toISOString(),
+    })
+    try {
+      await withTimeout(
+        this.redis!.send('SET', [this.directEncCapKeyPrefix + this.agentId, value, 'EX', String(this.directEncCapTtlS)]),
+        REDIS_TIMEOUT_MS,
+        'redis.direct_enc_cap.set',
+      )
+      this.directEncCapable = true
+    } catch (e) {
+      log('warn', 'a2a_direct_enc_cap_refresh_failed', { agent_id: this.agentId, ...errFields(e) })
+    }
+  }
+
+  private async releaseDirectEncryptionCapability(): Promise<void> {
+    if (!this.redis) return
+    await this.redis.send('EVAL', [DIRECT_ENC_CAP_RELEASE_SCRIPT, '1', this.directEncCapKeyPrefix + this.agentId, this.instanceToken])
+  }
+
   // Token-guarded heartbeat — refresh last_seen + TTL only if WE still own the
   // key (string-match on our UUID token), so we never clobber a successor.
   private async heartbeat(): Promise<void> {
@@ -936,6 +1161,7 @@ export class A2AChannel {
     try {
       const r = await withTimeout(this.redis.send('EVAL', [PRESENCE_HEARTBEAT_SCRIPT, '1', key, this.instanceToken, val, String(this.presenceTtlS)]), REDIS_TIMEOUT_MS, 'redis.heartbeat')
       if (Number(r) !== 1) log('warn', 'a2a_presence_heartbeat_failed', { agent_id: this.agentId, reason: 'lost_ownership' })
+      await this.refreshDirectEncryptionCapability()
     } catch (e) {
       log('warn', 'a2a_presence_heartbeat_failed', errFields(e))
     }
@@ -1053,15 +1279,20 @@ export class A2AChannel {
     if (this.externalSign) return // shim-signs: the external signer holds the seed; the core never reads it
     if (this.signKey != null) return
     if (this.sigAlg === 'ed25519') {
-      const buf = await Bun.file(this.signingKeyPath!).bytes()
-      // Accept a raw 32-byte seed or a base64/hex text seed.
-      const seed = buf.length === 32 ? buf : fromB64(new TextDecoder().decode(buf).trim())
+      const seed = this.ownEd25519Seed ?? await this.loadOwnEd25519Seed()
+      this.ownEd25519Seed = seed
       this.signKey = await importEd25519Seed(seed)
     } else {
       const secret = await withTimeout(this.redis!.get(this.secretKeyPrefix + this.agentId), REDIS_TIMEOUT_MS, 'redis.get(secret)')
       if (!secret) { log('error', 'a2a_secret_required', { agent_id: this.agentId }); throw new Error('own hmac secret absent') }
       this.signKey = secret
     }
+  }
+
+  private async loadOwnEd25519Seed(): Promise<Uint8Array> {
+    const buf = await Bun.file(this.signingKeyPath!).bytes()
+    // Accept a raw 32-byte seed or a base64 text seed.
+    return buf.length === 32 ? new Uint8Array(buf) : fromB64(new TextDecoder().decode(buf).trim())
   }
 
   // ── P6 · per-agent topics + join/leave (spec §8.2, §7.4) ───────────────────
@@ -1146,7 +1377,7 @@ export class A2AChannel {
     const c = this.counters
     if (Object.values(c).some((v) => v > 0)) {
       log('info', 'a2a_counts', { ...c })
-      this.counters = { sent: 0, rejected: 0, denied: 0, dup: 0, expired: 0, mal: 0, self: 0, misroute: 0, badsig: 0, downgrade: 0 }
+      this.counters = { sent: 0, rejected: 0, denied: 0, dup: 0, expired: 0, mal: 0, self: 0, misroute: 0, badsig: 0, downgrade: 0, decryptfail: 0 }
     }
   }
 
@@ -1275,6 +1506,53 @@ export class A2AChannel {
   }
 
   // ── P3 · a2a_send — the send pipeline V1–V9 (spec §7.5) ────────────────────
+  private async recipientDirectEncryptionCapable(agentId: string): Promise<boolean> {
+    if (!this.redis) return false
+    const raw = await withTimeout(this.redis.get(this.directEncCapKeyPrefix + agentId), REDIS_TIMEOUT_MS, 'redis.direct_enc_cap.get')
+    if (!raw) return false
+    try {
+      const cap = JSON.parse(raw)
+      return cap?.alg === DIRECT_ENC_ALG
+    } catch {
+      return raw.trim() === DIRECT_ENC_ALG
+    }
+  }
+
+  private async maybeEncryptDirectEnvelope(env: Envelope, target: string): Promise<{ ok: true; encrypted: boolean } | { ok: false; error: string; detail?: string }> {
+    if (this.directEncryption === 'off') return { ok: true, encrypted: false }
+    if (this.signingOff || this.sigAlg !== 'ed25519' || !this.redis) {
+      return this.directEncryption === 'required'
+        ? { ok: false, error: 'direct_encryption_unavailable' }
+        : { ok: true, encrypted: false }
+    }
+
+    let capable = false
+    try {
+      capable = await this.recipientDirectEncryptionCapable(target)
+    } catch (e) {
+      log('warn', 'a2a_direct_enc_cap_lookup_failed', { to: target, ...errFields(e) })
+      if (this.directEncryption === 'required') return { ok: false, error: 'direct_encryption_unavailable', detail: e instanceof Error ? e.message : String(e) }
+      return { ok: true, encrypted: false }
+    }
+    if (!capable) {
+      return this.directEncryption === 'required'
+        ? { ok: false, error: 'direct_encryption_unavailable' }
+        : { ok: true, encrypted: false }
+    }
+
+    try {
+      const pubkey = await withTimeout(this.redis.get(this.pubkeyKeyPrefix + target), REDIS_TIMEOUT_MS, 'redis.get(pubkey)')
+      if (!pubkey) return { ok: false, error: this.directEncryption === 'required' ? 'direct_encryption_unavailable' : 'direct_encryption_failed', detail: 'recipient_pubkey_unavailable' }
+      const encrypted = await encryptDirectEnvelopeBody(env, env.body, pubkey)
+      env.body = encrypted.body
+      env.enc = encrypted.enc
+      return { ok: true, encrypted: true }
+    } catch (e) {
+      log('warn', 'a2a_direct_encrypt_failed', { to: target, ...errFields(e) })
+      return { ok: false, error: 'direct_encryption_failed', detail: e instanceof Error ? e.message : String(e) }
+    }
+  }
+
   private async send(args: Record<string, any>): Promise<any> {
     const v = validateSendArgs(args, { agentId: this.agentId, maxSendBytes: this.maxSendBytes }) // V2–V6
     if ('error' in v) { this.counters.rejected++; return this.result({ ok: false, error: v.error }, true) }
@@ -1288,6 +1566,13 @@ export class A2AChannel {
     if (v.type === 'reply') env.corr = String(args.corr)
     if (args.ttl_ms != null) env.ttl_ms = Number(args.ttl_ms)
     if (args.attrs) env.attrs = args.attrs as Record<string, string>
+    if (!v.isTopic) {
+      const enc = await this.maybeEncryptDirectEnvelope(env, v.target)
+      if (!enc.ok) {
+        this.counters.rejected++
+        return this.result({ ok: false, error: enc.error, ...(enc.detail ? { detail: enc.detail } : {}) }, true)
+      }
+    }
     // Sign: core-signs with the own key, OR delegate to the external signer (shim-signs, Q2)
     // — externalSign gets the canonical string and returns a sig valid under this.sigAlg.
     // A delegated signer is out-of-process (the shim): bound it with a timeout and convert a
@@ -1309,8 +1594,8 @@ export class A2AChannel {
       const payload = new TextEncoder().encode(JSON.stringify(env))
       const r = await this.publishA2A(subject, payload, !v.isTopic, env.id) // V9
       this.counters.sent++
-      log('debug', 'a2a_sent', { id: env.id, subject, mode: v.isTopic ? 'core' : 'jetstream' })
-      return this.result({ ok: true, id: env.id, subject, mode: v.isTopic ? 'core' : 'jetstream', ...(r.seq != null ? { seq: r.seq } : {}) })
+      log('debug', 'a2a_sent', { id: env.id, subject, mode: v.isTopic ? 'core' : 'jetstream', encrypted: !!env.enc })
+      return this.result({ ok: true, id: env.id, subject, mode: v.isTopic ? 'core' : 'jetstream', ...(r.seq != null ? { seq: r.seq } : {}), ...(env.enc ? { encrypted: true, enc_alg: env.enc.alg } : {}) })
     } catch (e) {
       if (e instanceof A2ADenied) { this.counters.denied++; log('error', 'a2a_publish_denied', { subject }); return this.result({ ok: false, error: 'subject_denied' }, true) }
       this.counters.rejected++; log('warn', 'a2a_send_failed', { subject, ...errFields(e) })
@@ -1535,6 +1820,20 @@ export class A2AChannel {
       if (env.to !== `topic:${topic}`) { this.counters.misroute++; log('warn', 'a2a_misroute', { to: env.to, from: env.from, subject }); return true }
     }
 
+    if (env.enc) {
+      if (kind !== 'direct') { this.counters.mal++; log('warn', 'a2a_malformed', { subject, reason: 'encrypted_topic' }); return true }
+      if (!this.ownEd25519Seed) { this.counters.decryptfail++; log('warn', 'a2a_direct_decrypt_failed', { from: env.from, subject, reason: 'no_local_seed' }); return true }
+      try {
+        const plaintext = await decryptDirectEnvelopeBody(env, this.ownEd25519Seed)
+        env = { ...env, body: plaintext }
+        delete env.enc
+      } catch (e) {
+        this.counters.decryptfail++
+        log('warn', 'a2a_direct_decrypt_failed', { from: env.from, subject, ...errFields(e) })
+        return true
+      }
+    }
+
     // optional inbox storm backstop
     if (kind === 'direct' && this.inboxGate && !this.inboxGate()) { log('debug', 'a2a_inbox_throttled', { from: env.from }); return true }
 
@@ -1672,6 +1971,7 @@ export class A2AChannel {
     // Release our presence key (token-guarded so we never delete a successor's)
     // whenever we claimed it — even if a later start() step failed before
     // `started` flipped, so a partial start still cleans up.
+    if (this.directEncCapable && this.redis) { try { await this.releaseDirectEncryptionCapability() } catch {} this.directEncCapable = false }
     if (this.presenceClaimed && this.redis) { try { await this.releasePresence() } catch {} this.presenceClaimed = false }
     // Conns: drain/close ONLY what WE opened. A shared (core-injected) NATS/Redis is
     // owned by the a2a-core and MUST outlive this session — stopping one of N sessions

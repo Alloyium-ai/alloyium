@@ -6,7 +6,7 @@
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
-import { A2AChannel, type A2AChannelOpts, signEnvelope, signCanonical, inboxSubject, type Envelope, type VerifyKey } from '../a2a-channel.ts'
+import { A2AChannel, DIRECT_ENC_ALG, type A2AChannelOpts, signEnvelope, signCanonical, inboxSubject, type Envelope, type VerifyKey, encryptDirectEnvelopeBody } from '../a2a-channel.ts'
 import { requireBus } from './_require_bus.ts'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -55,13 +55,19 @@ async function startChannel(agentId: string, extra: Partial<A2AChannelOpts> = {}
 }
 
 // Provision an ed25519 keypair: publish the raw pubkey (base64) to Redis under
-// the sender's id, return the private CryptoKey to hand to the signing channel.
-async function provisionEd25519(agentId: string): Promise<CryptoKey> {
+// the sender's id, return private material for signing and optional direct decrypt.
+async function provisionEd25519Material(agentId: string): Promise<{ privateKey: CryptoKey; seed: Uint8Array; pubB64: string }> {
   const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as CryptoKeyPair
   const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey))
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey))
+  const seed = pkcs8.slice(pkcs8.length - 32)
   const key = `alloyium:a2a:pubkey:${agentId}`
-  await redis.set(key, Buffer.from(rawPub).toString('base64')); redisKeys.push(key)
-  return kp.privateKey
+  const pubB64 = Buffer.from(rawPub).toString('base64')
+  await redis.set(key, pubB64); redisKeys.push(key)
+  return { privateKey: kp.privateKey, seed, pubB64 }
+}
+async function provisionEd25519(agentId: string): Promise<CryptoKey> {
+  return (await provisionEd25519Material(agentId)).privateKey
 }
 async function provisionHmac(agentId: string, secret: string): Promise<string> {
   const key = `alloyium:a2a:secret:${agentId}`
@@ -86,6 +92,17 @@ async function rawPublishInbox(fleet: Fleet, toId: string, env: Partial<Envelope
   const js = probe.jetstream()
   const data = env._raw != null ? env._raw : JSON.stringify(env)
   await js.publish(inboxSubject(fleet.prefix, toId), new TextEncoder().encode(data), {})
+}
+async function captureNextInboxEnvelope(fleet: Fleet, toId: string): Promise<any> {
+  const sub = probe.subscribe(inboxSubject(fleet.prefix, toId))
+  try {
+    for await (const m of sub) {
+      sub.unsubscribe()
+      return JSON.parse(Buffer.from(m.data).toString('utf8'))
+    }
+  } finally {
+    try { sub.unsubscribe() } catch {}
+  }
 }
 function mkEnv(from: string, to: string, over: Partial<Envelope> = {}): Envelope {
   return { v: 1, id: crypto.randomUUID(), from, to, type: 'msg', ts: new Date().toISOString(), body: 'x', ...over }
@@ -163,6 +180,51 @@ describe.skipIf(!available)('A2A receive path (P4)', () => {
     expect(r.ok).toBe(true)
     expect(await waitFor(() => rb.length > 0)).toBe(true)
     expect(rb[0]).toMatchObject({ feed: 'a2a', kind: 'direct', from: A, type: 'request', content: 'hello' })
+  }, 35_000)
+
+  test('IT-ENC1 — capable signed direct send is encrypted on the bus and plaintext after delivery', async () => {
+    const f = newFleet(); const A = `enc1s-${uid}`, B = `enc1r-${uid}`
+    const ma = await provisionEd25519Material(A); const mb = await provisionEd25519Material(B)
+    const rb: Rec[] = []
+    const { ch: chB } = await startChannel(B, { ...signed(mb.privateKey), signingSeed: mb.seed }, rb, f)
+    const { ch: chA } = await startChannel(A, { ...signed(ma.privateKey), signingSeed: ma.seed }, [], f)
+    const rawP = Promise.race([
+      captureNextInboxEnvelope(f, B),
+      Bun.sleep(8000).then(() => { throw new Error('timed out waiting for raw encrypted envelope') }),
+    ])
+    await Bun.sleep(50)
+    const sent = parseToolResult(await chA.callTool('a2a_send', { to: B, body: 'encrypt-me', type: 'request', thread: 'enc-thread' }))
+    expect(sent).toMatchObject({ ok: true, encrypted: true, enc_alg: DIRECT_ENC_ALG })
+    const raw = await rawP
+    expect(raw.enc).toMatchObject({ alg: DIRECT_ENC_ALG })
+    expect(raw.body).not.toBe('encrypt-me')
+    expect(await waitFor(() => rb.some((m) => m.content === 'encrypt-me'))).toBe(true)
+    const listed = parseToolResult(await chB.callTool('a2a-inbox-messages', { action: 'list', thread: 'enc-thread' }))
+    expect(listed.messages[0]).toMatchObject({ body: 'encrypt-me', from: A, to: B, thread: 'enc-thread' })
+  }, 45_000)
+
+  test('IT-ENC2 — required mode refuses direct send when the recipient lacks encryption capability', async () => {
+    const f = newFleet(); const A = `enc2s-${uid}`, B = `enc2r-${uid}`
+    const ma = await provisionEd25519Material(A)
+    const { ch: chA } = await startChannel(A, { ...signed(ma.privateKey), signingSeed: ma.seed, directEncryption: 'required' }, [], f)
+    const sent = parseToolResult(await chA.callTool('a2a_send', { to: B, body: 'must-encrypt' }))
+    expect(sent).toMatchObject({ ok: false, error: 'direct_encryption_unavailable' })
+  }, 35_000)
+
+  test('IT-ENC3 — encrypted direct message for the wrong recipient is dropped after signature verification', async () => {
+    const f = newFleet(); const A = `enc3s-${uid}`, B = `enc3r-${uid}`, C = `enc3c-${uid}`
+    const ma = await provisionEd25519Material(A); const mb = await provisionEd25519Material(B); const mc = await provisionEd25519Material(C)
+    const rb: Rec[] = []
+    const { ch: chB } = await startChannel(B, { ...signed(mb.privateKey), signingSeed: mb.seed }, rb, f)
+    const env = mkEnv(A, B, { body: 'wrong-recipient', alg: 'ed25519' })
+    const encrypted = await encryptDirectEnvelopeBody(env, env.body, mc.pubB64)
+    env.body = encrypted.body
+    env.enc = encrypted.enc
+    env.sig = await signEnvelope(env, 'ed25519', ma.privateKey)
+    await rawPublishInbox(f, B, env)
+    await Bun.sleep(900)
+    expect(rb.some((m) => m.content === 'wrong-recipient')).toBe(false)
+    expect(chB.counts().decryptfail).toBeGreaterThanOrEqual(1)
   }, 35_000)
 
   test('IT-A2 — a message sent while the peer is offline is delivered when it starts', async () => {

@@ -6,6 +6,8 @@ import {
   importEd25519Seed, importEd25519Pub, type Envelope,
   validateSendArgs, TokenBucket, inboxSubject, topicSubject, assertA2ASubject,
   buildA2AAttrs, isValidInbound,
+  DIRECT_ENC_ALG, decryptDirectEnvelopeBody, ed25519PublicToX25519Raw,
+  encryptDirectEnvelopeBody, importX25519PrivateFromEd25519Seed,
 } from '../a2a-channel.ts'
 
 const base = (over: Partial<Envelope> = {}): Envelope => ({
@@ -27,12 +29,59 @@ describe('canonical serialization (§6.3)', () => {
     expect(a).toBe(b)
     expect(a).toBe(canonical(base()))
   })
+  test('encrypted metadata extends canonical form without changing plaintext envelopes', () => {
+    const plain = canonical(base())
+    const enc = canonical(base({
+      body: 'ciphertext',
+      enc: {
+        alg: DIRECT_ENC_ALG,
+        kid: 'kid',
+        epk: Buffer.from(new Uint8Array(32)).toString('base64'),
+        salt: Buffer.from(new Uint8Array(16)).toString('base64'),
+        iv: Buffer.from(new Uint8Array(12)).toString('base64'),
+      },
+    }))
+    expect(plain).toBe('1|id1|scout-1|analyst-2|msg||2026-06-12T17:05:00Z||hello')
+    expect(enc).not.toBe(plain)
+    expect(enc).toContain(DIRECT_ENC_ALG)
+  })
   test('body containing | and \\ is escaped so it cannot forge a field boundary', () => {
     // body = a | b \ c
     const c = canonical(base({ body: 'a|b\\c' }))
     expect(c.endsWith('a\\|b\\\\c')).toBe(true)
     // the only UNescaped '|' are the 8 field separators
     expect(c.replace(/\\\|/g, '').replace(/\\\\/g, '').split('|').length - 1).toBe(8)
+  })
+})
+
+describe('direct encryption helpers', () => {
+  async function freshMaterial() {
+    const kp = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as CryptoKeyPair
+    const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey))
+    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey))
+    const seed = pkcs8.slice(pkcs8.length - 32)
+    return { rawPub, seed, pubB64: Buffer.from(rawPub).toString('base64') }
+  }
+
+  test('ed25519 seed/public conversion agrees over X25519', async () => {
+    const m = await freshMaterial()
+    const staticPriv = await importX25519PrivateFromEd25519Seed(m.seed)
+    const staticPub = await crypto.subtle.importKey('raw', ed25519PublicToX25519Raw(m.rawPub), { name: 'X25519' }, false, [])
+    const eph = await crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']) as CryptoKeyPair
+    const a = new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: staticPub }, eph.privateKey, 256))
+    const ephPub = await crypto.subtle.importKey('raw', new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey)), { name: 'X25519' }, false, [])
+    const b = new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: ephPub }, staticPriv, 256))
+    expect(Buffer.from(a).equals(Buffer.from(b))).toBe(true)
+  })
+
+  test('encrypt/decrypt direct body and bind metadata with AES-GCM AAD', async () => {
+    const recipient = await freshMaterial()
+    const env = base({ id: 'enc-1', from: 'scout-1', to: 'analyst-2', thread: 'T', attrs: { z: 'last', a: 'first' } })
+    const encrypted = await encryptDirectEnvelopeBody(env, env.body, recipient.pubB64)
+    const wire = { ...env, body: encrypted.body, enc: encrypted.enc }
+    expect(wire.body).not.toBe('hello')
+    expect(await decryptDirectEnvelopeBody(wire, recipient.seed)).toBe('hello')
+    await expect(decryptDirectEnvelopeBody({ ...wire, thread: 'T2' }, recipient.seed)).rejects.toThrow()
   })
 })
 

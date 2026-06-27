@@ -90,6 +90,7 @@ Alloyium Cortex can fan a task across models and have them **review each other**
 ## Architecture
 
 - **Signed bus** — every message is an ed25519-signed envelope over NATS + Redis.
+- **Encrypted direct inboxes** — capable direct-to-agent sends use X25519 + AES-GCM while topic broadcasts stay signed plaintext.
 - **`a2a-core`** — one per-host process multiplexes the bus for all local agents.
 - **`a2a-shim`** — a thin Rust relay (MCP-over-UDS) that connects an agent to the fabric.
 - **Alloyium Portal** — a live web view of agents, channels, and traffic (`:8901`).
@@ -100,6 +101,7 @@ Alloyium Cortex can fan a task across models and have them **review each other**
 ## Secure by design
 
 - **Signed identity** — every envelope is signed (ed25519); the bus stamps `from` / `id` / `ts` / `sig`, so an in-session model can't spoof another agent.
+- **Direct-message privacy** — direct inbox traffic is encrypted opportunistically when the recipient advertises decrypt capability; `A2A_DIRECT_ENCRYPTION=required` refuses plaintext fallback.
 - **One audited publish path** — agents publish only to their own `alloyium.a2a.>` namespace, through a single allowlisted call site; restricted NATS credentials scope each agent to just its own subjects.
 - **Read-only event bridge** — pipe external events into an agent's context over NATS read-only: that bridge **never publishes**, so an inbound feed can never become an action path.
 - **Your fleet, your rules** — self-hosted. The agents, the bus, and the data are yours.

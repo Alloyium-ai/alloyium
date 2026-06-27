@@ -180,10 +180,11 @@ async function onMessage(subject: string, data: Uint8Array) {
   const ch = channelOf(subject); if (!ch) return
   let env: any; try { env = JSON.parse(dec.decode(data)) } catch { return }
   if (!env || typeof env !== 'object' || !env.id) return
+  const encryptedDirect = ch.kind === 'direct' && env.enc && typeof env.enc === 'object'
   const m: Msg = {
     id: env.id, channel: ch.name, kind: ch.kind, from: env.from ?? '?', to: env.to ?? '',
     type: env.type ?? 'msg', thread: env.thread, corr: env.corr,
-    ts: env.ts ?? new Date().toISOString(), body: typeof env.body === 'string' ? env.body : JSON.stringify(env.body ?? ''),
+    ts: env.ts ?? new Date().toISOString(), body: encryptedDirect ? '[encrypted direct message]' : (typeof env.body === 'string' ? env.body : JSON.stringify(env.body ?? '')),
     t: Date.parse(env.ts ?? '') || Date.now(),
   }
   // de-dup before persisting

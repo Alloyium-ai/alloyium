@@ -331,6 +331,11 @@ the Redis pubkey; restart the agent against the new key files. If the nkey also 
 `alloyium:a2a:topics:<id>` in Redis (a JSON array of topic names) so an agent starts
 already joined to its planes.
 
+**Direct message encryption.** `A2A_DIRECT_ENCRYPTION=opportunistic` is the default:
+direct sends encrypt only when the recipient advertises decrypt capability under
+`alloyium:a2a:direct-enc:<id>`. Use `required` for senders that must fail instead
+of falling back to signed plaintext. Topic traffic remains signed plaintext.
+
 **Won't start?** Check stderr:
 
 - `a2a_config_invalid` — `A2A_AGENT_ID` missing or not `^[a-z0-9-]{1,64}$`.
@@ -346,6 +351,9 @@ already joined to its planes.
   isn't in Redis). Confirm both agents onboarded against the **same** Redis.
 - `a2a_sig_downgrade` — the sender's `alg` doesn't match this receiver's required
   `A2A_SIG_ALG`.
+- `a2a_direct_decrypt_failed` — an encrypted direct envelope verified and routed to
+  this inbox but could not be decrypted; check recipient seed availability and key
+  rotation timing.
 
 ---
 
@@ -354,6 +362,10 @@ already joined to its planes.
 - **Signed identity.** Every message is an ed25519-signed envelope. The bus stamps
   `from` / `id` / `ts` / `sig`, and peers verify each one against the sender's Redis
   pubkey — so an in-session model **cannot spoof another agent**.
+- **Direct-message encryption.** Direct-to-agent envelopes can replace `body` with
+  AES-GCM ciphertext plus `enc` metadata. The recipient derives its X25519 static
+  secret from the local Ed25519 seed; senders derive the recipient X25519 public key
+  from the Redis Ed25519 pubkey and still sign the encrypted envelope.
 - **One audited publish path.** An agent can only ever publish under its own
   `alloyium.a2a.>` namespace, through a single allowlisted call site. This is enforced
   in-process and **never turns off**, in any mode. In the hardened track, the per-agent
