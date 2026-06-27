@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, normalizePortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexEndpointRecipient, isCodexJobRecipient, isCodexRealtimeRecipient, isSelfPortalRecipient, normalizePortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest } from '../a2a_portal_send.ts'
 
 describe('a2a portal send helpers', () => {
   test('normalizes dm and topic recipients from UI notation', () => {
@@ -61,41 +61,53 @@ describe('a2a portal send helpers', () => {
     const body = JSON.stringify({ schema: 'codex.job.request.v1', job_id: 'existing' })
     expect(wrapPlainCodexRequest({ to: 'codex-gw', type: 'request', body }, 'job-2').body).toBe(body)
     expect(wrapPlainCodexRequest({ to: 'agent-1', type: 'request', body: 'say hi' }, 'job-3').body).toBe('say hi')
+    expect(wrapPlainCodexRequest({ to: 'codex-rt-host-gw-e2e-gpubox', type: 'request', body: 'say hi' }, 'job-rt').body).toBe('say hi')
   })
 
   test('wraps chat-mode codex requests in the realtime session contract', () => {
     const wrapped = wrapPlainCodexRealtimeInput(
-      { to: 'codex-gw', type: 'request', body: 'say hi' },
+      { to: 'codex-rt-gw', type: 'request', body: 'say hi' },
       {
-        sessionId: 'portal:chat:a2a-portal:codex-gw',
-        threadKey: 'portal:chat:a2a-portal:codex-gw',
+        sessionId: 'portal:chat:a2a-portal:codex-rt-gw',
+        threadKey: 'portal:chat:a2a-portal:codex-rt-gw',
         cwd: '/app',
-        streamTopic: 'portal-rt-a2a-portal-codex-gw',
+        streamTopic: 'portal-rt-a2a-portal-codex-rt-gw',
       },
     )
-    expect(wrapped.to).toBe('codex-gw')
+    expect(wrapped.to).toBe('codex-rt-gw')
     expect(wrapped.type).toBe('request')
     expect(JSON.parse(wrapped.body)).toMatchObject({
       schema: 'codex.session.input.v1',
-      session_id: 'portal:chat:a2a-portal:codex-gw',
-      thread_key: 'portal:chat:a2a-portal:codex-gw',
+      session_id: 'portal:chat:a2a-portal:codex-rt-gw',
+      thread_key: 'portal:chat:a2a-portal:codex-rt-gw',
       input: [{ type: 'text', text: 'say hi' }],
       mode: 'auto',
       sandbox: 'read-only',
       approval_policy: 'never',
       cwd: '/app',
-      stream_topic: 'portal-rt-a2a-portal-codex-gw',
+      stream_topic: 'portal-rt-a2a-portal-codex-rt-gw',
     })
 
     const existing = JSON.stringify({ schema: 'codex.turn.steer.v1', session_id: 's1', text: 'follow up' })
-    expect(wrapPlainCodexRealtimeInput({ to: 'codex-gw', type: 'request', body: existing }, { sessionId: 's1' }).body).toBe(existing)
+    expect(wrapPlainCodexRealtimeInput({ to: 'codex-rt-gw', type: 'request', body: existing }, { sessionId: 's1' }).body).toBe(existing)
     expect(wrapPlainCodexRealtimeInput({ to: 'agent-1', type: 'request', body: 'say hi' }, { sessionId: 's1' }).body).toBe('say hi')
-    expect(wrapPlainCodexRealtimeInput({ to: 'codex-gw', type: 'request', body: 'say hi' }).body).toBe('say hi')
+    expect(wrapPlainCodexRealtimeInput({ to: 'codex-gw', type: 'request', body: 'say hi' }, { sessionId: 's1' }).body).toBe('say hi')
+    expect(JSON.parse(wrapPlainCodexRealtimeInput(
+      { to: 'codex-rt-host-gw-e2e-gpubox', type: 'request', body: 'say hi' },
+      { sessionId: 'portal:chat:a2a-portal:codex-rt-host-gw-e2e-gpubox' },
+    ).body)).toMatchObject({
+      schema: 'codex.session.input.v1',
+      session_id: 'portal:chat:a2a-portal:codex-rt-host-gw-e2e-gpubox',
+    })
   })
 
   test('classifies codex job recipients separately from direct claude peers', () => {
     expect(isCodexJobRecipient('codex-gw')).toBe(true)
     expect(isCodexJobRecipient('host-ops-gw-1')).toBe(true)
+    expect(isCodexJobRecipient('codex-rt-host-gw-e2e-gpubox')).toBe(false)
+    expect(isCodexRealtimeRecipient('codex-rt-gw')).toBe(true)
+    expect(isCodexRealtimeRecipient('codex-rt-host-gw-e2e-gpubox')).toBe(true)
+    expect(isCodexEndpointRecipient('codex-rt-host-gw-e2e-gpubox')).toBe(true)
     expect(isCodexJobRecipient('agent-1')).toBe(false)
   })
 
@@ -126,6 +138,8 @@ describe('a2a portal send helpers', () => {
       .toBe('portal:chat:a2a-portal:host-ops-gw:c-reset-01')
     expect(buildPortalThreadKey({ to: 'host-ops-gw-1', type: 'request', body: 'x' }, 'a2a-portal', 'chat'))
       .toBe('portal:chat:a2a-portal:host-ops-gw-1')
+    expect(buildPortalThreadKey({ to: 'codex-rt-host-gw-e2e-gpubox', type: 'request', body: 'x' }, 'a2a-portal', 'chat'))
+      .toBe('portal:chat:a2a-portal:codex-rt-host-gw-e2e-gpubox')
     expect(buildPortalThreadKey({ to: 'codex-gw-sub-bus-test-abc123', type: 'request', body: 'x' }, 'a2a-portal', 'chat'))
       .toBe('portal:chat:a2a-portal:codex-gw-sub-bus-test-abc123')
     expect(buildPortalThreadKey({ to: 'host-ops-gw', type: 'request', body: 'x' }, 'a2a-portal', 'one-off')).toBeNull()
@@ -147,6 +161,8 @@ describe('a2a portal send helpers', () => {
     expect(buildPortalDefaultCwd({ to: 'host-ops-gw-1', type: 'request', body: 'x' }, 'chat', { remoteHostOpsCwd: '/remote/repo' }))
       .toBe('/remote/repo')
     expect(buildPortalDefaultCwd({ to: 'codex-gw', type: 'request', body: 'x' }, 'chat'))
+      .toBe('/app')
+    expect(buildPortalDefaultCwd({ to: 'codex-rt-host-gw-e2e-gpubox', type: 'request', body: 'x' }, 'chat'))
       .toBe('/app')
     expect(buildPortalDefaultCwd({ to: 'codex-gw-sub-bus-test-abc123', type: 'request', body: 'x' }, 'chat'))
       .toBe('/app')

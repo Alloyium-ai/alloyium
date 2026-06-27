@@ -13,7 +13,7 @@ import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
 import { randomUUID } from 'node:crypto'
 import { A2AChannel } from './a2a-channel.ts'
-import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexJobRecipient, isSelfPortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
+import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendArgs, buildPortalThreadKey, formatPortalRenderedBody, isCodexEndpointRecipient, isSelfPortalRecipient, routePortalCodexTarget, wrapPlainCodexRealtimeInput, wrapPlainCodexRequest, type PortalSendBuildResult } from './a2a_portal_send.ts'
 import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
@@ -284,7 +284,7 @@ type DeliveryWait =
 
 function shouldSerializeInteractiveSend(built: Extract<PortalSendBuildResult, { ok: true }>): boolean {
   const args = built.args
-  return built.sendMode === 'chat' && args.type === 'request' && !args.to.startsWith('topic:') && !isCodexJobRecipient(args.to)
+  return built.sendMode === 'chat' && args.type === 'request' && !args.to.startsWith('topic:') && !isCodexEndpointRecipient(args.to)
 }
 
 async function withInteractiveSendQueue<T>(target: string, fn: () => Promise<T>): Promise<T> {

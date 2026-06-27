@@ -90,6 +90,12 @@ Portal and service routing should become explicit:
   `codex-gw`.
 - Direct A2A clients may still target either role with the canonical schema for that
   role.
+- Job dispatchers must not fan out `codex.job.request.v1` to `codex-rt-*` peers.
+  `codex-rt-*` denotes a session-only endpoint unless explicitly configured otherwise;
+  batch jobs should target `codex-gw`, `host-ops-gw*`, `codex-gw-sub-*`, or another
+  non-`codex-rt-*` job-capable peer.
+- A `codex.job.rejected.v1` reply with `reason=unsupported_schema_for_role` and
+  `detail=role=session` is a routing error at the sender, not a receiver failure.
 
 Suggested portal env:
 

@@ -21,10 +21,13 @@ export type PortalSendBuildResult =
 
 const SEND_TYPES = new Set<PortalSendType>(['msg', 'request', 'reply'])
 const SEND_MODES = new Set<PortalSendMode>(['chat', 'one-off'])
+const CODEX_REALTIME_RECIPIENTS = [
+  /^codex-rt(?:-[a-z0-9-]+)?$/,
+]
 const CODEX_JOB_RECIPIENTS = [
   /^codex-gw(?:-\d+)?$/,
-  /^codex-[a-z0-9-]+$/,
   /^codex-gw-sub-[a-z0-9-]+$/,
+  /^codex-(?!rt(?:-|$))[a-z0-9-]+$/,
   /^host-ops-gw(?:-[a-z0-9-]+)?$/,
 ]
 const HOST_OPS_RE = /^host-ops-gw(?:-[a-z0-9-]+)?$/
@@ -106,7 +109,7 @@ export function wrapPlainCodexRequest(args: PortalSendArgs, jobId: string, opts:
 }
 
 export function wrapPlainCodexRealtimeInput(args: PortalSendArgs, opts: { sessionId?: string | null; threadKey?: string | null; cwd?: string | null; streamTopic?: string | null } = {}): PortalSendArgs {
-  if (args.type !== 'request' || !isCodexJobRecipient(args.to) || isJsonObjectWithCodexSchema(args.body)) return args
+  if (args.type !== 'request' || !isCodexRealtimeRecipient(args.to) || isJsonObjectWithCodexSchema(args.body)) return args
   const sessionId = opts.sessionId || opts.threadKey
   if (!sessionId) return args
   return {
@@ -142,7 +145,7 @@ export function buildPortalDefaultCwd(
   sendMode: PortalSendMode,
   opts: { hostOpsCwd?: string; remoteHostOpsCwd?: string; codexCwd?: string; oneOffCwd?: string } = {},
 ): string | null {
-  if (args.type !== 'request' || !isCodexJobRecipient(args.to)) return null
+  if (args.type !== 'request' || !isCodexEndpointRecipient(args.to)) return null
   if (sendMode !== 'chat') return normalizeCwd(opts.oneOffCwd) ?? '/tmp'
   if (LOCAL_HOST_OPS_RE.test(args.to)) return normalizeCwd(opts.hostOpsCwd) ?? '/srv/git/alloyium'
   if (HOST_OPS_RE.test(args.to)) return normalizeCwd(opts.remoteHostOpsCwd) ?? '/srv/remote/alloyium'
@@ -150,7 +153,7 @@ export function buildPortalDefaultCwd(
 }
 
 export function buildPortalThreadKey(args: PortalSendArgs, portalAgentId: string, sendMode: PortalSendMode, opts: { chatContext?: string | null } = {}): string | null {
-  if (sendMode !== 'chat' || args.type !== 'request' || !isCodexJobRecipient(args.to)) return null
+  if (sendMode !== 'chat' || args.type !== 'request' || !isCodexEndpointRecipient(args.to)) return null
   const self = normalizeThreadKeyPart(portalAgentId)
   const target = normalizeThreadKeyPart(args.to)
   if (!self || !target) return null
@@ -198,6 +201,14 @@ function normalizeCwd(value: unknown): string | null {
 
 export function isCodexJobRecipient(agentId: string): boolean {
   return CODEX_JOB_RECIPIENTS.some((re) => re.test(agentId))
+}
+
+export function isCodexRealtimeRecipient(agentId: string): boolean {
+  return CODEX_REALTIME_RECIPIENTS.some((re) => re.test(agentId))
+}
+
+export function isCodexEndpointRecipient(agentId: string): boolean {
+  return isCodexJobRecipient(agentId) || isCodexRealtimeRecipient(agentId)
 }
 
 function isJsonObjectWithSchema(text: string, schema: string): boolean {
