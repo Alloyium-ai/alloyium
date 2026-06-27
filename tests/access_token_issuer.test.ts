@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import {
+  ACCESS_TOKEN_REQUEST_DOMAIN,
   AccessTokenIssuer,
   AccessTokenIssuerTools,
   canonicalAccessIssuerRequest,
@@ -120,6 +121,22 @@ describe('AccessTokenIssuerTools', () => {
   })
 })
 
+describe('canonical access request encoding', () => {
+  test('uses a domain-separated pipe encoding with escaped fields', () => {
+    const canonical = canonicalAccessIssuerRequest({
+      agent_id: 'agent-a',
+      expiry: '2026-06-27T14:10:00.000Z',
+      issued_at: '2026-06-27T14:00:00.000Z',
+      nonce: 'abc_123',
+      requested_scope: String.raw`vault:path:team/a|b\c:read`,
+    })
+
+    expect(canonical).toBe(
+      String.raw`${ACCESS_TOKEN_REQUEST_DOMAIN}|agent-a|2026-06-27T14:10:00.000Z|2026-06-27T14:00:00.000Z|abc_123|vault:path:team/a\|b\\c:read`,
+    )
+  })
+})
+
 describe('access scope policy matching', () => {
   test('supports bounded wildcards for numeric ids, repos, Vault paths, and branches', () => {
     expect(scopeMatchesPolicy('taskboard:project:*:read', 'taskboard:project:13:read')).toBe(true)
@@ -128,6 +145,35 @@ describe('access scope policy matching', () => {
     expect(scopeMatchesPolicy('vault:path:team/*:read', 'vault:path:team/alpha:read')).toBe(true)
     expect(scopeMatchesPolicy('forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/*', 'forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/feature')).toBe(true)
     expect(scopeMatchesPolicy('forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/*', 'forgejo:repo:Alloyium-ai/alloyium:branch:push:main')).toBe(false)
+  })
+})
+
+describe('access role policy evaluation', () => {
+  test('allows scopes through reusable roles assigned to an agent', async () => {
+    const f = await fixture()
+    const issuer = new AccessTokenIssuer({
+      registry: f.registry,
+      store: f.store,
+      policy: {
+        defaults: { max_ttl_sec: 900 },
+        roles: {
+          developer: {
+            scopes: ['forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/*'],
+            max_ttl_sec: 600,
+          },
+        },
+        agent_roles: { 'agent-a': ['developer'] },
+      },
+      nowMs: () => NOW,
+      genLeaseId: () => 'lease-role',
+    })
+    const req = await signedRequest(f.privateKey, {
+      requested_scope: 'forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/role-policy',
+    })
+
+    const res = await issuer.issue(req)
+
+    expect(res).toMatchObject({ ok: true, lease_id: 'lease-role' })
   })
 })
 
@@ -155,6 +201,8 @@ describe('AccessTokenIssuer', () => {
       reason: 'allowed',
       lease_id: 'lease-0001',
       ttl_sec: 600,
+      lifecycle: 'brokered',
+      revocable: false,
       runtime_id: 'test-runtime',
     })
   })
@@ -292,6 +340,31 @@ describe('AccessTokenIssuer', () => {
     const res = await f.issuer.issue(req)
 
     expect(res).toEqual({ ok: false, error: 'scope_denied' })
+    expect(f.store.audits[0]).toMatchObject({ decision: 'deny', reason: 'scope_denied' })
+  })
+
+  test('Forgejo merge scope is refused by the general issuer even if policy grants it', async () => {
+    const f = await fixture()
+    const issuer = new AccessTokenIssuer({
+      registry: f.registry,
+      store: f.store,
+      policy: {
+        defaults: { max_ttl_sec: 900 },
+        agents: {
+          'agent-a': ['forgejo:repo:Alloyium-ai/alloyium:pr:merge'],
+        },
+      },
+      nowMs: () => NOW,
+      genLeaseId: () => 'lease-merge',
+    })
+    const req = await signedRequest(f.privateKey, {
+      requested_scope: 'forgejo:repo:Alloyium-ai/alloyium:pr:merge',
+    })
+
+    const res = await issuer.issue(req)
+
+    expect(res).toEqual({ ok: false, error: 'scope_denied' })
+    expect(f.store.leases).toHaveLength(0)
     expect(f.store.audits[0]).toMatchObject({ decision: 'deny', reason: 'scope_denied' })
   })
 })

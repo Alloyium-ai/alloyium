@@ -7,10 +7,12 @@ It does not return raw credential material.
 
 ## Request
 
-The signed canonical payload is deterministic JSON with these fields in this order:
+The signed canonical payload is a domain-separated pipe string. Each field escapes
+`\` as `\\` and `|` as `\|`, then joins the fields in this exact order:
+domain, agent id, expiry, issued-at, nonce, requested scope.
 
-```json
-{"agent_id":"agent-a","expiry":"2026-06-27T14:10:00.000Z","issued_at":"2026-06-27T14:00:00.000Z","nonce":"base64url-128bit-min","requested_scope":"taskboard:project:13:read"}
+```text
+a2a-token-request:v1|agent-a|2026-06-27T14:10:00.000Z|2026-06-27T14:00:00.000Z|base64url-128bit-min|taskboard:project:13:read
 ```
 
 The tool input adds `signature`, a base64url ed25519 signature over that UTF-8
@@ -50,12 +52,30 @@ Example:
         "vault:path:team/*:read"
       ]
     }
+  },
+  "roles": {
+    "code-reviewer": {
+      "max_ttl_sec": 900,
+      "scopes": ["forgejo:repo:*/*:pr:review"]
+    }
+  },
+  "agent_roles": {
+    "agent-reviewer": ["code-reviewer"]
   }
 }
 ```
 
 Supported scope families are taskboard, Forgejo, and Vault only. Branch scopes
 reject unsafe branch names before policy matching.
+
+Forgejo merge scopes are intentionally refused by this general issuer even if a
+policy grants `forgejo:repo:<owner>/<repo>:pr:merge`. Foundation merges remain a
+trusted broker/host action after two distinct non-author approvals of the exact
+head SHA and any required security review.
+
+Successful responses are brokered lease references only. They include
+`lifecycle:"brokered"`, `revocable:false`, and an `expires_at_meaning` string so
+callers do not mistake issuer bookkeeping for downstream-enforced token expiry.
 
 ## Storage And Audit
 

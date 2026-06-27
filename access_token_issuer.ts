@@ -35,6 +35,8 @@ export type AccessIssueAuditRecord = {
   reason: AccessDecisionReason
   lease_id?: string
   ttl_sec?: number
+  lifecycle?: AccessLeaseLifecycle
+  revocable?: boolean
   request_hash: string
   nonce_hash?: string
   runtime_id?: string
@@ -47,6 +49,8 @@ export type AccessLeaseRecord = {
   issued_at: string
   expires_at: string
   ttl_sec: number
+  lifecycle: AccessLeaseLifecycle
+  revocable: boolean
   delivery: 'brokered'
 }
 
@@ -57,11 +61,15 @@ export type AccessPolicyAgentEntry =
       max_ttl_sec?: number
     }
 
+export type AccessLeaseLifecycle = 'brokered'
+
 export type AccessPolicy = {
   defaults?: {
     max_ttl_sec?: number
   }
   agents?: Record<string, AccessPolicyAgentEntry>
+  roles?: Record<string, AccessPolicyAgentEntry>
+  agent_roles?: Record<string, string[]>
 }
 
 export interface AccessIdentityRegistry {
@@ -107,12 +115,18 @@ const BASE64URL_RE = /^[A-Za-z0-9_-]+$/
 const POLICY_SCOPE_MAX = 512
 const enc = new TextEncoder()
 
+export const ACCESS_TOKEN_REQUEST_DOMAIN = 'a2a-token-request:v1'
 const REQUEST_CANONICAL_KEYS = ['agent_id', 'expiry', 'issued_at', 'nonce', 'requested_scope'] as const
 
 export function canonicalAccessIssuerRequest(req: Pick<AccessIssuerRequest, typeof REQUEST_CANONICAL_KEYS[number]>): string {
-  const canonical: Record<string, string> = {}
-  for (const key of REQUEST_CANONICAL_KEYS) canonical[key] = String(req[key])
-  return JSON.stringify(canonical)
+  return [
+    ACCESS_TOKEN_REQUEST_DOMAIN,
+    req.agent_id,
+    req.expiry,
+    req.issued_at,
+    req.nonce,
+    req.requested_scope,
+  ].map(escField).join('|')
 }
 
 export function accessIssuerRequestHash(canonicalRequest: string): string {
@@ -251,6 +265,7 @@ export class AccessTokenIssuer {
 
     const scopeValidation = validateRequestedScope(req.requested_scope)
     if (!scopeValidation.ok) return await this.deny(auditBase, 'scope_denied')
+    if (isForgejoMergeScope(req.requested_scope)) return await this.deny(auditBase, 'scope_denied')
 
     const requestedTtlSec = Math.ceil((expiryMs - issuedAtMs) / 1000)
     const policy = evaluatePolicy(this.opts.policy ?? {}, req.agent_id, req.requested_scope, requestedTtlSec)
@@ -259,6 +274,7 @@ export class AccessTokenIssuer {
     const ttlSec = Math.max(1, Math.ceil((expiryMs - this.nowMs()) / 1000))
     const leaseId = this.genLeaseId()
     const expiresAt = new Date(expiryMs).toISOString()
+    const lifecycle: AccessLeaseLifecycle = 'brokered'
     const lease: AccessLeaseRecord = {
       lease_id: leaseId,
       agent_id: req.agent_id,
@@ -266,6 +282,8 @@ export class AccessTokenIssuer {
       issued_at: new Date(this.nowMs()).toISOString(),
       expires_at: expiresAt,
       ttl_sec: ttlSec,
+      lifecycle,
+      revocable: false,
       delivery: 'brokered',
     }
 
@@ -277,6 +295,8 @@ export class AccessTokenIssuer {
         reason: 'allowed',
         lease_id: leaseId,
         ttl_sec: ttlSec,
+        lifecycle,
+        revocable: false,
       })
     } catch {
       return { ok: false, error: 'issuer_unavailable' }
@@ -287,6 +307,10 @@ export class AccessTokenIssuer {
       lease_id: leaseId,
       scope: req.requested_scope,
       expires_at: expiresAt,
+      lifecycle,
+      revocable: false,
+      granted_ttl_seconds: ttlSec,
+      expires_at_meaning: 'issuer lease bookkeeping only; downstream enforcement depends on the brokered scope',
       token_ref: `lease:${leaseId}`,
       delivery: 'brokered',
     }
@@ -355,8 +379,9 @@ export class AccessTokenIssuerTools {
         description:
           'Issue a short-lived brokered lease for taskboard, Forgejo, or Vault after ' +
           'verifying an ed25519 signature over the canonical request payload against ' +
-          'the A2A public identity registry. Deny-by-default; audits decisions without ' +
-          'raw token values.',
+          'the A2A public identity registry. General Forgejo merge leases are refused; ' +
+          'merge remains a review-gated host/broker action. Deny-by-default; audits ' +
+          'decisions without raw token values.',
         inputSchema: {
           type: 'object',
           additionalProperties: false,
@@ -369,7 +394,7 @@ export class AccessTokenIssuerTools {
             signature: {
               type: 'string',
               description:
-                'Base64url ed25519 signature over canonical JSON of agent_id, expiry, issued_at, nonce, and requested_scope.',
+                'Base64url ed25519 signature over the domain-separated canonical payload.',
             },
           },
           required: ['agent_id', 'requested_scope', 'nonce', 'issued_at', 'expiry', 'signature'],
@@ -416,13 +441,39 @@ function parseRequest(raw: Record<string, any>): { ok: true; req: AccessIssuerRe
 }
 
 function evaluatePolicy(policy: AccessPolicy, agentId: string, scope: string, requestedTtlSec: number): { ok: true } | { ok: false; reason: AccessDecisionReason } {
-  const entry = policy.agents?.[agentId]
-  if (!entry) return { ok: false, reason: 'scope_denied' }
-  const scopes = Array.isArray(entry) ? entry : Array.isArray(entry.scopes) ? entry.scopes : []
-  const maxTtlSec = Math.max(1, Number((Array.isArray(entry) ? undefined : entry.max_ttl_sec) ?? policy.defaults?.max_ttl_sec ?? DEFAULT_MAX_TTL_SEC) || DEFAULT_MAX_TTL_SEC)
-  if (!scopes.some((pattern) => scopeMatchesPolicy(String(pattern), scope))) return { ok: false, reason: 'scope_denied' }
-  if (requestedTtlSec > maxTtlSec) return { ok: false, reason: 'ttl_too_long' }
-  return { ok: true }
+  const entries = policyEntriesForAgent(policy, agentId)
+  if (!entries.length) return { ok: false, reason: 'scope_denied' }
+
+  let matchedScope = false
+  for (const entry of entries) {
+    const scopes = entryScopes(entry)
+    if (!scopes.some((pattern) => scopeMatchesPolicy(String(pattern), scope))) continue
+    matchedScope = true
+    if (requestedTtlSec <= entryMaxTtlSec(policy, entry)) return { ok: true }
+  }
+  return { ok: false, reason: matchedScope ? 'ttl_too_long' : 'scope_denied' }
+}
+
+function policyEntriesForAgent(policy: AccessPolicy, agentId: string): AccessPolicyAgentEntry[] {
+  const entries: AccessPolicyAgentEntry[] = []
+  const direct = policy.agents?.[agentId]
+  if (direct) entries.push(direct)
+  const roleNames = Array.isArray(policy.agent_roles?.[agentId]) ? policy.agent_roles![agentId] : []
+  for (const roleName of roleNames) {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(String(roleName))) continue
+    const role = policy.roles?.[String(roleName)]
+    if (role) entries.push(role)
+  }
+  return entries
+}
+
+function entryScopes(entry: AccessPolicyAgentEntry): string[] {
+  return Array.isArray(entry) ? entry : Array.isArray(entry.scopes) ? entry.scopes : []
+}
+
+function entryMaxTtlSec(policy: AccessPolicy, entry: AccessPolicyAgentEntry): number {
+  const raw = Array.isArray(entry) ? undefined : entry.max_ttl_sec
+  return Math.max(1, Number(raw ?? policy.defaults?.max_ttl_sec ?? DEFAULT_MAX_TTL_SEC) || DEFAULT_MAX_TTL_SEC)
 }
 
 function validateRequestedScope(scope: string): { ok: true } | { ok: false } {
@@ -443,6 +494,10 @@ function validateRequestedScope(scope: string): { ok: true } | { ok: false } {
   if (vault) return validLogicalPath(vault[1]) ? { ok: true } : { ok: false }
 
   return { ok: false }
+}
+
+function isForgejoMergeScope(scope: string): boolean {
+  return /^forgejo:repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:pr:merge$/.test(scope)
 }
 
 function isAllowedPolicyPattern(pattern: string): boolean {
@@ -507,8 +562,12 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+function escField(s: string): string {
+  return String(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
+}
+
 function str(v: unknown): string {
-  return typeof v === 'string' ? v.trim() : ''
+  return typeof v === 'string' ? v : ''
 }
 
 function redisTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
