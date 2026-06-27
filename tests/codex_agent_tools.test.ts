@@ -26,6 +26,7 @@ describe('codex A2A tool config', () => {
       kaiHttpUrl: 'http://kai:18789',
       kaiWsUrl: 'ws://kai:18789/ws',
       kaiTokenPath: '/run/secrets/kai-token',
+      requestedRoleScopes: '["forgejo:repo:Alloyium-ai/alloyium:pr:create"]',
       maxSendBytes: 8192,
       inheritEnvVars: ['KAI_TOKEN'],
     }))
@@ -38,6 +39,7 @@ describe('codex A2A tool config', () => {
     expect(cfg.get('mcp_servers.a2a_tools.env.A2A_SIGNING_KEY')).toBe('"/run/secrets/a2a/codex-gw.seed"')
     expect(cfg.get('mcp_servers.a2a_tools.env.BRAIN_URL')).toBe('"http://brain:8787"')
     expect(cfg.get('mcp_servers.a2a_tools.env.KAI_WS_URL')).toBe('"ws://kai:18789/ws"')
+    expect(cfg.get('mcp_servers.a2a_tools.env.A2A_REQUESTED_ROLE_SCOPES')).toBe('"[\\"forgejo:repo:Alloyium-ai/alloyium:pr:create\\"]"')
     expect(cfg.get('mcp_servers.a2a_tools.env_vars')).toBe('["KAI_TOKEN"]')
     expect(cfg.get('tools.request_user_input')).toBe('false')
   })

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildDefaultCodexCwdRoots, buildDockerContainerSpec, launcherRequestAuthorized, resolveCodexHostHome, resolveLaunchWorkspaceHostPath } from '../a2a_launcher.ts'
+import { buildCodexWriteAllowlist, buildDefaultCodexCwdRoots, buildDockerContainerSpec, launcherRequestAuthorized, resolveCodexHostHome, resolveLaunchWorkspaceHostPath, resolveLaunchWorktreeCwd } from '../a2a_launcher.ts'
 
 async function withEnv<T>(updates: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const old: Record<string, string | undefined> = {}
@@ -81,7 +81,6 @@ describe('a2a launcher docker provider', () => {
     expect(envList).toContain('CODEX_GW_EFFORT=medium')
     expect(envList).toContain('CODEX_GW_MODEL=gpt-5.5-codex')
     expect(envList).toContain('CODEX_GW_TURN_TIMEOUT_MS=300000')
-
     const hostConfig = spec.body.HostConfig as any
     expect(hostConfig.Binds).toEqual(expect.arrayContaining([
       'alloyium_a2a_secrets:/run/secrets/a2a:ro',
@@ -159,6 +158,42 @@ describe('a2a launcher docker provider', () => {
     expect(envList).toContain('CODEX_GW_ALLOW_WRITE=1')
     expect(envList).toContain('CODEX_GW_CODEX_SANDBOX=danger-full-access')
     expect(envList).toContain('CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX=workspace-write')
+  })
+
+  test('maps absolute worktree requests to a launched worker default cwd', () => {
+    expect(resolveLaunchWorktreeCwd('/host/work/repo@develop', '/host/work', '/workspace', '/srv/git')).toBe('/workspace/repo')
+    expect(resolveLaunchWorktreeCwd('/srv/git/repo@main', '/host/work', '/workspace', '/srv/git')).toBe('/srv/git/repo')
+    expect(resolveLaunchWorktreeCwd('Alloyium-ai/alloyium@develop', '/host/work', '/workspace', '/srv/git')).toBeUndefined()
+  })
+
+  test('carries worktree, role-scope metadata, and requester-aware write allowlist into codex peers', async () => {
+    await withEnv({
+      CODEX_GW_WRITE_ALLOWLIST: undefined,
+      A2A_LAUNCH_WRITE_ALLOWLIST_EXTRA: 'codex-rt-gw-2',
+    }, async () => {
+      const spec = buildDockerContainerSpec({
+        agentId: 'codex-gw-sub-write-scoped',
+        mode: 'shim',
+        createdBy: 'codex-gw',
+        allowWrite: true,
+        worktree: '/srv/git/alloyium@develop',
+        roleScopes: ['forgejo:repo:Alloyium-ai/alloyium:pr:create'],
+        writeRequesters: ['a2a-portal'],
+      })
+
+      const envList = spec.body.Env as string[]
+      expect(envList).toContain('A2A_LAUNCH_WORKTREE=/srv/git/alloyium@develop')
+      expect(envList).toContain('CODEX_GW_DEFAULT_CWD=/srv/git/alloyium')
+      expect(envList).toContain('A2A_REQUESTED_ROLE_SCOPES=["forgejo:repo:Alloyium-ai/alloyium:pr:create"]')
+      expect(envList).toContain('CODEX_GW_WRITE_ALLOWLIST=dev-pm,codex-rt-gw-2,codex-gw,agent-1,a2a-portal')
+    })
+  })
+
+  test('builds a bounded write allowlist from base, extras, creator, and requested identities', () => {
+    expect(buildCodexWriteAllowlist('codex-gw', true, ['a2a-portal'], {
+      CODEX_GW_WRITE_ALLOWLIST: 'dev-pm,agent-1',
+      A2A_LAUNCH_WRITE_ALLOWLIST_EXTRA: 'codex-rt-gw-2',
+    })).toBe('dev-pm,agent-1,codex-rt-gw-2,codex-gw,a2a-portal')
   })
 
   test('requires a bearer token for protected launcher requests', () => {

@@ -7,6 +7,8 @@ import {
   CODEX_TURN_INTERRUPTED_SCHEMA,
   CODEX_TURN_STARTED_SCHEMA,
 } from './codex_realtime.ts'
+export { isCodexJobRecipient, isCodexRealtimeSessionPeer } from './codex_peer_routing.ts'
+import { isCodexJobRecipient } from './codex_peer_routing.ts'
 
 export type PortalSendType = 'msg' | 'request' | 'reply'
 export type PortalSendMode = 'chat' | 'one-off'
@@ -21,12 +23,6 @@ export type PortalSendBuildResult =
 
 const SEND_TYPES = new Set<PortalSendType>(['msg', 'request', 'reply'])
 const SEND_MODES = new Set<PortalSendMode>(['chat', 'one-off'])
-const CODEX_JOB_RECIPIENTS = [
-  /^codex-gw(?:-\d+)?$/,
-  /^codex-[a-z0-9-]+$/,
-  /^codex-gw-sub-[a-z0-9-]+$/,
-  /^host-ops-gw(?:-[a-z0-9-]+)?$/,
-]
 const HOST_OPS_RE = /^host-ops-gw(?:-[a-z0-9-]+)?$/
 const LOCAL_HOST_OPS_RE = /^host-ops-gw$/
 
@@ -182,10 +178,6 @@ function normalizeCwd(value: unknown): string | null {
   const cwd = value.trim()
   if (!cwd || !cwd.startsWith('/')) return null
   return cwd
-}
-
-export function isCodexJobRecipient(agentId: string): boolean {
-  return CODEX_JOB_RECIPIENTS.some((re) => re.test(agentId))
 }
 
 function isJsonObjectWithSchema(text: string, schema: string): boolean {

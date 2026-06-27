@@ -41,6 +41,13 @@ bin/alloyium verify
   `A2A_LAUNCH_ALLOWED_IDS=codex-gw,claude-gw,agent-1,core,pm-design,pm-dev,pm-ops,codex-a2a-full-1`.
 - Launcher-spawned Codex peers inherit the shared workspace mount at `/workspace` and
   `CODEX_BUILD_CWD_ROOTS=/workspace,<legacy host git root>`.
+- Write-enabled launched Codex peers merge the launcher base allowlist with the creating
+  requester, `agent-1`, and any sanitized `policy.write_requesters` entries. The compose
+  default includes `dev-pm`, `agent-1`, `codex-gw`, current codex-rt gateway ids, and
+  `a2a-portal`.
+- `a2a_launch_codex_agent` accepts a `policy` object for `allow_write`, sandbox/model/effort
+  overrides, turn timeout, sanitized `role_scopes`, and extra write requesters. Role scopes
+  are metadata for scoped-access tooling, not credential values.
 
 Both allowlists matter. `A2A_AGENT_LAUNCH_ALLOWED_IDS` controls whether a peer sees the
 launch tool in its MCP surface. `A2A_LAUNCH_ALLOWED_IDS` controls whether the launcher
@@ -74,6 +81,9 @@ Alloyium exposes two Codex execution shapes:
   or reuses a long-lived app-server thread, starts a turn when idle, steers an active
   turn when possible, and streams normalized `codex.session.event.v1` events to a
   deterministic portal topic.
+
+Job wrapping deliberately excludes `codex-rt*` and `*-realtime-session-*` peers so
+batch jobs do not land on realtime-session identities.
 
 The gateway also accepts the lower-level realtime A2A schemas:
 

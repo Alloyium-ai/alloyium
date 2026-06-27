@@ -116,6 +116,16 @@ describe('A2A Fleet v2 validation', () => {
     if (result.ok) throw new Error('expected validation failure')
     expect(result.issues.some((issue) => issue.message.includes('duplicate agent id research-manager'))).toBe(true)
   })
+
+  test('rejects codex realtime-session ids as fleet job targets', () => {
+    const spec = parseLegacyFleetSpec(LEGACY_SPEC) as FleetSpec
+    spec.agents[1].id = 'codex-rt-gw-2'
+    spec.agents[1].thread_key = 'fleet:research-2026-06-19:codex-rt-gw-2'
+    const result = validateFleetSpec(spec)
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected validation failure')
+    expect(result.issues.some((issue) => issue.path === 'agents[1].id' && issue.message.includes('realtime-session'))).toBe(true)
+  })
 })
 
 describe('A2A Fleet v2 dry-run planning', () => {
@@ -192,6 +202,25 @@ describe('A2A Fleet v2 dry-run planning', () => {
       cwd: '/srv/git/research-stack',
       sandbox: 'read-only',
       approval_policy: 'never',
+    })
+  })
+
+  test('includes launcher policy in docker-codex dry-run plans', () => {
+    const spec = parseLegacyFleetSpec(LEGACY_SPEC, { provider: 'docker-codex', sandbox: 'workspace-write' }) as FleetSpec
+    spec.defaults.role_scopes = ['forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/*']
+    const validation = validateFleetSpec(spec)
+    if (!validation.ok) throw new Error('expected valid spec')
+
+    const plan = buildFleetRunPlan(validation.spec)
+    expect(plan.agents[1].launch.request?.body).toMatchObject({
+      agent_id: 'research-alpha',
+      worktree: '/srv/git/research-stack@feat/topic-analysis',
+      policy: {
+        allow_write: true,
+        sandbox: 'workspace-write',
+        effort: 'xhigh',
+        role_scopes: ['forgejo:repo:Alloyium-ai/alloyium:branch:push:codex/*'],
+      },
     })
   })
 })

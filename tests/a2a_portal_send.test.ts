@@ -61,6 +61,7 @@ describe('a2a portal send helpers', () => {
     const body = JSON.stringify({ schema: 'codex.job.request.v1', job_id: 'existing' })
     expect(wrapPlainCodexRequest({ to: 'codex-gw', type: 'request', body }, 'job-2').body).toBe(body)
     expect(wrapPlainCodexRequest({ to: 'agent-1', type: 'request', body: 'say hi' }, 'job-3').body).toBe('say hi')
+    expect(wrapPlainCodexRequest({ to: 'codex-rt-gw-2', type: 'request', body: 'say hi' }, 'job-rt').body).toBe('say hi')
   })
 
   test('wraps chat-mode codex requests in the realtime session contract', () => {
@@ -96,6 +97,8 @@ describe('a2a portal send helpers', () => {
   test('classifies codex job recipients separately from direct claude peers', () => {
     expect(isCodexJobRecipient('codex-gw')).toBe(true)
     expect(isCodexJobRecipient('host-ops-gw-1')).toBe(true)
+    expect(isCodexJobRecipient('codex-rt-gw-2')).toBe(false)
+    expect(isCodexJobRecipient('codex-realtime-session-abc123')).toBe(false)
     expect(isCodexJobRecipient('agent-1')).toBe(false)
   })
 
@@ -133,6 +136,8 @@ describe('a2a portal send helpers', () => {
     expect(buildPortalDefaultCwd({ to: 'host-ops-gw', type: 'request', body: 'x' }, 'one-off'))
       .toBe('/tmp')
     expect(buildPortalDefaultCwd({ to: 'agent-1', type: 'request', body: 'x' }, 'chat'))
+      .toBeNull()
+    expect(buildPortalDefaultCwd({ to: 'codex-rt-gw-2', type: 'request', body: 'x' }, 'chat'))
       .toBeNull()
     expect(buildPortalDefaultCwd({ to: 'host-ops-gw', type: 'request', body: 'x' }, 'chat', { hostOpsCwd: '/srv/repo' }))
       .toBe('/srv/repo')

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { GatewayThreadCache, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides, codexHttpGatewayStartAllowed, isCodexHttpLoopbackBind } from '../codex_gateway.ts'
+import { GatewayThreadCache, validateWorkspaceWriteJob, approvalPolicyAllowed, normalizeCodexSandboxMode, resolveCodexExecutionSandbox, describeGatewayError, defaultPlainRequestApprovalPolicy, defaultCodexJobCwd, buildPeerInboxContext, codexMcpElicitationResult, codexDetachedThreadOverrides, codexHttpGatewayStartAllowed, isCodexHttpLoopbackBind } from '../codex_gateway.ts'
 
 describe('codex gateway workspace-write preflight', () => {
   test('formats structured app-server errors without [object Object]', () => {
@@ -70,6 +70,12 @@ describe('codex gateway workspace-write preflight', () => {
     expect(defaultPlainRequestApprovalPolicy(true)).toBe('never')
     expect(defaultPlainRequestApprovalPolicy(false)).toBe('on-request')
     expect(approvalPolicyAllowed(defaultPlainRequestApprovalPolicy(true), true)).toBe(true)
+  })
+
+  test('plain or cwd-less jobs can inherit a launcher-provided default cwd', () => {
+    expect(defaultCodexJobCwd({ CODEX_GW_DEFAULT_CWD: '/workspace/alloyium' })).toBe('/workspace/alloyium')
+    expect(defaultCodexJobCwd({ CODEX_GW_DEFAULT_CWD: 'relative/path' })).toBe('/tmp')
+    expect(defaultCodexJobCwd({})).toBe('/tmp')
   })
 
   test('renders async peer replies as bounded next-turn context', () => {

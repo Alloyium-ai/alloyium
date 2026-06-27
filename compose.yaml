@@ -337,7 +337,7 @@ services:
       CODEX_HOST_HOME: ${CODEX_HOST_HOME:-${HOME}/.codex}
       CODEX_WORKSPACE_ROOT: ${CODEX_WORKSPACE_ROOT:-${HOME}/git}
       CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
-      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
+      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm,agent-1,codex-gw,codex-rt-gw,codex-rt-gw-2,a2a-portal}
       CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
       CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${HOME}/git}
       # Spawned kind=claude workers need the HOST paths of the logged-in `claude` session
@@ -472,7 +472,7 @@ services:
       CODEX_GW_MODEL: ${CODEX_GW_MODEL:-}
       CODEX_GW_BUDGET_MAX_PCT: ${CODEX_GW_BUDGET_MAX_PCT:-92}
       CODEX_GW_ALLOW_WRITE: ${CODEX_GW_ALLOW_WRITE:-1}
-      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm}
+      CODEX_GW_WRITE_ALLOWLIST: ${CODEX_GW_WRITE_ALLOWLIST:-dev-pm,agent-1,codex-gw,codex-rt-gw,codex-rt-gw-2,a2a-portal}
       CODEX_GW_CODEX_SANDBOX: ${CODEX_GW_CODEX_SANDBOX:-danger-full-access}
       # Authorize codex workspace-write jobs to land in the shared /workspace (plus legacy ~/git).
       CODEX_BUILD_CWD_ROOTS: ${CODEX_BUILD_CWD_ROOTS:-/workspace,${HOME}/git}

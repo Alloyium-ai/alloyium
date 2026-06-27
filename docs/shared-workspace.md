@@ -30,14 +30,20 @@ their `git clone`s / edits land back on the host.
   `CODEX_BUILD_CWD_ROOTS` (`/workspace,${HOME}/git`).
 
   > Codex keeps its own defence-in-depth gate for **workspace-write jobs**: the requester must
-  > be in `CODEX_GW_WRITE_ALLOWLIST` (default `dev-pm`), and the cwd must be registered in the
-  > Redis cwd-allow set. The mount + cwd-root make `/workspace` *eligible*; codex's authz still
-  > governs *who* may drive a write there. `codex-gw-b` is read-only (`CODEX_GW_ALLOW_WRITE=0`)
-  > — it can read `/workspace` but not run write jobs.
+  > be in `CODEX_GW_WRITE_ALLOWLIST` (compose defaults include `dev-pm`, `agent-1`,
+  > `codex-gw`, current codex-rt gateway ids, and `a2a-portal`), and the cwd must be
+  > registered in the Redis cwd-allow set. The mount + cwd-root make `/workspace`
+  > *eligible*; codex's authz still governs *who* may drive a write there. `codex-gw-b`
+  > is read-only (`CODEX_GW_ALLOW_WRITE=0`) — it can read `/workspace` but not run
+  > write jobs.
 - Launcher-spawned peers keep the legacy same-path workspace root bind
   (`CODEX_WORKSPACE_ROOT`, default `${HOME}/git`) and also receive the shared workspace
   bind. Relative launcher workspace paths are resolved against `A2A_LAUNCH_PROJECT_DIR`
   so Docker receives an absolute host path.
+- When a launch request includes an absolute `worktree` value inside `/workspace` or
+  `CODEX_WORKSPACE_ROOT`, the launcher sets `CODEX_GW_DEFAULT_CWD` for the spawned
+  Codex peer. Cwd-less jobs and plain requests then start in that workspace while
+  explicit job `cwd` values remain authoritative.
 
 ## Setup
 

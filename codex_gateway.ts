@@ -64,6 +64,7 @@ const A2A_TOOLS_MODE = codexA2AToolsMode()
 const A2A_TOOLS_STARTUP_TIMEOUT_SEC = positiveNumber(process.env.CODEX_GW_A2A_TOOLS_STARTUP_TIMEOUT_SEC)
 const A2A_TOOLS_TOOL_TIMEOUT_SEC = positiveNumber(process.env.CODEX_GW_A2A_TOOLS_TOOL_TIMEOUT_SEC)
 const AGENT_PREAMBLE = process.env.CODEX_GW_AGENT_PREAMBLE?.trim()
+const DEFAULT_JOB_CWD = defaultCodexJobCwd()
 const HTTP_PORT = Math.max(0, Number(process.env.CODEX_GW_HTTP_PORT ?? 0) || 0)
 const HTTP_BIND = process.env.CODEX_GW_HTTP_BIND ?? '127.0.0.1'
 const HTTP_TOKEN = process.env.CODEX_GW_HTTP_TOKEN ?? ''
@@ -121,6 +122,11 @@ export function resolveCodexExecutionSandbox(
   const workspaceWriteSandbox = normalizeCodexSandboxMode(opts.workspaceWriteSandbox)
   if (requested === 'workspace-write') return workspaceWriteSandbox ?? defaultSandbox ?? 'workspace-write'
   return defaultSandbox ?? 'read-only'
+}
+
+export function defaultCodexJobCwd(env: Record<string, string | undefined> = process.env): string {
+  const cwd = env.CODEX_GW_DEFAULT_CWD?.trim()
+  return cwd?.startsWith('/') ? cwd : '/tmp'
 }
 
 // Lazy Redis for claim-check blobs; opened on first large reply, reused after.
@@ -357,6 +363,7 @@ class CodexAppServer {
       kaiHttpUrl: process.env.KAI_HTTP_URL,
       kaiWsUrl: process.env.KAI_WS_URL,
       kaiTokenPath: process.env.KAI_TOKEN_PATH,
+      requestedRoleScopes: process.env.A2A_REQUESTED_ROLE_SCOPES,
       maxSendBytes: process.env.A2A_MAX_SEND_BYTES,
       inheritEnvVars: process.env.KAI_TOKEN ? ['KAI_TOKEN'] : [],
       startupTimeoutSec: A2A_TOOLS_STARTUP_TIMEOUT_SEC,
@@ -703,7 +710,7 @@ type RealtimeContext =
 async function resolveRealtimeContext(req: Record<string, any>, from: string): Promise<RealtimeContext> {
   const sandbox = req.sandbox === 'workspace-write' ? 'workspace-write' : 'read-only'
   const approvalPolicy = typeof req.approval_policy === 'string' ? req.approval_policy : 'never'
-  const cwd = typeof req.cwd === 'string' && req.cwd ? req.cwd : '/tmp'
+  const cwd = typeof req.cwd === 'string' && req.cwd ? req.cwd : DEFAULT_JOB_CWD
   const sessionId = typeof req.session_id === 'string' && req.session_id ? req.session_id : undefined
   const threadKey = typeof req.thread_key === 'string' && req.thread_key ? req.thread_key : sessionId
   const resumeThreadId = typeof req.resume_thread_id === 'string' && req.resume_thread_id ? req.resume_thread_id : undefined
@@ -975,7 +982,7 @@ function startHttpGateway() {
           thread_key: body.thread_key ?? body.session_id,
           sandbox: body.sandbox ?? 'read-only',
           approval_policy: body.approval_policy ?? 'never',
-          cwd: body.cwd ?? '/tmp',
+          cwd: body.cwd ?? DEFAULT_JOB_CWD,
         }, 'http')
         if (!created.ok) return created.response
         return httpJson({ ok: true, schema: CODEX_SESSION_READY_SCHEMA, ...sessionPublicState(created.session) })
@@ -1072,7 +1079,7 @@ async function onInbound(content: string, attrs: any) {
   // prompt is read-only; on write-enabled gateways it must also use 'never'
   // because approvals route back to the requester.
   const approvalPolicy = isJob ? (typeof job.approval_policy === 'string' ? job.approval_policy : 'never') : defaultPlainRequestApprovalPolicy(WRITE_ENABLED)
-  const cwd = isJob && typeof job.cwd === 'string' && job.cwd ? job.cwd : '/tmp'
+  const cwd = isJob && typeof job.cwd === 'string' && job.cwd ? job.cwd : DEFAULT_JOB_CWD
   const tid = typeof job.triage_id === 'string' ? { triage_id: job.triage_id } : {}
   let effectiveCwd = cwd
   let effectiveThreadKey = job.thread_key

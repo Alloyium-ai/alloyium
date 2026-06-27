@@ -28,6 +28,7 @@ import { join } from 'node:path'
 import { A2AChannel } from './a2a-channel.ts'
 import { RedisClient } from 'bun'
 import { canonicalizeCwd, registerCwd } from './codex_build_authz.ts'
+import { isCodexRealtimeSessionPeer } from './codex_peer_routing.ts'
 
 export const FLEET_SPEC_SCHEMA = 'a2a.fleet.spec.v2'
 export const FLEET_PLAN_SCHEMA = 'a2a.fleet.run_plan.v1'
@@ -35,6 +36,7 @@ export const CODEX_JOB_SCHEMA = 'codex.job.request.v1'
 export const CLAUDE_ASSIGNMENT_SCHEMA = 'fleet.task.assigned.v1'
 
 const AGENT_ID_RE = /^[a-z0-9-]{1,64}$/
+const ROLE_SCOPE_RE = /^[A-Za-z0-9:_./*@+=-]{1,256}$/
 const DEFAULT_BUDGET_MAX_PRIMARY_USED_PERCENT = 99
 const DEFAULT_TURN_TIMEOUT_MS = 28_800_000
 const DEFAULT_CANARY_TIMEOUT_MS = 300_000
@@ -60,6 +62,7 @@ export type FleetDefaults = {
   provider?: FleetProvider
   model?: string | null
   effort?: string
+  role_scopes?: string[]
   sandbox?: 'read-only' | 'workspace-write'
   approval_policy?: 'never'
   a2a_tools_required?: boolean
@@ -401,6 +404,11 @@ export function validateFleetSpec(input: unknown): FleetValidationResult {
     if (defaults.sandbox != null && defaults.sandbox !== 'read-only' && defaults.sandbox !== 'workspace-write') {
       issues.push({ path: 'defaults.sandbox', message: 'must be read-only or workspace-write' })
     }
+    if (defaults.role_scopes != null) {
+      if (!Array.isArray(defaults.role_scopes) || defaults.role_scopes.length > 32 || defaults.role_scopes.some((scope) => typeof scope !== 'string' || !ROLE_SCOPE_RE.test(scope))) {
+        issues.push({ path: 'defaults.role_scopes', message: 'must be an array of sanitized scope strings' })
+      }
+    }
     for (const field of ['status_topic', 'result_topic'] as const) {
       if (defaults[field] != null && !AGENT_ID_RE.test(String(defaults[field]))) {
         issues.push({ path: `defaults.${field}`, message: 'must be a valid A2A topic token' })
@@ -426,6 +434,9 @@ export function validateFleetSpec(input: unknown): FleetValidationResult {
       const runtime = parseRuntime(agent.runtime) ?? defaultRuntime
       const provider = parseProvider(agent.provider) ?? defaultProvider ?? (runtime ? providerForRuntime(runtime) : undefined)
       if (!runtime) issues.push({ path: `${prefix}.runtime`, message: 'must be codex or claude-live, or inherit a valid default' })
+      if (id && runtime === 'codex' && isCodexRealtimeSessionPeer(id)) {
+        issues.push({ path: `${prefix}.id`, message: 'must not target codex realtime-session peers for codex jobs' })
+      }
       if (!provider) issues.push({ path: `${prefix}.provider`, message: 'must be valid, or inherit a valid default' })
       if (runtime && provider && !providerMatchesRuntime(provider, runtime)) {
         issues.push({ path: `${prefix}.provider`, message: `provider ${provider} does not match runtime ${runtime}` })
@@ -473,7 +484,7 @@ function buildPlanAgent(spec: FleetSpec, agent: FleetAgentSpec): FleetRunPlanAge
     runtime,
     provider,
     cwd,
-    launch: buildLaunchPlan(agent.id, provider, worktree),
+    launch: buildLaunchPlan(spec, agent.id, provider, worktree),
     dispatch: buildDispatchPlan(spec, agent, runtime, cwd),
   }
 }
@@ -490,8 +501,9 @@ function workerWorktreeRoot(): string {
   return process.env.WORKER_WORKTREE_ROOT ?? process.env.AGENTS_ROOT ?? join(homedir(), 'a2a-agents')
 }
 
-function buildLaunchPlan(agentId: string, provider: FleetProvider, worktree: string): FleetRunPlanAgent['launch'] {
+function buildLaunchPlan(spec: FleetSpec, agentId: string, provider: FleetProvider, worktree: string): FleetRunPlanAgent['launch'] {
   if (provider === 'docker-codex') {
+    const sandbox = spec.defaults.sandbox ?? 'read-only'
     return {
       provider,
       mode: 'shim',
@@ -504,6 +516,13 @@ function buildLaunchPlan(agentId: string, provider: FleetProvider, worktree: str
           mode: 'shim',
           worktree,
           dry_run: true,
+          policy: {
+            allow_write: sandbox === 'workspace-write',
+            sandbox,
+            ...(spec.defaults.effort ? { effort: spec.defaults.effort } : {}),
+            ...(spec.defaults.model ? { model: spec.defaults.model } : {}),
+            ...(spec.defaults.role_scopes?.length ? { role_scopes: spec.defaults.role_scopes } : {}),
+          },
         },
       },
     }
@@ -957,6 +976,7 @@ async function launchViaLauncherHttp(launcherUrl: string, spec: FleetSpec, agent
       sandbox,
       ...(spec.defaults.effort ? { effort: spec.defaults.effort } : {}),
       ...(spec.defaults.model ? { model: spec.defaults.model } : {}),
+      ...(spec.defaults.role_scopes?.length ? { role_scopes: spec.defaults.role_scopes } : {}),
       turn_timeout_ms: opts.gatewayTurnTimeoutMs,
     },
   }
@@ -1013,6 +1033,7 @@ async function launchViaShellScript(scriptPath: string, spec: FleetSpec, agent: 
       CODEX_GW_A2A_TOOLS_REQUIRED: spec.defaults.a2a_tools_required === false ? '0' : '1',
       CODEX_GW_A2A_TOOLS_TOOL_TIMEOUT_SEC: String(opts.toolTimeoutSec),
       CODEX_GW_TURN_TIMEOUT_MS: String(opts.gatewayTurnTimeoutMs),
+      ...(spec.defaults.role_scopes?.length ? { A2A_REQUESTED_ROLE_SCOPES: JSON.stringify(spec.defaults.role_scopes) } : {}),
       ...gatewayWriteEnv(spec, opts.orchestratorId),
       ...(spec.defaults.model ? { CODEX_GW_MODEL: spec.defaults.model } : {}),
       ...(spec.defaults.effort ? { CODEX_GW_EFFORT: spec.defaults.effort } : {}),

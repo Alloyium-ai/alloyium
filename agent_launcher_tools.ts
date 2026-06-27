@@ -43,7 +43,18 @@ export type SpawnImpl = (cmd: string[], opts: { env: Record<string, string | und
 export type FetchImpl = (url: string, init: RequestInit) => Promise<Response>
 
 const AGENT_ID_RE = /^[a-z0-9-]{1,64}$/
+const ROLE_SCOPE_RE = /^[A-Za-z0-9:_./*@+=-]{1,256}$/
 const DEFAULT_TIMEOUT_MS = 60_000
+
+type LaunchPolicy = {
+  allowWrite?: boolean
+  sandbox?: string
+  effort?: string
+  model?: string
+  turnTimeoutMs?: number
+  roleScopes?: string[]
+  writeRequesters?: string[]
+}
 
 export class AgentLauncherTools {
   private readonly agentId: string
@@ -101,6 +112,30 @@ export class AgentLauncherTools {
             label: { type: 'string', description: 'Optional short label used when agent_id is omitted, e.g. "review" or "smoke".' },
             mode: { enum: ['shim', 'webhook'], default: this.defaultMode, description: 'MCP transport mode for the launched peer. Prefer shim.' },
             worktree: { type: 'string', description: 'Optional REPO@BASE worktree argument passed to a2a-launch.sh.' },
+            policy: {
+              type: 'object',
+              additionalProperties: false,
+              description: 'Optional runtime policy for the launched Codex peer. Contains no credential material.',
+              properties: {
+                allow_write: { type: 'boolean', description: 'Start the worker write-enabled. The requester must still pass gateway write authz.' },
+                sandbox: { type: 'string', description: 'Codex execution sandbox setting for the worker gateway.' },
+                effort: { type: 'string', description: 'Codex effort override.' },
+                model: { type: 'string', description: 'Codex model override.' },
+                turn_timeout_ms: { type: 'integer', minimum: 1, description: 'Worker turn timeout in milliseconds.' },
+                role_scopes: {
+                  type: 'array',
+                  maxItems: 32,
+                  items: { type: 'string' },
+                  description: 'Sanitized role/scope names the worker may request from scoped-access tooling.',
+                },
+                write_requesters: {
+                  type: 'array',
+                  maxItems: 32,
+                  items: { type: 'string' },
+                  description: 'Additional A2A requester identities allowed to drive workspace-write jobs on this worker.',
+                },
+              },
+            },
             dry_run: { type: 'boolean', default: false, description: 'Return the launcher command without executing it.' },
           },
         },
@@ -128,6 +163,8 @@ export class AgentLauncherTools {
     if (agentId === this.agentId) return this.result({ ok: false, error: 'self_launch_refused' }, true)
 
     const mode = parseMode(args.mode, this.defaultMode)
+    const policy = parseLaunchPolicy(args.policy)
+    if (policy === false) return this.result({ ok: false, error: 'bad_policy' }, true)
     const cmd = ['bash', this.launcherPath, agentId, 'codex', mode === 'shim' ? '--shim' : '--webhook']
 
     if (args.worktree != null) {
@@ -144,11 +181,12 @@ export class AgentLauncherTools {
         mode,
         worktree: typeof args.worktree === 'string' ? args.worktree : undefined,
         dryRun: args.dry_run === true,
+        policy,
       })
     }
 
     if (args.dry_run === true) {
-      return this.result({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: this.agentId, kind: 'codex', mode, cmd })
+      return this.result({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: this.agentId, kind: 'codex', mode, cmd, ...(policy ? { policy: policyForResponse(policy) } : {}) })
     }
 
     const r = await this.spawnImpl(cmd, {
@@ -159,6 +197,7 @@ export class AgentLauncherTools {
         A2A_PARENT_AGENT_ID: this.agentId,
         A2A_LAUNCH_AGENT_LABEL: label || undefined,
         CODEX_GW_A2A_TOOLS_MODE: mode,
+        ...policyEnv(policy, this.agentId, this.launchEnv),
       },
       timeoutMs: this.timeoutMs,
     })
@@ -178,9 +217,10 @@ export class AgentLauncherTools {
     })
   }
 
-  private async remoteLaunchCodex(args: { agentId: string; label?: string; mode: LaunchMode; worktree?: string; dryRun?: boolean }): Promise<ToolResult> {
+  private async remoteLaunchCodex(args: { agentId: string; label?: string; mode: LaunchMode; worktree?: string; dryRun?: boolean; policy?: LaunchPolicy }): Promise<ToolResult> {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
     if (this.launcherToken) headers.authorization = `Bearer ${this.launcherToken}`
+    const policy = args.policy ? policyForLauncher(args.policy) : undefined
     const res = await this.fetchImpl(`${this.launcherUrl}/v1/agents/codex`, {
       method: 'POST',
       headers,
@@ -191,6 +231,7 @@ export class AgentLauncherTools {
         created_by: this.agentId,
         worktree: args.worktree,
         dry_run: args.dryRun === true,
+        ...(policy ? { policy } : {}),
       }),
       signal: AbortSignal.timeout(this.timeoutMs),
     })
@@ -246,6 +287,114 @@ export function allocateChildAgentId(parentAgentId: string, label?: string, opts
 function allowedIdsFromEnv(): string[] {
   const raw = process.env.A2A_AGENT_LAUNCH_ALLOWED_IDS ?? 'codex-gw'
   return raw.split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+function parseLaunchPolicy(value: unknown): LaunchPolicy | undefined | false {
+  if (value == null) return undefined
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const o = value as Record<string, unknown>
+  const policy: LaunchPolicy = {}
+
+  if (o.allow_write != null) {
+    if (typeof o.allow_write !== 'boolean') return false
+    policy.allowWrite = o.allow_write
+  }
+  if (o.sandbox != null) {
+    const sandbox = safeString(o.sandbox, 64)
+    if (!sandbox) return false
+    policy.sandbox = sandbox
+  }
+  if (o.effort != null) {
+    const effort = safeString(o.effort, 32)
+    if (!effort) return false
+    policy.effort = effort
+  }
+  if (o.model != null) {
+    const model = safeString(o.model, 128)
+    if (!model) return false
+    policy.model = model
+  }
+  if (o.turn_timeout_ms != null) {
+    if (!Number.isInteger(o.turn_timeout_ms) || o.turn_timeout_ms <= 0) return false
+    policy.turnTimeoutMs = o.turn_timeout_ms
+  }
+  if (o.role_scopes != null) {
+    const roleScopes = safeStringList(o.role_scopes, ROLE_SCOPE_RE)
+    if (!roleScopes) return false
+    policy.roleScopes = roleScopes
+  }
+  if (o.write_requesters != null) {
+    const writeRequesters = safeStringList(o.write_requesters, AGENT_ID_RE)
+    if (!writeRequesters) return false
+    policy.writeRequesters = writeRequesters
+  }
+
+  return Object.keys(policy).length ? policy : undefined
+}
+
+function safeString(value: unknown, maxLen: number): string | null {
+  if (typeof value !== 'string') return null
+  const s = value.trim()
+  if (!s || s.length > maxLen || /[\r\n]/.test(s)) return null
+  return s
+}
+
+function safeStringList(value: unknown, re: RegExp): string[] | null {
+  if (!Array.isArray(value) || value.length > 32) return null
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return null
+    const s = item.trim()
+    if (!re.test(s) || /[\r\n]/.test(s)) return null
+    if (!out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+function policyForLauncher(policy: LaunchPolicy): Record<string, unknown> {
+  return {
+    ...(policy.allowWrite !== undefined ? { allow_write: policy.allowWrite } : {}),
+    ...(policy.sandbox ? { sandbox: policy.sandbox } : {}),
+    ...(policy.effort ? { effort: policy.effort } : {}),
+    ...(policy.model ? { model: policy.model } : {}),
+    ...(policy.turnTimeoutMs ? { turn_timeout_ms: policy.turnTimeoutMs } : {}),
+    ...(policy.roleScopes?.length ? { role_scopes: policy.roleScopes } : {}),
+    ...(policy.writeRequesters?.length ? { write_requesters: policy.writeRequesters } : {}),
+  }
+}
+
+function policyForResponse(policy: LaunchPolicy): Record<string, unknown> {
+  return policyForLauncher(policy)
+}
+
+function policyEnv(policy: LaunchPolicy | undefined, parentAgentId: string, baseEnv: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (!policy) return {}
+  const out: Record<string, string | undefined> = {}
+  if (policy.allowWrite !== undefined) out.CODEX_GW_ALLOW_WRITE = policy.allowWrite ? '1' : '0'
+  if (policy.sandbox) {
+    out.CODEX_GW_CODEX_SANDBOX = policy.sandbox
+    if (policy.allowWrite) out.CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX = policy.sandbox
+  }
+  if (policy.effort) out.CODEX_GW_EFFORT = policy.effort
+  if (policy.model) out.CODEX_GW_MODEL = policy.model
+  if (policy.turnTimeoutMs) out.CODEX_GW_TURN_TIMEOUT_MS = String(policy.turnTimeoutMs)
+  if (policy.roleScopes?.length) out.A2A_REQUESTED_ROLE_SCOPES = JSON.stringify(policy.roleScopes)
+  if (policy.allowWrite) {
+    out.CODEX_GW_WRITE_ALLOWLIST = mergeAllowlist(baseEnv.CODEX_GW_WRITE_ALLOWLIST ?? process.env.CODEX_GW_WRITE_ALLOWLIST ?? 'dev-pm', [
+      parentAgentId,
+      'agent-1',
+      ...(policy.writeRequesters ?? []),
+    ])
+  }
+  return out
+}
+
+function mergeAllowlist(raw: string, additions: string[]): string {
+  return [...raw.split(','), ...additions]
+    .map((s) => s.trim())
+    .filter((s) => AGENT_ID_RE.test(s))
+    .filter((s, i, all) => all.indexOf(s) === i)
+    .join(',')
 }
 
 function parseMode(value: unknown, fallback: LaunchMode): LaunchMode {

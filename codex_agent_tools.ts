@@ -15,6 +15,7 @@ export type CodexA2AToolsConfig = {
   kaiHttpUrl?: string
   kaiWsUrl?: string
   kaiTokenPath?: string
+  requestedRoleScopes?: string
   inheritEnvVars?: string[]
   maxSendBytes?: string | number
   startupTimeoutSec?: number
@@ -100,6 +101,7 @@ export function buildCodexA2AToolsConfigArgs(cfg: CodexA2AToolsConfig): string[]
   addEnv(args, server, 'KAI_HTTP_URL', cfg.kaiHttpUrl)
   addEnv(args, server, 'KAI_WS_URL', cfg.kaiWsUrl)
   addEnv(args, server, 'KAI_TOKEN_PATH', cfg.kaiTokenPath)
+  addEnv(args, server, 'A2A_REQUESTED_ROLE_SCOPES', cfg.requestedRoleScopes)
   addEnv(args, server, 'SUBS_KEY', 'alloyium:a2a-silent-subs')
 
   return args

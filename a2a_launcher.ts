@@ -21,7 +21,15 @@ type CodexLaunchRequest = {
   created_by?: unknown
   worktree?: unknown
   dry_run?: unknown
-  policy?: { allow_write?: unknown; sandbox?: unknown; effort?: unknown; model?: unknown; turn_timeout_ms?: unknown }
+  policy?: {
+    allow_write?: unknown
+    sandbox?: unknown
+    effort?: unknown
+    model?: unknown
+    turn_timeout_ms?: unknown
+    role_scopes?: unknown
+    write_requesters?: unknown
+  }
 }
 
 // Claude Code worker launch (kind=claude). The codex path's analog: spawns
@@ -70,6 +78,7 @@ const CLAUDE_HOST_CONFIG = resolveClaudeHostConfig(env.CLAUDE_HOST_CONFIG, env.H
 const CONTAINER_USER = env.A2A_LAUNCH_CONTAINER_USER ?? `${env.CC_UID ?? 1000}:${env.CC_GID ?? 1000}`
 const PRESENCE_WAIT_MS = Math.max(0, Number(env.A2A_LAUNCH_PRESENCE_WAIT_MS ?? 15_000) || 0)
 const AGENT_ID_RE = /^[a-z0-9-]{1,64}$/
+const ROLE_SCOPE_RE = /^[A-Za-z0-9:_./*@+=-]{1,256}$/
 
 const allowed = new Set((env.A2A_LAUNCH_ALLOWED_IDS ?? 'codex-gw,claude-gw,agent-1').split(',').map((s) => s.trim()).filter(Boolean))
 let redis: RedisClient | null = null
@@ -116,6 +125,19 @@ function asSafeEnvValue(value: unknown, maxLen = 128): string | undefined {
   return value
 }
 
+function asSafeStringList(value: unknown, re: RegExp, maxItems: number): string[] | null {
+  if (value == null) return []
+  if (!Array.isArray(value) || value.length > maxItems) return null
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') return null
+    const s = item.trim()
+    if (!re.test(s) || /[\r\n]/.test(s)) return null
+    if (!out.includes(s)) out.push(s)
+  }
+  return out
+}
+
 function asPositiveInteger(value: unknown): number | undefined {
   if (!Number.isInteger(value) || value <= 0) return undefined
   return value
@@ -145,6 +167,39 @@ export function buildDefaultCodexCwdRoots(sharedWorkspacePath: string | null, le
   return [sharedWorkspacePath, legacyWorkspaceRoot]
     .map((s) => s?.trim())
     .filter((s): s is string => !!s)
+    .filter((s, i, all) => all.indexOf(s) === i)
+    .join(',')
+}
+
+export function resolveLaunchWorktreeCwd(
+  value: string | undefined,
+  sharedHostPath: string | null = SHARED_WORKSPACE_HOST_PATH,
+  sharedContainerPath = SHARED_WORKSPACE_CONTAINER_PATH,
+  workspaceRoot = WORKSPACE_ROOT,
+): string | undefined {
+  const raw = value?.trim()
+  if (!raw || /[\r\n]/.test(raw)) return undefined
+  const repo = raw.slice(0, raw.lastIndexOf('@') > 0 ? raw.lastIndexOf('@') : raw.length).replace(/\/+$/, '') || raw
+  if (!isAbsolute(repo)) return undefined
+
+  const sharedHost = sharedHostPath?.replace(/\/+$/, '') || null
+  if (sharedHost && (repo === sharedHost || repo.startsWith(`${sharedHost}/`))) {
+    const suffix = repo.slice(sharedHost.length)
+    return `${sharedContainerPath.replace(/\/+$/, '')}${suffix}` || sharedContainerPath
+  }
+
+  const root = workspaceRoot.replace(/\/+$/, '')
+  if (root && (repo === root || repo.startsWith(`${root}/`))) return repo
+  return undefined
+}
+
+export function buildCodexWriteAllowlist(createdBy: string, allowWrite: boolean, requested: string[] = [], envValues: Record<string, string | undefined> = env): string {
+  const base = (envValues.CODEX_GW_WRITE_ALLOWLIST ?? 'dev-pm').split(',')
+  const extra = (envValues.A2A_LAUNCH_WRITE_ALLOWLIST_EXTRA ?? '').split(',')
+  const automatic = allowWrite ? [createdBy, 'agent-1', ...requested] : []
+  return [...base, ...extra, ...automatic]
+    .map((s) => s.trim())
+    .filter((s) => AGENT_ID_RE.test(s))
     .filter((s, i, all) => all.indexOf(s) === i)
     .join(',')
 }
@@ -183,11 +238,14 @@ export function buildDockerContainerSpec(req: {
   mode: LaunchMode
   createdBy: string
   label?: string
+  worktree?: string
   allowWrite?: boolean
   sandbox?: string
   effort?: string
   model?: string
   turnTimeoutMs?: number
+  roleScopes?: string[]
+  writeRequesters?: string[]
 }): DockerContainerSpec {
   const name = `cc-agent-${req.agentId}`
   const labels: Record<string, string> = {
@@ -197,11 +255,14 @@ export function buildDockerContainerSpec(req: {
     'ai.alloyium.created_by': req.createdBy,
   }
   if (req.label) labels['ai.alloyium.label'] = req.label
+  if (req.worktree) labels['ai.alloyium.worktree'] = req.worktree
 
   const allowWrite = req.allowWrite ?? false
   const sandbox = req.sandbox ?? 'danger-full-access'
   const workspaceWriteSandbox = allowWrite ? req.sandbox ?? env.CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX ?? 'workspace-write' : undefined
   const turnTimeoutMs = req.turnTimeoutMs ?? asPositiveInteger(Number(env.CODEX_GW_TURN_TIMEOUT_MS))
+  const defaultCwd = resolveLaunchWorktreeCwd(req.worktree)
+  const writeAllowlist = buildCodexWriteAllowlist(req.createdBy, allowWrite, req.writeRequesters)
   const binds = [
     `${SECRETS_VOLUME}:/run/secrets/a2a:ro`,
     `${CORE_SOURCE}:/run/a2a-core`,
@@ -230,14 +291,17 @@ export function buildDockerContainerSpec(req: {
     envPair('A2A_CORE_SOCK', '/run/a2a-core/core.sock'),
     envPair('A2A_PARENT_AGENT_ID', req.createdBy),
     envPair('A2A_LAUNCH_AGENT_LABEL', req.label),
+    envPair('A2A_LAUNCH_WORKTREE', req.worktree),
+    envPair('A2A_REQUESTED_ROLE_SCOPES', req.roleScopes?.length ? JSON.stringify(req.roleScopes) : undefined),
     envPair('CODEX_GW_EFFORT', req.effort ?? env.CODEX_GW_EFFORT ?? 'xhigh'),
     envPair('CODEX_GW_MODEL', req.model ?? env.CODEX_GW_MODEL),
     envPair('CODEX_GW_TURN_TIMEOUT_MS', turnTimeoutMs),
     envPair('CODEX_GW_BUDGET_MAX_PCT', env.CODEX_GW_BUDGET_MAX_PCT ?? '92'),
     envPair('CODEX_GW_ALLOW_WRITE', allowWrite ? '1' : '0'),
-    envPair('CODEX_GW_WRITE_ALLOWLIST', env.CODEX_GW_WRITE_ALLOWLIST ?? 'dev-pm'),
+    envPair('CODEX_GW_WRITE_ALLOWLIST', writeAllowlist),
     envPair('CODEX_GW_CODEX_SANDBOX', sandbox),
     envPair('CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX', workspaceWriteSandbox),
+    envPair('CODEX_GW_DEFAULT_CWD', defaultCwd),
     envPair('CODEX_BUILD_CWD_ROOTS', env.CODEX_BUILD_CWD_ROOTS ?? DEFAULT_CODEX_CWD_ROOTS),
     envPair('CODEX_GW_ENABLE_A2A_TOOLS', '1'),
     envPair('CODEX_GW_A2A_TOOLS_MODE', req.mode),
@@ -459,14 +523,20 @@ async function handleCodexLaunch(input: CodexLaunchRequest): Promise<Response> {
   const mode = asMode(input.mode)
   const label = asLabel(input.label)
   const dryRun = input.dry_run === true
+  const worktree = input.worktree == null ? undefined : asSafeEnvValue(input.worktree, 512)
+  if (input.worktree != null && !worktree) return err('bad_worktree')
   const allowWrite = typeof input.policy?.allow_write === 'boolean' ? input.policy.allow_write : undefined
   const sandbox = typeof input.policy?.sandbox === 'string' ? input.policy.sandbox : undefined
   const effort = asSafeEnvValue(input.policy?.effort, 32)
   const model = asSafeEnvValue(input.policy?.model, 128)
   const turnTimeoutMs = asPositiveInteger(input.policy?.turn_timeout_ms)
+  const roleScopes = asSafeStringList(input.policy?.role_scopes, ROLE_SCOPE_RE, 32)
+  if (!roleScopes) return err('bad_role_scopes')
+  const writeRequesters = asSafeStringList(input.policy?.write_requesters, AGENT_ID_RE, 32)
+  if (!writeRequesters) return err('bad_write_requesters')
 
   if (PROVIDER !== 'docker') return err('unsupported_provider', 500, PROVIDER)
-  const spec = buildDockerContainerSpec({ agentId, mode, createdBy, label, allowWrite, sandbox, effort, model, turnTimeoutMs })
+  const spec = buildDockerContainerSpec({ agentId, mode, createdBy, label, worktree, allowWrite, sandbox, effort, model, turnTimeoutMs, roleScopes, writeRequesters })
   if (dryRun) {
     return json({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'codex', mode, provider: 'docker', runtime_id: spec.name, status: 'planned', container: spec })
   }

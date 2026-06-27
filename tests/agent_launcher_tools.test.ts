@@ -104,6 +104,15 @@ describe('AgentLauncherTools', () => {
         agent_id: 'codex-worker-remote',
         label: 'remote smoke',
         dry_run: true,
+        policy: {
+          allow_write: true,
+          sandbox: 'workspace-write',
+          effort: 'medium',
+          model: 'gpt-5.5-codex',
+          turn_timeout_ms: 300000,
+          role_scopes: ['forgejo:repo:Alloyium-ai/alloyium:pr:create'],
+          write_requesters: ['codex-rt-gw-2'],
+        },
       }))
 
       expect(out).toMatchObject({
@@ -122,6 +131,15 @@ describe('AgentLauncherTools', () => {
         mode: 'shim',
         created_by: 'codex-gw',
         dry_run: true,
+        policy: {
+          allow_write: true,
+          sandbox: 'workspace-write',
+          effort: 'medium',
+          model: 'gpt-5.5-codex',
+          turn_timeout_ms: 300000,
+          role_scopes: ['forgejo:repo:Alloyium-ai/alloyium:pr:create'],
+          write_requesters: ['codex-rt-gw-2'],
+        },
       })
     } finally {
       if (oldToken === undefined) delete process.env.A2A_LAUNCHER_TOKEN
@@ -137,6 +155,7 @@ describe('AgentLauncherTools', () => {
     expect(payload(await allowed.callTool('a2a_launch_codex_agent', { agent_id: 'Bad Id' }))).toEqual({ ok: false, error: 'bad_agent_id' })
     expect(payload(await allowed.callTool('a2a_launch_codex_agent', { agent_id: 'codex-gw' }))).toEqual({ ok: false, error: 'self_launch_refused' })
     expect(payload(await allowed.callTool('a2a_launch_codex_agent', { label: 'bad\nlabel' }))).toEqual({ ok: false, error: 'bad_label' })
+    expect(payload(await allowed.callTool('a2a_launch_codex_agent', { policy: { role_scopes: ['bad scope'] } }))).toEqual({ ok: false, error: 'bad_policy' })
   })
 
   test('allocateChildAgentId returns bounded valid ids', () => {
