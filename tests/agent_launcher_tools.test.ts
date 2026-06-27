@@ -103,6 +103,11 @@ describe('AgentLauncherTools', () => {
       const out = payload(await tools.callTool('a2a_launch_codex_agent', {
         agent_id: 'codex-worker-remote',
         label: 'remote smoke',
+        worktree: '/srv/git/alloyium@origin/develop',
+        job_id: 'job-remote-1',
+        base_ref: 'origin/develop',
+        target_branch: 'codex/job-remote-1',
+        cleanup_policy: 'preserve',
         dry_run: true,
         policy: {
           allow_write: true,
@@ -130,6 +135,11 @@ describe('AgentLauncherTools', () => {
         label: 'remote smoke',
         mode: 'shim',
         created_by: 'codex-gw',
+        worktree: '/srv/git/alloyium@origin/develop',
+        job_id: 'job-remote-1',
+        base_ref: 'origin/develop',
+        target_branch: 'codex/job-remote-1',
+        cleanup_policy: 'preserve',
         dry_run: true,
         policy: {
           allow_write: true,

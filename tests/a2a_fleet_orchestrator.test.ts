@@ -215,6 +215,10 @@ describe('A2A Fleet v2 dry-run planning', () => {
     expect(plan.agents[1].launch.request?.body).toMatchObject({
       agent_id: 'research-alpha',
       worktree: '/srv/git/research-stack@feat/topic-analysis',
+      job_id: 'fleet-research-2026-06-19-research-alpha-001',
+      base_ref: 'feat/topic-analysis',
+      target_branch: 'codex/research-2026-06-19-research-alpha',
+      cleanup_policy: 'preserve',
       policy: {
         allow_write: true,
         sandbox: 'workspace-write',

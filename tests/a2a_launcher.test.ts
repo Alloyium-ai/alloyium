@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildCodexWriteAllowlist, buildDefaultCodexCwdRoots, buildDockerContainerSpec, launcherRequestAuthorized, resolveCodexHostHome, resolveLaunchWorkspaceHostPath, resolveLaunchWorktreeCwd } from '../a2a_launcher.ts'
+import { buildCodexWriteAllowlist, buildDefaultCodexCwdRoots, buildDockerContainerSpec, buildLaunchWorktreePlan, launcherRequestAuthorized, resolveCodexHostHome, resolveLaunchWorkspaceHostPath, resolveLaunchWorktreeCwd } from '../a2a_launcher.ts'
 
 async function withEnv<T>(updates: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
   const old: Record<string, string | undefined> = {}
@@ -164,6 +164,89 @@ describe('a2a launcher docker provider', () => {
     expect(resolveLaunchWorktreeCwd('/host/work/repo@develop', '/host/work', '/workspace', '/srv/git')).toBe('/workspace/repo')
     expect(resolveLaunchWorktreeCwd('/srv/git/repo@main', '/host/work', '/workspace', '/srv/git')).toBe('/srv/git/repo')
     expect(resolveLaunchWorktreeCwd('Alloyium-ai/alloyium@develop', '/host/work', '/workspace', '/srv/git')).toBeUndefined()
+  })
+
+  test('plans isolated write worktrees from repo, base, target branch, and job id', () => {
+    const result = buildLaunchWorktreePlan({
+      agentId: 'codex-gw-sub-write',
+      worktree: '/host/work/repo@origin/develop',
+      allowWrite: true,
+      jobId: 'job-123',
+      targetBranch: 'codex/job-123',
+      cleanupPolicy: 'preserve',
+      sharedHostPath: '/host/work',
+      sharedContainerPath: '/workspace',
+      workspaceRoot: '/srv/git',
+      worktreeRootHostPath: null,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok || !result.plan) throw new Error('expected worktree plan')
+    expect(result.plan).toMatchObject({
+      requested: '/host/work/repo@origin/develop',
+      isolated: true,
+      sourceRepoHostPath: '/host/work/repo',
+      sourceRepoLauncherPath: '/workspace/repo',
+      baseRef: 'origin/develop',
+      targetBranch: 'codex/job-123',
+      jobId: 'job-123',
+      cleanupPolicy: 'preserve',
+    })
+    expect(result.plan.hostWorktreePath).toContain('/host/work/.a2a-worktrees/repo-origin-develop-codex-job-123-job-123-')
+    expect(result.plan.launcherWorktreePath).toContain('/workspace/.a2a-worktrees/repo-origin-develop-codex-job-123-job-123-')
+    expect(result.plan.containerCwd).toBe(result.plan.launcherWorktreePath)
+    expect(result.plan.cwdRoots).toBe(result.plan.containerCwd)
+  })
+
+  test('requires a worktree plan for write-enabled launches', () => {
+    expect(buildLaunchWorktreePlan({
+      agentId: 'codex-gw-sub-write',
+      allowWrite: true,
+      sharedHostPath: '/host/work',
+      sharedContainerPath: '/workspace',
+      workspaceRoot: '/srv/git',
+    })).toEqual({ ok: false, error: 'write_worktree_required' })
+  })
+
+  test('uses isolated worktree cwd and exact cwd roots in launched codex peers', () => {
+    const result = buildLaunchWorktreePlan({
+      agentId: 'codex-gw-sub-write',
+      worktree: '/host/work/repo@origin/develop',
+      allowWrite: true,
+      jobId: 'job-123',
+      targetBranch: 'codex/job-123',
+      sharedHostPath: '/host/work',
+      sharedContainerPath: '/workspace',
+      workspaceRoot: '/srv/git',
+      worktreeRootHostPath: null,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok || !result.plan) throw new Error('expected worktree plan')
+
+    const spec = buildDockerContainerSpec({
+      agentId: 'codex-gw-sub-write',
+      mode: 'shim',
+      createdBy: 'codex-gw',
+      allowWrite: true,
+      worktree: '/host/work/repo@origin/develop',
+      worktreePlan: result.plan,
+    })
+
+    const envList = spec.body.Env as string[]
+    expect(envList).toContain(`CODEX_GW_DEFAULT_CWD=${result.plan.containerCwd}`)
+    expect(envList).toContain(`CODEX_BUILD_CWD_ROOTS=${result.plan.containerCwd}`)
+    expect(envList).toContain(`A2A_LAUNCH_WORKTREE_CWD=${result.plan.containerCwd}`)
+    expect(envList).toContain('A2A_LAUNCH_WORKTREE_BASE_REF=origin/develop')
+    expect(envList).toContain('A2A_LAUNCH_WORKTREE_TARGET_BRANCH=codex/job-123')
+    expect(envList).toContain('A2A_LAUNCH_JOB_ID=job-123')
+    expect(spec.body.Labels).toMatchObject({
+      'ai.alloyium.worktree': '/host/work/repo@origin/develop',
+      'ai.alloyium.worktree_cwd': result.plan.containerCwd,
+      'ai.alloyium.base_ref': 'origin/develop',
+      'ai.alloyium.target_branch': 'codex/job-123',
+      'ai.alloyium.job_id': 'job-123',
+      'ai.alloyium.cleanup_policy': 'preserve',
+    })
   })
 
   test('carries worktree, role-scope metadata, and requester-aware write allowlist into codex peers', async () => {

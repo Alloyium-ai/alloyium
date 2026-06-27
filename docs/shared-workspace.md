@@ -40,10 +40,13 @@ their `git clone`s / edits land back on the host.
   (`CODEX_WORKSPACE_ROOT`, default `${HOME}/git`) and also receive the shared workspace
   bind. Relative launcher workspace paths are resolved against `A2A_LAUNCH_PROJECT_DIR`
   so Docker receives an absolute host path.
-- When a launch request includes an absolute `worktree` value inside `/workspace` or
-  `CODEX_WORKSPACE_ROOT`, the launcher sets `CODEX_GW_DEFAULT_CWD` for the spawned
-  Codex peer. Cwd-less jobs and plain requests then start in that workspace while
-  explicit job `cwd` values remain authoritative.
+- Read-only launch requests may use a shared checkout when no branch mutation is
+  needed. When a write-enabled launch request includes `worktree: REPO@BASE`, the
+  launcher creates or reuses a deterministic isolated git worktree under
+  `.a2a-worktrees` for `repo + base_ref + target_branch + job_id`; it never switches
+  the source checkout branch. The spawned peer receives that worktree as
+  `CODEX_GW_DEFAULT_CWD`, and `CODEX_BUILD_CWD_ROOTS` is narrowed to the exact
+  worker-visible worktree path.
 
 ## Setup
 

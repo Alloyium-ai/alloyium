@@ -56,6 +56,13 @@ type LaunchPolicy = {
   writeRequesters?: string[]
 }
 
+type LaunchWorktreeMetadata = {
+  jobId?: string
+  baseRef?: string
+  targetBranch?: string
+  cleanupPolicy?: string
+}
+
 export class AgentLauncherTools {
   private readonly agentId: string
   private readonly allowedAgentIds: Set<string>
@@ -112,6 +119,10 @@ export class AgentLauncherTools {
             label: { type: 'string', description: 'Optional short label used when agent_id is omitted, e.g. "review" or "smoke".' },
             mode: { enum: ['shim', 'webhook'], default: this.defaultMode, description: 'MCP transport mode for the launched peer. Prefer shim.' },
             worktree: { type: 'string', description: 'Optional REPO@BASE worktree argument passed to a2a-launch.sh.' },
+            job_id: { type: 'string', description: 'Optional write-job id used to derive an isolated launcher worktree.' },
+            base_ref: { type: 'string', description: 'Optional git base ref for isolated write-job worktree creation. Overrides REPO@BASE.' },
+            target_branch: { type: 'string', description: 'Optional target branch checked out only inside the isolated worktree.' },
+            cleanup_policy: { type: 'string', description: 'Optional sanitized cleanup policy label for worktree lifecycle tracking.' },
             policy: {
               type: 'object',
               additionalProperties: false,
@@ -165,6 +176,8 @@ export class AgentLauncherTools {
     const mode = parseMode(args.mode, this.defaultMode)
     const policy = parseLaunchPolicy(args.policy)
     if (policy === false) return this.result({ ok: false, error: 'bad_policy' }, true)
+    const worktreeMetadata = parseLaunchWorktreeMetadata(args)
+    if (worktreeMetadata === false) return this.result({ ok: false, error: 'bad_worktree_metadata' }, true)
     const cmd = ['bash', this.launcherPath, agentId, 'codex', mode === 'shim' ? '--shim' : '--webhook']
 
     if (args.worktree != null) {
@@ -180,13 +193,14 @@ export class AgentLauncherTools {
         label,
         mode,
         worktree: typeof args.worktree === 'string' ? args.worktree : undefined,
+        worktreeMetadata,
         dryRun: args.dry_run === true,
         policy,
       })
     }
 
     if (args.dry_run === true) {
-      return this.result({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: this.agentId, kind: 'codex', mode, cmd, ...(policy ? { policy: policyForResponse(policy) } : {}) })
+      return this.result({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: this.agentId, kind: 'codex', mode, cmd, ...(worktreeMetadata ? { worktree_metadata: worktreeMetadata } : {}), ...(policy ? { policy: policyForResponse(policy) } : {}) })
     }
 
     const r = await this.spawnImpl(cmd, {
@@ -217,7 +231,7 @@ export class AgentLauncherTools {
     })
   }
 
-  private async remoteLaunchCodex(args: { agentId: string; label?: string; mode: LaunchMode; worktree?: string; dryRun?: boolean; policy?: LaunchPolicy }): Promise<ToolResult> {
+  private async remoteLaunchCodex(args: { agentId: string; label?: string; mode: LaunchMode; worktree?: string; worktreeMetadata?: LaunchWorktreeMetadata; dryRun?: boolean; policy?: LaunchPolicy }): Promise<ToolResult> {
     const headers: Record<string, string> = { 'content-type': 'application/json' }
     if (this.launcherToken) headers.authorization = `Bearer ${this.launcherToken}`
     const policy = args.policy ? policyForLauncher(args.policy) : undefined
@@ -230,6 +244,10 @@ export class AgentLauncherTools {
         mode: args.mode,
         created_by: this.agentId,
         worktree: args.worktree,
+        ...(args.worktreeMetadata?.jobId ? { job_id: args.worktreeMetadata.jobId } : {}),
+        ...(args.worktreeMetadata?.baseRef ? { base_ref: args.worktreeMetadata.baseRef } : {}),
+        ...(args.worktreeMetadata?.targetBranch ? { target_branch: args.worktreeMetadata.targetBranch } : {}),
+        ...(args.worktreeMetadata?.cleanupPolicy ? { cleanup_policy: args.worktreeMetadata.cleanupPolicy } : {}),
         dry_run: args.dryRun === true,
         ...(policy ? { policy } : {}),
       }),
@@ -330,6 +348,31 @@ function parseLaunchPolicy(value: unknown): LaunchPolicy | undefined | false {
   }
 
   return Object.keys(policy).length ? policy : undefined
+}
+
+function parseLaunchWorktreeMetadata(args: Record<string, any>): LaunchWorktreeMetadata | undefined | false {
+  const meta: LaunchWorktreeMetadata = {}
+  if (args.job_id != null) {
+    const jobId = safeString(args.job_id, 128)
+    if (!jobId) return false
+    meta.jobId = jobId
+  }
+  if (args.base_ref != null) {
+    const baseRef = safeString(args.base_ref, 256)
+    if (!baseRef) return false
+    meta.baseRef = baseRef
+  }
+  if (args.target_branch != null) {
+    const targetBranch = safeString(args.target_branch, 256)
+    if (!targetBranch) return false
+    meta.targetBranch = targetBranch
+  }
+  if (args.cleanup_policy != null) {
+    const cleanupPolicy = safeString(args.cleanup_policy, 64)
+    if (!cleanupPolicy) return false
+    meta.cleanupPolicy = cleanupPolicy
+  }
+  return Object.keys(meta).length ? meta : undefined
 }
 
 function safeString(value: unknown, maxLen: number): string | null {

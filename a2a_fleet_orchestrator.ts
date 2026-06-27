@@ -478,13 +478,14 @@ function buildPlanAgent(spec: FleetSpec, agent: FleetAgentSpec): FleetRunPlanAge
   const cwd = resolveAgentCwd(spec, agent, provider)
   const role = agent.role ?? 'worker'
   const worktree = spec.base.ref ? `${spec.base.repo}@${spec.base.ref}` : spec.base.repo
+  const jobId = jobIdFor(spec.fleet_id, agent.id)
   return {
     agent_id: agent.id,
     role,
     runtime,
     provider,
     cwd,
-    launch: buildLaunchPlan(spec, agent.id, provider, worktree),
+    launch: buildLaunchPlan(spec, agent.id, provider, worktree, jobId),
     dispatch: buildDispatchPlan(spec, agent, runtime, cwd),
   }
 }
@@ -501,7 +502,7 @@ function workerWorktreeRoot(): string {
   return process.env.WORKER_WORKTREE_ROOT ?? process.env.AGENTS_ROOT ?? join(homedir(), 'a2a-agents')
 }
 
-function buildLaunchPlan(spec: FleetSpec, agentId: string, provider: FleetProvider, worktree: string): FleetRunPlanAgent['launch'] {
+function buildLaunchPlan(spec: FleetSpec, agentId: string, provider: FleetProvider, worktree: string, jobId: string): FleetRunPlanAgent['launch'] {
   if (provider === 'docker-codex') {
     const sandbox = spec.defaults.sandbox ?? 'read-only'
     return {
@@ -515,6 +516,9 @@ function buildLaunchPlan(spec: FleetSpec, agentId: string, provider: FleetProvid
           label: fleetLabel(agentId),
           mode: 'shim',
           worktree,
+          job_id: jobId,
+          ...(spec.base.ref ? { base_ref: spec.base.ref } : {}),
+          ...(sandbox === 'workspace-write' ? { target_branch: targetBranchFor(spec, agentId), cleanup_policy: 'preserve' } : {}),
           dry_run: true,
           policy: {
             allow_write: sandbox === 'workspace-write',
@@ -641,6 +645,10 @@ function cleanArtifact(value: string): string {
 
 function jobIdFor(fleetId: string, agentId: string): string {
   return `fleet-${fleetId}-${agentId}-001`.replace(/[^a-zA-Z0-9_.-]+/g, '-')
+}
+
+function targetBranchFor(spec: FleetSpec, agentId: string): string {
+  return `codex/${topicToken(spec.fleet_id, agentId)}`
 }
 
 function fleetLabel(agentId: string): string {
@@ -971,6 +979,9 @@ async function launchViaLauncherHttp(launcherUrl: string, spec: FleetSpec, agent
     mode: agent.launch.mode,
     label: opts.label,
     worktree,
+    job_id: String(agent.dispatch.envelope.job_id ?? agent.agent_id),
+    ...(spec.base.ref ? { base_ref: spec.base.ref } : {}),
+    ...(sandbox === 'workspace-write' ? { target_branch: targetBranchFor(spec, agent.agent_id), cleanup_policy: 'preserve' } : {}),
     policy: {
       allow_write: sandbox === 'workspace-write',
       sandbox,

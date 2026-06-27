@@ -358,6 +358,13 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - a2a_secrets:/run/secrets/a2a
+      - ${CODEX_WORKSPACE_ROOT:-${HOME}/git}:${CODEX_WORKSPACE_ROOT:-${HOME}/git}
+      - codex_workspaces:/workspaces
+      - type: bind
+        source: ${A2A_LAUNCH_WORKSPACE_HOST_PATH:-${A2A_WORKSPACE_HOST_PATH:-./data/workspace}}
+        target: ${A2A_LAUNCH_WORKSPACE_CONTAINER_PATH:-/workspace}
+        bind:
+          create_host_path: true
     depends_on:
       redis:
         condition: service_healthy

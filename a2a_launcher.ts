@@ -6,11 +6,13 @@
 // Compose now and Kubernetes later.
 import './preamble.ts'
 import http from 'node:http'
-import { timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { chownSync } from 'node:fs'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { mkdir, realpath } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { RedisClient } from 'bun'
 import { onboard } from './onboard.ts'
+import { isCwdRegistered, registerCwd } from './codex_build_authz.ts'
 
 type LaunchMode = 'shim' | 'webhook'
 
@@ -20,6 +22,10 @@ type CodexLaunchRequest = {
   mode?: unknown
   created_by?: unknown
   worktree?: unknown
+  job_id?: unknown
+  base_ref?: unknown
+  target_branch?: unknown
+  cleanup_policy?: unknown
   dry_run?: unknown
   policy?: {
     allow_write?: unknown
@@ -50,6 +56,25 @@ type DockerContainerSpec = {
   body: Record<string, unknown>
 }
 
+export type LaunchWorktreePlan = {
+  requested?: string
+  isolated: boolean
+  sourceRepoHostPath?: string
+  sourceRepoLauncherPath?: string
+  baseRef?: string
+  targetBranch?: string
+  jobId?: string
+  cleanupPolicy: string
+  hostWorktreePath?: string
+  launcherWorktreePath?: string
+  containerCwd?: string
+  cwdRoots?: string
+}
+
+export type LaunchWorktreePlanResult =
+  | { ok: true; plan?: LaunchWorktreePlan }
+  | { ok: false; error: string; detail?: unknown }
+
 const env = process.env
 const PORT = Number(env.A2A_LAUNCHER_PORT ?? 8910)
 const HOSTNAME = env.A2A_LAUNCHER_HOST ?? '127.0.0.1'
@@ -69,6 +94,7 @@ const WORKSPACES_VOLUME = env.A2A_LAUNCH_WORKSPACES_VOLUME ?? `${PROJECT}_codex_
 const WORKSPACE_ROOT = env.CODEX_WORKSPACE_ROOT ?? '/srv/git'
 const SHARED_WORKSPACE_HOST_PATH = resolveLaunchWorkspaceHostPath(env.A2A_LAUNCH_WORKSPACE_HOST_PATH ?? env.A2A_WORKSPACE_HOST_PATH, env.A2A_LAUNCH_PROJECT_DIR)
 const SHARED_WORKSPACE_CONTAINER_PATH = resolveContainerWorkspacePath(env.A2A_LAUNCH_WORKSPACE_CONTAINER_PATH)
+const WORKTREE_ROOT_HOST_PATH = resolveLaunchWorkspaceHostPath(env.A2A_LAUNCH_WORKTREE_ROOT, env.A2A_LAUNCH_PROJECT_DIR)
 const DEFAULT_CODEX_CWD_ROOTS = buildDefaultCodexCwdRoots(SHARED_WORKSPACE_HOST_PATH ? SHARED_WORKSPACE_CONTAINER_PATH : null, WORKSPACE_ROOT)
 const CODEX_HOST_HOME = resolveCodexHostHome(env.CODEX_HOST_HOME, env.HOME, WORKSPACE_ROOT)
 // Claude's login is split across a dir (~/.claude) and a file (~/.claude.json); resolve
@@ -77,6 +103,7 @@ const CLAUDE_HOST_HOME = resolveClaudeHostHome(env.CLAUDE_HOST_HOME, env.HOME, W
 const CLAUDE_HOST_CONFIG = resolveClaudeHostConfig(env.CLAUDE_HOST_CONFIG, env.HOME, WORKSPACE_ROOT)
 const CONTAINER_USER = env.A2A_LAUNCH_CONTAINER_USER ?? `${env.CC_UID ?? 1000}:${env.CC_GID ?? 1000}`
 const PRESENCE_WAIT_MS = Math.max(0, Number(env.A2A_LAUNCH_PRESENCE_WAIT_MS ?? 15_000) || 0)
+const CWD_ALLOW_TTL_S = Math.max(1, Number(env.A2A_LAUNCH_CWD_ALLOW_TTL_S ?? env.CODEX_BUILD_CWD_TTL_S ?? 12 * 3600) || 12 * 3600)
 const AGENT_ID_RE = /^[a-z0-9-]{1,64}$/
 const ROLE_SCOPE_RE = /^[A-Za-z0-9:_./*@+=-]{1,256}$/
 
@@ -171,26 +198,196 @@ export function buildDefaultCodexCwdRoots(sharedWorkspacePath: string | null, le
     .join(',')
 }
 
+function stripTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, '') || '/'
+}
+
+function isSafeGitRef(value: string): boolean {
+  const s = value.trim()
+  if (!s || s.length > 256) return false
+  if (s.startsWith('-') || s.startsWith('/') || s.endsWith('/') || s.endsWith('.')) return false
+  if (s.includes('..') || s.includes('@{') || s.includes('//')) return false
+  return !/[\\\s~^:?*\[\]\0]/.test(s)
+}
+
+function asSafeGitRef(value: unknown): string | undefined {
+  const s = asSafeEnvValue(value, 256)?.trim()
+  return s && isSafeGitRef(s) ? s : undefined
+}
+
+function asSafeJobId(value: unknown): string | undefined {
+  const s = asSafeEnvValue(value, 128)?.trim()
+  return s && /^[A-Za-z0-9_.:-]{1,128}$/.test(s) ? s : undefined
+}
+
+function asCleanupPolicy(value: unknown): string | undefined {
+  const s = asSafeEnvValue(value, 64)?.trim()
+  return s && /^[A-Za-z0-9_.:-]{1,64}$/.test(s) ? s : undefined
+}
+
+function slugPart(value: string, max = 40): string {
+  const s = value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
+  return (s || 'x').slice(0, max).replace(/[.-]$/g, '') || 'x'
+}
+
+function parseLaunchWorktreeSpec(value: string | undefined): { repo: string; baseRef?: string } | null {
+  const raw = value?.trim()
+  if (!raw || /[\r\n]/.test(raw)) return null
+  const at = raw.lastIndexOf('@')
+  if (at > 0 && at < raw.length - 1) {
+    const repo = raw.slice(0, at).trim()
+    const baseRef = raw.slice(at + 1).trim()
+    if (!repo || !isSafeGitRef(baseRef)) return null
+    return { repo, baseRef }
+  }
+  return { repo: raw }
+}
+
+function resolveLaunchRepoHostPath(repo: string, workspaceRoot = WORKSPACE_ROOT): string | null {
+  const raw = repo.trim().replace(/\/+$/, '')
+  if (!raw || /[\r\n]/.test(raw)) return null
+  if (isAbsolute(raw)) return raw
+  const root = workspaceRoot.trim()
+  return root ? resolvePath(root, raw) : null
+}
+
+export function mapLaunchHostPathToContainerPath(
+  value: string,
+  sharedHostPath: string | null = SHARED_WORKSPACE_HOST_PATH,
+  sharedContainerPath = SHARED_WORKSPACE_CONTAINER_PATH,
+  workspaceRoot = WORKSPACE_ROOT,
+): string | undefined {
+  const p = stripTrailingSlashes(value)
+  const sharedHost = sharedHostPath ? stripTrailingSlashes(sharedHostPath) : null
+  if (sharedHost && (p === sharedHost || p.startsWith(`${sharedHost}/`))) {
+    const suffix = p.slice(sharedHost.length)
+    return `${stripTrailingSlashes(sharedContainerPath)}${suffix}` || sharedContainerPath
+  }
+
+  const root = workspaceRoot.trim() ? stripTrailingSlashes(workspaceRoot) : ''
+  if (root && (p === root || p.startsWith(`${root}/`))) return p
+  return undefined
+}
+
+function mapLaunchHostPathToLauncherPath(
+  value: string,
+  sharedHostPath: string | null = SHARED_WORKSPACE_HOST_PATH,
+  sharedContainerPath = SHARED_WORKSPACE_CONTAINER_PATH,
+  workspaceRoot = WORKSPACE_ROOT,
+): string | undefined {
+  return mapLaunchHostPathToContainerPath(value, sharedHostPath, sharedContainerPath, workspaceRoot)
+}
+
+function defaultWorktreeRootHostPath(sharedHostPath: string | null, workspaceRoot: string): string {
+  return join(stripTrailingSlashes(sharedHostPath ?? workspaceRoot), '.a2a-worktrees')
+}
+
+function buildWorktreeSlug(repo: string, baseRef: string, targetBranch: string, jobId: string): string {
+  const hash = createHash('sha256').update(`${repo}\0${baseRef}\0${targetBranch}\0${jobId}`).digest('hex').slice(0, 10)
+  return [
+    slugPart(basename(repo) || 'repo', 32),
+    slugPart(baseRef, 28),
+    slugPart(targetBranch, 36),
+    slugPart(jobId, 32),
+    hash,
+  ].join('-')
+}
+
+function defaultTargetBranch(agentId: string, jobId: string): string {
+  return `codex/${slugPart(agentId, 28)}-${slugPart(jobId, 28)}`
+}
+
+export function buildLaunchWorktreePlan(opts: {
+  agentId: string
+  worktree?: string
+  allowWrite?: boolean
+  jobId?: string
+  baseRef?: string
+  targetBranch?: string
+  cleanupPolicy?: string
+  sharedHostPath?: string | null
+  sharedContainerPath?: string
+  workspaceRoot?: string
+  worktreeRootHostPath?: string | null
+}): LaunchWorktreePlanResult {
+  const allowWrite = opts.allowWrite === true
+  const sharedHostPath = opts.sharedHostPath === undefined ? SHARED_WORKSPACE_HOST_PATH : opts.sharedHostPath
+  const sharedContainerPath = opts.sharedContainerPath ?? SHARED_WORKSPACE_CONTAINER_PATH
+  const workspaceRoot = opts.workspaceRoot ?? WORKSPACE_ROOT
+  const cleanupPolicy = opts.cleanupPolicy ?? 'preserve'
+  const parsed = parseLaunchWorktreeSpec(opts.worktree)
+
+  if (!parsed) {
+    if (allowWrite) return { ok: false, error: 'write_worktree_required' }
+    return { ok: true }
+  }
+
+  const sourceRepoHostPath = resolveLaunchRepoHostPath(parsed.repo, workspaceRoot)
+  if (!sourceRepoHostPath) return { ok: false, error: 'bad_worktree_repo' }
+  const sourceRepoLauncherPath = mapLaunchHostPathToLauncherPath(sourceRepoHostPath, sharedHostPath, sharedContainerPath, workspaceRoot)
+  const sourceRepoContainerPath = mapLaunchHostPathToContainerPath(sourceRepoHostPath, sharedHostPath, sharedContainerPath, workspaceRoot)
+  if (!sourceRepoLauncherPath || !sourceRepoContainerPath) return { ok: false, error: 'worktree_not_mounted', detail: sourceRepoHostPath }
+
+  const baseRef = opts.baseRef ?? parsed.baseRef ?? 'HEAD'
+  if (!isSafeGitRef(baseRef)) return { ok: false, error: 'bad_base_ref' }
+
+  if (!allowWrite) {
+    return {
+      ok: true,
+      plan: {
+        requested: opts.worktree,
+        isolated: false,
+        sourceRepoHostPath,
+        sourceRepoLauncherPath,
+        baseRef,
+        cleanupPolicy,
+        containerCwd: sourceRepoContainerPath,
+      },
+    }
+  }
+
+  const jobId = opts.jobId ?? opts.agentId
+  const targetBranch = opts.targetBranch ?? defaultTargetBranch(opts.agentId, jobId)
+  if (!isSafeGitRef(targetBranch)) return { ok: false, error: 'bad_target_branch' }
+  const rootHost = opts.worktreeRootHostPath ?? WORKTREE_ROOT_HOST_PATH ?? defaultWorktreeRootHostPath(sharedHostPath, workspaceRoot)
+  const rootLauncher = mapLaunchHostPathToLauncherPath(rootHost, sharedHostPath, sharedContainerPath, workspaceRoot)
+  const rootContainer = mapLaunchHostPathToContainerPath(rootHost, sharedHostPath, sharedContainerPath, workspaceRoot)
+  if (!rootLauncher || !rootContainer) return { ok: false, error: 'worktree_root_not_mounted', detail: rootHost }
+
+  const slug = buildWorktreeSlug(sourceRepoHostPath, baseRef, targetBranch, jobId)
+  const hostWorktreePath = join(rootHost, slug)
+  const launcherWorktreePath = join(rootLauncher, slug)
+  const containerCwd = join(rootContainer, slug)
+  return {
+    ok: true,
+    plan: {
+      requested: opts.worktree,
+      isolated: true,
+      sourceRepoHostPath,
+      sourceRepoLauncherPath,
+      baseRef,
+      targetBranch,
+      jobId,
+      cleanupPolicy,
+      hostWorktreePath,
+      launcherWorktreePath,
+      containerCwd,
+      cwdRoots: containerCwd,
+    },
+  }
+}
+
 export function resolveLaunchWorktreeCwd(
   value: string | undefined,
   sharedHostPath: string | null = SHARED_WORKSPACE_HOST_PATH,
   sharedContainerPath = SHARED_WORKSPACE_CONTAINER_PATH,
   workspaceRoot = WORKSPACE_ROOT,
 ): string | undefined {
-  const raw = value?.trim()
-  if (!raw || /[\r\n]/.test(raw)) return undefined
-  const repo = raw.slice(0, raw.lastIndexOf('@') > 0 ? raw.lastIndexOf('@') : raw.length).replace(/\/+$/, '') || raw
-  if (!isAbsolute(repo)) return undefined
-
-  const sharedHost = sharedHostPath?.replace(/\/+$/, '') || null
-  if (sharedHost && (repo === sharedHost || repo.startsWith(`${sharedHost}/`))) {
-    const suffix = repo.slice(sharedHost.length)
-    return `${sharedContainerPath.replace(/\/+$/, '')}${suffix}` || sharedContainerPath
-  }
-
-  const root = workspaceRoot.replace(/\/+$/, '')
-  if (root && (repo === root || repo.startsWith(`${root}/`))) return repo
-  return undefined
+  const parsed = parseLaunchWorktreeSpec(value)
+  if (!parsed) return undefined
+  if (!isAbsolute(parsed.repo)) return undefined
+  const repo = resolveLaunchRepoHostPath(parsed.repo, workspaceRoot)
+  return repo ? mapLaunchHostPathToContainerPath(repo, sharedHostPath, sharedContainerPath, workspaceRoot) : undefined
 }
 
 export function buildCodexWriteAllowlist(createdBy: string, allowWrite: boolean, requested: string[] = [], envValues: Record<string, string | undefined> = env): string {
@@ -239,6 +436,7 @@ export function buildDockerContainerSpec(req: {
   createdBy: string
   label?: string
   worktree?: string
+  worktreePlan?: LaunchWorktreePlan
   allowWrite?: boolean
   sandbox?: string
   effort?: string
@@ -256,12 +454,18 @@ export function buildDockerContainerSpec(req: {
   }
   if (req.label) labels['ai.alloyium.label'] = req.label
   if (req.worktree) labels['ai.alloyium.worktree'] = req.worktree
+  if (req.worktreePlan?.containerCwd) labels['ai.alloyium.worktree_cwd'] = req.worktreePlan.containerCwd
+  if (req.worktreePlan?.baseRef) labels['ai.alloyium.base_ref'] = req.worktreePlan.baseRef
+  if (req.worktreePlan?.targetBranch) labels['ai.alloyium.target_branch'] = req.worktreePlan.targetBranch
+  if (req.worktreePlan?.jobId) labels['ai.alloyium.job_id'] = req.worktreePlan.jobId
+  if (req.worktreePlan?.cleanupPolicy) labels['ai.alloyium.cleanup_policy'] = req.worktreePlan.cleanupPolicy
 
   const allowWrite = req.allowWrite ?? false
   const sandbox = req.sandbox ?? 'danger-full-access'
   const workspaceWriteSandbox = allowWrite ? req.sandbox ?? env.CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX ?? 'workspace-write' : undefined
   const turnTimeoutMs = req.turnTimeoutMs ?? asPositiveInteger(Number(env.CODEX_GW_TURN_TIMEOUT_MS))
-  const defaultCwd = resolveLaunchWorktreeCwd(req.worktree)
+  const defaultCwd = req.worktreePlan?.containerCwd ?? resolveLaunchWorktreeCwd(req.worktree)
+  const cwdRoots = req.worktreePlan?.cwdRoots ?? env.CODEX_BUILD_CWD_ROOTS ?? DEFAULT_CODEX_CWD_ROOTS
   const writeAllowlist = buildCodexWriteAllowlist(req.createdBy, allowWrite, req.writeRequesters)
   const binds = [
     `${SECRETS_VOLUME}:/run/secrets/a2a:ro`,
@@ -292,6 +496,11 @@ export function buildDockerContainerSpec(req: {
     envPair('A2A_PARENT_AGENT_ID', req.createdBy),
     envPair('A2A_LAUNCH_AGENT_LABEL', req.label),
     envPair('A2A_LAUNCH_WORKTREE', req.worktree),
+    envPair('A2A_LAUNCH_WORKTREE_CWD', req.worktreePlan?.containerCwd),
+    envPair('A2A_LAUNCH_WORKTREE_BASE_REF', req.worktreePlan?.baseRef),
+    envPair('A2A_LAUNCH_WORKTREE_TARGET_BRANCH', req.worktreePlan?.targetBranch),
+    envPair('A2A_LAUNCH_WORKTREE_CLEANUP_POLICY', req.worktreePlan?.cleanupPolicy),
+    envPair('A2A_LAUNCH_JOB_ID', req.worktreePlan?.jobId),
     envPair('A2A_REQUESTED_ROLE_SCOPES', req.roleScopes?.length ? JSON.stringify(req.roleScopes) : undefined),
     envPair('CODEX_GW_EFFORT', req.effort ?? env.CODEX_GW_EFFORT ?? 'xhigh'),
     envPair('CODEX_GW_MODEL', req.model ?? env.CODEX_GW_MODEL),
@@ -302,7 +511,7 @@ export function buildDockerContainerSpec(req: {
     envPair('CODEX_GW_CODEX_SANDBOX', sandbox),
     envPair('CODEX_GW_WORKSPACE_WRITE_CODEX_SANDBOX', workspaceWriteSandbox),
     envPair('CODEX_GW_DEFAULT_CWD', defaultCwd),
-    envPair('CODEX_BUILD_CWD_ROOTS', env.CODEX_BUILD_CWD_ROOTS ?? DEFAULT_CODEX_CWD_ROOTS),
+    envPair('CODEX_BUILD_CWD_ROOTS', cwdRoots),
     envPair('CODEX_GW_ENABLE_A2A_TOOLS', '1'),
     envPair('CODEX_GW_A2A_TOOLS_MODE', req.mode),
     envPair('CODEX_GW_A2A_SHIM_BIN', '/usr/local/bin/a2a-shim'),
@@ -513,6 +722,109 @@ function chownIdentityFiles(files: { seedPath: string; pubPath: string; envPath:
   }
 }
 
+async function runGit(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number }> {
+  const proc = Bun.spawn(['git', '-c', 'safe.directory=*', '-C', cwd, ...args], { stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  return { ok: exitCode === 0, stdout, stderr, exitCode }
+}
+
+function mapLaunchRuntimePathToContainerPath(value: string): string | undefined {
+  const p = stripTrailingSlashes(value)
+  const shared = stripTrailingSlashes(SHARED_WORKSPACE_CONTAINER_PATH)
+  if (shared && (p === shared || p.startsWith(`${shared}/`))) return p
+  const root = WORKSPACE_ROOT.trim() ? stripTrailingSlashes(WORKSPACE_ROOT) : ''
+  if (root && (p === root || p.startsWith(`${root}/`))) return p
+  return undefined
+}
+
+async function chownWorktreeIfRoot(path: string): Promise<{ ok: true } | { ok: false; error: string; detail?: string }> {
+  const getuid = (process as any).getuid
+  if (typeof getuid !== 'function' || getuid() !== 0) return { ok: true }
+  const [uidRaw, gidRaw] = CONTAINER_USER.split(':')
+  const uid = Number(uidRaw)
+  const gid = Number(gidRaw ?? uidRaw)
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) return { ok: true }
+  const proc = Bun.spawn(['chown', '-R', `${uid}:${gid}`, path], { stdout: 'pipe', stderr: 'pipe' })
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
+  return exitCode === 0 ? { ok: true } : { ok: false, error: 'worktree_chown_failed', detail: stderr.trim().slice(0, 1000) }
+}
+
+async function finalizedRuntimePlan(plan: LaunchWorktreePlan): Promise<LaunchWorktreePlan> {
+  if (!plan.launcherWorktreePath || !plan.containerCwd) return plan
+  const launcherRealpath = await realpath(plan.launcherWorktreePath)
+  return {
+    ...plan,
+    launcherWorktreePath: launcherRealpath,
+    containerCwd: mapLaunchRuntimePathToContainerPath(launcherRealpath) ?? plan.containerCwd,
+    cwdRoots: mapLaunchRuntimePathToContainerPath(launcherRealpath) ?? plan.containerCwd,
+  }
+}
+
+async function ensureIsolatedGitWorktree(plan: LaunchWorktreePlan): Promise<{ ok: true; plan: LaunchWorktreePlan } | { ok: false; error: string; detail?: unknown }> {
+  if (!plan.isolated) return { ok: true, plan }
+  if (!plan.sourceRepoLauncherPath || !plan.launcherWorktreePath || !plan.baseRef || !plan.targetBranch) {
+    return { ok: false, error: 'bad_worktree_plan' }
+  }
+
+  const sourceTop = await runGit(['rev-parse', '--show-toplevel'], plan.sourceRepoLauncherPath)
+  if (!sourceTop.ok) return { ok: false, error: 'worktree_source_not_git', detail: sourceTop.stderr.trim() || plan.sourceRepoLauncherPath }
+  const sourceRepo = sourceTop.stdout.trim()
+
+  const base = await runGit(['rev-parse', '--verify', '--quiet', `${plan.baseRef}^{commit}`], sourceRepo)
+  if (!base.ok) return { ok: false, error: 'base_ref_not_found', detail: plan.baseRef }
+
+  const existing = await runGit(['rev-parse', '--show-toplevel'], plan.launcherWorktreePath)
+  if (existing.ok) {
+    const branch = await runGit(['branch', '--show-current'], plan.launcherWorktreePath)
+    if (!branch.ok || branch.stdout.trim() !== plan.targetBranch) {
+      return { ok: false, error: 'existing_worktree_branch_mismatch', detail: { path: plan.launcherWorktreePath, target_branch: plan.targetBranch, current_branch: branch.stdout.trim() } }
+    }
+    return { ok: true, plan: await finalizedRuntimePlan(plan) }
+  }
+
+  await mkdir(dirname(plan.launcherWorktreePath), { recursive: true })
+  const branchExists = await runGit(['show-ref', '--verify', '--quiet', `refs/heads/${plan.targetBranch}`], sourceRepo)
+  const addArgs = branchExists.ok
+    ? ['worktree', 'add', plan.launcherWorktreePath, plan.targetBranch]
+    : ['worktree', 'add', '-b', plan.targetBranch, plan.launcherWorktreePath, plan.baseRef]
+  const added = await runGit(addArgs, sourceRepo)
+  if (!added.ok) return { ok: false, error: 'git_worktree_add_failed', detail: added.stderr.trim().slice(0, 2000) }
+
+  const chowned = await chownWorktreeIfRoot(plan.launcherWorktreePath)
+  if (!chowned.ok) return chowned
+  return { ok: true, plan: await finalizedRuntimePlan(plan) }
+}
+
+async function registerLaunchWorktreeCwd(plan: LaunchWorktreePlan): Promise<{ ok: true } | { ok: false; error: string; detail?: unknown }> {
+  if (!plan.isolated || !plan.containerCwd) return { ok: true }
+  const ok = await registerCwd(getRedis(), plan.containerCwd, { ttlS: CWD_ALLOW_TTL_S })
+  if (!ok) return { ok: false, error: 'cwd_register_failed', detail: plan.containerCwd }
+  if (!await isCwdRegistered(getRedis(), plan.containerCwd)) return { ok: false, error: 'cwd_register_verify_failed', detail: plan.containerCwd }
+  return { ok: true }
+}
+
+function worktreePlanMetadata(plan: LaunchWorktreePlan | undefined): Record<string, unknown> | undefined {
+  if (!plan) return undefined
+  return {
+    requested: plan.requested,
+    isolated: plan.isolated,
+    source_repo: plan.sourceRepoHostPath,
+    source_repo_runtime: plan.sourceRepoLauncherPath,
+    worktree_host_path: plan.hostWorktreePath,
+    worktree_runtime_path: plan.launcherWorktreePath,
+    worktree_path: plan.containerCwd,
+    base_ref: plan.baseRef,
+    target_branch: plan.targetBranch,
+    job_id: plan.jobId,
+    cleanup_policy: plan.cleanupPolicy,
+    cwd_roots: plan.cwdRoots,
+  }
+}
+
 async function handleCodexLaunch(input: CodexLaunchRequest): Promise<Response> {
   const agentId = asAgentId(input.agent_id)
   if (!agentId) return err('bad_agent_id')
@@ -525,7 +837,15 @@ async function handleCodexLaunch(input: CodexLaunchRequest): Promise<Response> {
   const dryRun = input.dry_run === true
   const worktree = input.worktree == null ? undefined : asSafeEnvValue(input.worktree, 512)
   if (input.worktree != null && !worktree) return err('bad_worktree')
-  const allowWrite = typeof input.policy?.allow_write === 'boolean' ? input.policy.allow_write : undefined
+  const jobId = input.job_id == null ? undefined : asSafeJobId(input.job_id)
+  if (input.job_id != null && !jobId) return err('bad_job_id')
+  const baseRef = input.base_ref == null ? undefined : asSafeGitRef(input.base_ref)
+  if (input.base_ref != null && !baseRef) return err('bad_base_ref')
+  const targetBranch = input.target_branch == null ? undefined : asSafeGitRef(input.target_branch)
+  if (input.target_branch != null && !targetBranch) return err('bad_target_branch')
+  const cleanupPolicy = input.cleanup_policy == null ? 'preserve' : asCleanupPolicy(input.cleanup_policy)
+  if (input.cleanup_policy != null && !cleanupPolicy) return err('bad_cleanup_policy')
+  const allowWrite = typeof input.policy?.allow_write === 'boolean' ? input.policy.allow_write : false
   const sandbox = typeof input.policy?.sandbox === 'string' ? input.policy.sandbox : undefined
   const effort = asSafeEnvValue(input.policy?.effort, 32)
   const model = asSafeEnvValue(input.policy?.model, 128)
@@ -536,14 +856,31 @@ async function handleCodexLaunch(input: CodexLaunchRequest): Promise<Response> {
   if (!writeRequesters) return err('bad_write_requesters')
 
   if (PROVIDER !== 'docker') return err('unsupported_provider', 500, PROVIDER)
-  const spec = buildDockerContainerSpec({ agentId, mode, createdBy, label, worktree, allowWrite, sandbox, effort, model, turnTimeoutMs, roleScopes, writeRequesters })
+  const planned = buildLaunchWorktreePlan({ agentId, worktree, allowWrite, jobId, baseRef, targetBranch, cleanupPolicy })
+  if (!planned.ok) return err(planned.error, 400, planned.detail)
+  let worktreePlan = planned.plan
+  if (allowWrite && !worktreePlan?.isolated) return err('write_worktree_required')
+
   if (dryRun) {
-    return json({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'codex', mode, provider: 'docker', runtime_id: spec.name, status: 'planned', container: spec })
+    const spec = buildDockerContainerSpec({ agentId, mode, createdBy, label, worktree, worktreePlan, allowWrite, sandbox, effort, model, turnTimeoutMs, roleScopes, writeRequesters })
+    return json({ ok: true, dry_run: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'codex', mode, provider: 'docker', runtime_id: spec.name, status: 'planned', launch_plan: worktreePlanMetadata(worktreePlan), container: spec })
   }
 
+  if (worktreePlan?.isolated) {
+    const ensured = await ensureIsolatedGitWorktree(worktreePlan)
+    if (!ensured.ok) return err(ensured.error, 500, ensured.detail)
+    worktreePlan = ensured.plan
+  }
+
+  const spec = buildDockerContainerSpec({ agentId, mode, createdBy, label, worktree, worktreePlan, allowWrite, sandbox, effort, model, turnTimeoutMs, roleScopes, writeRequesters })
   const identity = await onboard({ id: agentId, dir: SECRETS_DIR, redis: getRedis(), transport: 'none', natsUrl: NATS_URL, redisUrl: REDIS_URL, verify: true })
   if (identity.verified === false) return err('identity_verify_failed', 500)
   chownIdentityFiles(identity.files)
+
+  if (worktreePlan?.isolated) {
+    const registered = await registerLaunchWorktreeCwd(worktreePlan)
+    if (!registered.ok) return err(registered.error, 500, registered.detail)
+  }
 
   const runtime = await ensureDockerRuntime(spec)
   if (!runtime.ok) return err(runtime.error, 500, runtime.detail)
@@ -558,10 +895,11 @@ async function handleCodexLaunch(input: CodexLaunchRequest): Promise<Response> {
     status: state,
     created_by: createdBy,
     label,
+    worktree: worktreePlanMetadata(worktreePlan),
     updated_at: new Date().toISOString(),
   })
-  log('codex_agent_launched', { agent_id: agentId, created_by: createdBy, runtime_id: runtime.runtimeId, status: state })
-  return json({ ok: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'codex', mode, provider: 'docker', runtime_id: runtime.runtimeId, status: state })
+  log('codex_agent_launched', { agent_id: agentId, created_by: createdBy, runtime_id: runtime.runtimeId, status: state, worktree: worktreePlan?.containerCwd })
+  return json({ ok: true, agent_id: agentId, parent_agent_id: createdBy, kind: 'codex', mode, provider: 'docker', runtime_id: runtime.runtimeId, status: state, worktree: worktreePlanMetadata(worktreePlan) })
 }
 
 // kind=claude: same guard/onboard/runtime flow as handleCodexLaunch, just with the
