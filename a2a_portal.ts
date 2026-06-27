@@ -17,11 +17,13 @@ import { buildPortalDefaultCwd, buildPortalRealtimeStreamTopic, buildPortalSendA
 import { computeFleet, disabledTaskboardTotals, parseHostAliases, parseKnownHosts, type Fleet, type FleetActivityMessage, type FleetPresence, type LogicalHost, type RawPresence } from './a2a_portal_hosts.ts'
 import { PortalLangChainAgent, PORTAL_LANGCHAIN_CHANNEL } from './portal_langchain_agent.ts'
 import { resolveRef } from './output_transport.ts'
+import { AciArchiveStore, type AciQueryFilters } from './aci_archive.ts'
 
 const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
 const PORT = Number(process.env.A2A_PORTAL_PORT ?? 8900)
 const STORE = process.env.A2A_PORTAL_STORE ?? '/srv/git/alloyium/logs/a2a_portal.jsonl'
+const ACI_DB = process.env.A2A_ACI_DB ?? '/var/lib/alloyium/portal/a2a_aci.sqlite3'
 const PORTAL_AGENT_ID = process.env.A2A_PORTAL_AGENT_ID ?? process.env.A2A_AGENT_ID ?? 'a2a-portal'
 const SEND_ENABLED = (process.env.A2A_PORTAL_SEND_ENABLED ?? '0') === '1' || process.env.A2A_PORTAL_SEND_ENABLED?.toLowerCase() === 'true'
 const HOST_OPS_CHAT_CWD = process.env.A2A_PORTAL_HOST_OPS_CHAT_CWD ?? '/srv/git/alloyium'
@@ -166,11 +168,64 @@ async function persistInit() {
 }
 function append(line: string) { try { require('node:fs').appendFileSync(STORE, line + '\n') } catch {} }
 
+function startAciArchive(): void {
+  try {
+    aciArchive = new AciArchiveStore(ACI_DB)
+    aciStatus = { enabled: true, db_path: ACI_DB, error: '' }
+  } catch (e) {
+    aciArchive = null
+    aciStatus = { enabled: false, db_path: ACI_DB, error: e instanceof Error ? e.message : String(e) }
+    console.error('[portal] ACI archive disabled', aciStatus.error)
+  }
+}
+
+function aciSubjectFor(m: Msg): string {
+  if (m.kind === 'topic') return `alloyium.a2a.topic.${m.channel}`
+  const target = m.channel.startsWith('@') ? m.channel.slice(1) : (m.to || PORTAL_AGENT_ID)
+  return `alloyium.a2a.agent.${target}.inbox`
+}
+
+function ingestAciMessage(m: Msg, rawEnvelope?: string): void {
+  if (!aciArchive || m.kind === 'local') return
+  try {
+    const routeKind = m.kind === 'topic' ? 'topic' : 'direct'
+    aciArchive.ingestEnvelope({
+      env: {
+        id: m.id,
+        from: m.from,
+        to: routeKind === 'topic' ? `topic:${m.channel}` : m.to,
+        type: m.type,
+        thread: m.thread,
+        corr: m.corr,
+        ts: m.ts,
+        body: m.body,
+      },
+      rawEnvelope,
+      subject: aciSubjectFor(m),
+      sourceKind: routeKind,
+      routeKind,
+      observedAt: new Date(m.t || Date.now()).toISOString(),
+      recipient: routeKind === 'direct' ? m.to : null,
+      trustStatus: rawEnvelope ? 'observed' : 'portal_history',
+      routeStatus: 'observed',
+    })
+  } catch (e) {
+    aciStatus = { ...aciStatus, error: e instanceof Error ? e.message : String(e) }
+    console.error('[portal] ACI ingest failed', aciStatus.error)
+  }
+}
+
 async function loadHistory() {
   try {
     if (!(await Bun.file(STORE).exists())) return
     const lines = (await Bun.file(STORE).text()).split('\n').filter(Boolean).slice(-CAP * 4)
-    for (const l of lines) { try { record(JSON.parse(l), false) } catch {} }
+    for (const l of lines) {
+      try {
+        const m = JSON.parse(l) as Msg
+        record(m, false)
+        ingestAciMessage(m)
+      } catch {}
+    }
     let n = 0; for (const c of channels.values()) n += c.msgs.length
     console.error(`[portal] loaded ${n} messages from history across ${channels.size} channels`)
   } catch {}
@@ -178,7 +233,8 @@ async function loadHistory() {
 
 async function onMessage(subject: string, data: Uint8Array) {
   const ch = channelOf(subject); if (!ch) return
-  let env: any; try { env = JSON.parse(dec.decode(data)) } catch { return }
+  const rawEnvelope = dec.decode(data)
+  let env: any; try { env = JSON.parse(rawEnvelope) } catch { return }
   if (!env || typeof env !== 'object' || !env.id) return
   const m: Msg = {
     id: env.id, channel: ch.name, kind: ch.kind, from: env.from ?? '?', to: env.to ?? '',
@@ -191,6 +247,7 @@ async function onMessage(subject: string, data: Uint8Array) {
   if (existing && existing.msgs.some((x) => x.id === m.id)) return
   record(m, false)
   append(JSON.stringify(m))
+  ingestAciMessage(m, rawEnvelope)
   projectSkillEvent(m)
 }
 
@@ -198,6 +255,8 @@ let redis: RedisClient
 let sendChannel: A2AChannel | null = null
 let sendStatus: { enabled: boolean; agent_id: string; error: string } = { enabled: false, agent_id: PORTAL_AGENT_ID, error: SEND_ENABLED ? 'not_started' : 'disabled' }
 let langchainAgent: PortalLangChainAgent | null = null
+let aciArchive: AciArchiveStore | null = null
+let aciStatus: { enabled: boolean; db_path: string; error: string } = { enabled: false, db_path: ACI_DB, error: 'not_started' }
 
 function portalHostOptions(): { knownHosts: LogicalHost[]; aliases: Record<string, LogicalHost>; containerHostFallback: LogicalHost } {
   const knownHosts = parseKnownHosts(process.env.A2A_PORTAL_KNOWN_HOSTS)
@@ -443,6 +502,65 @@ async function readSkills(): Promise<any[]> {
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 const json = (o: any, init: ResponseInit = {}) => new Response(JSON.stringify(o), { ...init, headers: { 'content-type': 'application/json', ...(init.headers ?? {}) } })
 
+function csvParam(url: URL, name: string): string[] {
+  return (url.searchParams.get(name) ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .slice(0, 80)
+}
+
+function intParam(url: URL, name: string): number | undefined {
+  const n = Number(url.searchParams.get(name))
+  return Number.isFinite(n) ? Math.trunc(n) : undefined
+}
+
+function aciFilters(url: URL): AciQueryFilters {
+  return {
+    from: url.searchParams.get('from'),
+    to: url.searchParams.get('to'),
+    agents: csvParam(url, 'agents'),
+    topics: csvParam(url, 'topics'),
+    types: csvParam(url, 'types'),
+    schemas: csvParam(url, 'schemas'),
+    thread: url.searchParams.get('thread'),
+    jobId: url.searchParams.get('job_id'),
+    sessionId: url.searchParams.get('session_id'),
+    limit: intParam(url, 'limit'),
+    cursor: url.searchParams.get('cursor'),
+    order: url.searchParams.get('order') === 'asc' ? 'asc' : 'desc',
+  }
+}
+
+function aciUnavailable(): Response | null {
+  if (aciArchive) return null
+  return json({ ok: false, aci: aciStatus }, { status: 503 })
+}
+
+function handleAciApi(url: URL, p: string): Response {
+  const unavailable = aciUnavailable()
+  if (unavailable) return unavailable
+  const archive = aciArchive!
+  if (p === '/api/aci/status') return json({ ok: true, aci: aciStatus, stats: archive.stats() })
+  if (p === '/api/aci/agents') return json(archive.listAgents({ ...aciFilters(url), q: url.searchParams.get('q') }))
+  if (p === '/api/aci/graph') return json(archive.graph(aciFilters(url)))
+  if (p === '/api/aci/matrix') {
+    return json(archive.matrix({
+      ...aciFilters(url),
+      metric: url.searchParams.get('metric') ?? 'count',
+      includeTopics: url.searchParams.get('include_topics') !== '0',
+    }))
+  }
+  if (p === '/api/aci/timeline') return json(archive.timeline(aciFilters(url)))
+  const ego = p.match(/^\/api\/aci\/agent\/([^/]+)\/ego$/)
+  if (ego) return json(archive.ego(decodeURIComponent(ego[1]), aciFilters(url)))
+  const thread = p.match(/^\/api\/aci\/thread\/([^/]+)$/)
+  if (thread) return json(archive.thread(decodeURIComponent(thread[1]), aciFilters(url)))
+  const job = p.match(/^\/api\/aci\/job\/([^/]+)$/)
+  if (job) return json(archive.job(decodeURIComponent(job[1]), aciFilters(url)))
+  return new Response('not found', { status: 404 })
+}
+
 Bun.serve({
   port: PORT, hostname: '0.0.0.0',
   idleTimeout: 255,
@@ -488,6 +606,7 @@ Bun.serve({
     if (p === '/api/fleet') return json(await fleet())
     if (p === '/api/presence') return json({ presence: (await presence()).map(fp => ({ ...fp, host: fp.logical_host })) })
     if (p === '/api/skills') return json({ skills: await readSkills(), feed: brainFeed })
+    if (p === '/api/aci/status' || p.startsWith('/api/aci/')) return handleAciApi(url, p)
     const mc = p.match(/^\/api\/channels\/(.+)$/)
     if (mc) {
       const name = decodeURIComponent(mc[1])
@@ -638,11 +757,12 @@ body.nav-open .scrim{opacity:1;pointer-events:auto}
 .tabpanel{display:none;flex:1;min-height:0;overflow:auto}
 body:not(.tab-chat) #msgs,body:not(.tab-chat) .composer,body:not(.tab-chat) .chat-only{display:none}
 body.tab-brain #brainPanel{display:block;overflow:auto}
+body.tab-intelligence #intelPanel{display:block;overflow:auto}
 .brain-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px;flex:0 0 auto}
 .brain-head h2{font-size:16px}
 .panel-sub{color:var(--mut);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .col-empty{color:var(--mut);font-size:12px;text-align:center;padding:18px 0}
-#brainPanel{padding:14px 18px}
+#brainPanel,#intelPanel{padding:14px 18px}
 .brain-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:16px;align-items:start}
 .sec2{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;display:flex;align-items:center;gap:8px}
 .cnt2{background:var(--bg2);color:var(--mut);border-radius:9px;padding:0 7px;font-size:11px}
@@ -660,8 +780,19 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 .fi .ic{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:0 0 8px}
 .fi .ft{flex:1;min-width:0}.fi .ft .h{font-size:12px;color:var(--tx)}.fi .ft .s{font-size:11px;color:var(--mut);margin-top:2px;word-break:break-word}
 .fi .ts2{color:var(--mut);font-size:10px;white-space:nowrap}
+.intel-head{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.intel-head h2{font-size:16px;margin-right:auto}
+.intel-head select,.intel-head button{background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:7px 9px;font:12px ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.intel-head button{cursor:pointer;background:var(--bg2)}
+.intel-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:12px;align-items:start}
+.intel-panel{min-width:0;background:var(--bg2);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:hidden}
+.intel-panel.wide{grid-column:1/-1}.intel-panel h3{font-size:13px;color:#eef2f8;margin-bottom:10px}
+.matrix-wrap{overflow:auto;max-height:360px;border:1px solid var(--line);border-radius:7px}
+.matrix{width:100%;border-collapse:collapse;font-size:12px}.matrix th,.matrix td{border-bottom:1px solid var(--line);border-right:1px solid var(--line);padding:6px 7px;text-align:left;white-space:nowrap}.matrix th{position:sticky;top:0;background:var(--bg3);z-index:1}.matrix td.num{text-align:right;font-variant-numeric:tabular-nums;color:#eef2f8}
+.timeline{display:grid;gap:7px;max-height:430px;overflow:auto}.tev{display:grid;grid-template-columns:110px minmax(0,1fr) auto;gap:10px;align-items:center;padding:7px 0;border-top:1px solid #171b24}.tev:first-child{border-top:0}.tev .when{color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}.tev .route{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tev .schema{color:var(--mut);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ego-cols{display:grid;grid-template-columns:1fr 1fr;gap:10px}.ego-list{display:grid;gap:6px}.ego-chip{display:flex;justify-content:space-between;gap:10px;border:1px solid var(--line);border-radius:7px;padding:7px 8px;background:var(--bg);font-size:12px}.ego-chip span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ego-chip b{font-variant-numeric:tabular-nums;color:#eef2f8}
 @container (max-width:980px){.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.dash-panels{grid-template-columns:1fr}}
-@media(max-width:760px){.tab{padding:8px 12px}.brain-grid{grid-template-columns:1fr}#brainPanel{padding:10px 12px}}
+@media(max-width:760px){.tab{padding:8px 12px}.brain-grid,.intel-grid,.ego-cols{grid-template-columns:1fr}#brainPanel,#intelPanel{padding:10px 12px}.tev{grid-template-columns:1fr}.tev .schema{max-width:none}}
 @media(max-width:760px){.fleet .metric{padding:9px 5px}.homebtn{min-height:44px;padding:12px 16px}.dash{padding-bottom:18px}.dash-head{align-items:flex-start;flex-direction:column;margin-top:2px}.dash-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.dash-card{padding:10px 9px}.dash-card .num{font-size:20px}.dash-card .lab{font-size:9px}.panel{padding:12px}.chart{height:132px}.row{gap:8px}}
 </style></head><body class="tab-chat">
 <div class="side">
@@ -674,7 +805,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
 <div class="resizer" id="sideResizer" role="separator" aria-label="Resize sidebar" aria-orientation="vertical" tabindex="0"></div>
 <div class="scrim" id="scrim"></div>
 <div class="main">
-  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
+  <div class="top"><button class="navbtn" id="navBtn" type="button" aria-label="Open navigation" aria-expanded="false">☰</button><div class="tabs" id="tabs"><button class="tab active" type="button" data-tab="chat">Chat</button><button class="tab" type="button" data-tab="intelligence">Intelligence</button><button class="tab" type="button" data-tab="brain">Skills &amp; Brain</button></div><h2 id="title" class="chat-only"># —</h2><label class="viewtoggle chat-only"><input id="renderOutput" type="checkbox"> Render output</label><span class="meta chat-only" id="meta"></span></div>
   <div class="msgs" id="msgs"><div class="empty">Loading fleet dashboard</div></div>
   <div class="composer">
     <input id="sendTo" autocomplete="off" spellcheck="false" aria-label="Recipient" placeholder="@agent or #topic">
@@ -692,6 +823,10 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
       <div><div class="sec2">Memory &amp; Activity</div><div class="feed" id="feed"></div></div>
     </div>
   </div>
+  <div class="tabpanel" id="intelPanel">
+    <div class="intel-head"><h2>Intelligence</h2><select id="intelAgent" aria-label="Agent"></select><button id="intelRefresh" type="button">Refresh</button></div>
+    <div id="intelBody"><div class="col-empty">Loading</div></div>
+  </div>
 </div>
   <script>
   const $=s=>document.querySelector(s)
@@ -699,6 +834,7 @@ body.tab-brain #brainPanel{display:block;overflow:auto}
   const HOME='__fleet_dashboard__'
   let active=HOME, chans=[], presenceList=[], fleetStats=null, fleetData=null, sendReady=false, portalAgent='', currentMsgs=[]
   let activeTab='chat', skillsData=[], feedData=[], freshSkills={}
+  let intelData=null, intelAgent=localStorage.getItem('a2a.portal.intelAgent')||''
   let langchainReady=false, langchainError='', langchainModel=''
   let renderOutput=localStorage.getItem('a2a.portal.renderOutput')==='1'
   let sendMode=localStorage.getItem('a2a.portal.sendMode')||'chat'
@@ -884,10 +1020,40 @@ $('#resetContextBtn').onclick=resetChatContext
 $('#sendBody').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendNow()}})
   function activePath(){if(active===HOME)return '/api/fleet';return isLangChainChannel()?'/api/langchain/messages':(active&&active[0]==='@'?'/api/dm/'+encodeURIComponent(active.slice(1)):'/api/channels/'+encodeURIComponent(active))}
   function messageTouchesActive(d){if(!active||active===HOME)return false;if(d.channel===active)return true;if(active[0]!=='@')return false;const peer=active.slice(1);const m=d.message||{};return d.channel==='@'+portalAgent&&m.from===peer}
+  function setupIntelControls(){var b=$('#intelRefresh'),s=$('#intelAgent');if(b)b.onclick=loadIntelligence;if(s)s.onchange=function(){intelAgent=s.value;localStorage.setItem('a2a.portal.intelAgent',intelAgent);loadIntelligence()}}
+  async function loadIntelligence(){let status={stats:{}},agents={agents:[]},matrix={rows:[],cols:[],cells:[]},timeline={events:[]},ego=null;
+    try{status=await(await fetch('/api/aci/status')).json()}catch(e){status={ok:false,aci:{error:String(e)},stats:{}}}
+    try{agents=await(await fetch('/api/aci/agents?limit=80')).json()}catch(e){}
+    if(!intelAgent&&agents.agents&&agents.agents.length)intelAgent=agents.agents[0].id
+    try{matrix=await(await fetch('/api/aci/matrix?limit=120&include_topics=1')).json()}catch(e){}
+    try{timeline=await(await fetch('/api/aci/timeline?limit=80')).json()}catch(e){}
+    if(intelAgent){try{ego=await(await fetch('/api/aci/agent/'+encodeURIComponent(intelAgent)+'/ego?limit=80')).json()}catch(e){}}
+    intelData={status,agents,matrix,timeline,ego};renderIntelligence()}
+  function renderIntelligence(){var body=$('#intelBody'),sel=$('#intelAgent');if(!body)return;var d=intelData||{};var agents=(d.agents&&d.agents.agents)||[];
+    if(sel){var opts=['<option value="">All agents</option>'].concat(agents.map(function(a){return '<option value="'+escAttr(a.id)+'"'+(a.id===intelAgent?' selected':'')+'>'+esc(a.label||a.id)+'</option>'}));sel.innerHTML=opts.join('')}
+    if(d.status&&!d.status.ok){body.innerHTML='<div class="col-empty">'+esc((d.status.aci&&d.status.aci.error)||'ACI unavailable')+'</div>';return}
+    var stats=d.status&&d.status.stats||{},m=d.matrix||{rows:[],cols:[],cells:[]},tl=d.timeline||{events:[]},ego=d.ego||null
+    body.innerHTML='<div class="intel-grid">'+
+      '<div class="intel-panel"><h3>Traffic Matrix</h3>'+renderMatrix(m)+'</div>'+
+      '<div class="intel-panel"><h3>Archive</h3>'+renderIntelStats(stats)+'</div>'+
+      '<div class="intel-panel wide"><h3>Timeline</h3>'+renderTimeline(tl.events||[])+'</div>'+
+      '<div class="intel-panel wide"><h3>Ego</h3>'+renderEgo(ego)+'</div>'+
+    '</div>'}
+  function renderIntelStats(s){var cells=[['Events',s.events||0],['Agents',s.agents||0],['Edges',s.edges||0],['Jobs',s.jobs||0],['Sessions',s.sessions||0]];
+    return '<div class="dash-grid">'+cells.map(function(c){return '<div class="dash-card"><span class="num">'+esc(c[1])+'</span><span class="lab">'+esc(c[0])+'</span></div>'}).join('')+'</div>'}
+  function renderMatrix(m){var rows=(m.rows||[]).slice(0,12),cols=(m.cols||[]).slice(0,12),cellMap={};(m.cells||[]).forEach(function(c){cellMap[c.row+'\\n'+c.col]=c});
+    if(!rows.length||!cols.length)return '<div class="col-empty">No traffic</div>';
+    return '<div class="matrix-wrap"><table class="matrix"><thead><tr><th>from / to</th>'+cols.map(function(c){return '<th title="'+escAttr(c.id)+'">'+esc(shortName(c.label||c.id,16))+'</th>'}).join('')+'</tr></thead><tbody>'+
+      rows.map(function(r){return '<tr><th title="'+escAttr(r.id)+'">'+esc(shortName(r.label||r.id,18))+'</th>'+cols.map(function(c){var v=cellMap[r.id+'\\n'+c.id];var n=v?Number(v.count)||0:0;return '<td class="num" title="'+escAttr(r.id+' -> '+c.id)+'">'+(n?esc(n):'')+'</td>'}).join('')+'</tr>'}).join('')+
+      '</tbody></table></div>'}
+  function renderTimeline(events){if(!events.length)return '<div class="col-empty">No events</div>';return '<div class="timeline">'+events.slice(0,80).map(function(e){var to=e.topic?'#'+e.topic:(e.to_agent||'');var route=(e.from_agent||'?')+' → '+to;var schema=e.schema||e.msg_type||'';return '<div class="tev"><div class="when">'+esc(new Date(e.observed_at).toLocaleTimeString())+'</div><div class="route" title="'+escAttr(route)+'">'+esc(route)+'</div><div class="schema" title="'+escAttr(schema)+'">'+esc(schema)+'</div></div>'}).join('')+'</div>'}
+  function renderEgo(ego){if(!ego||!ego.center)return '<div class="col-empty">Select an agent</div>';var edges=(ego.edges||[]).slice(0,18),events=(ego.events||[]).slice(0,10);
+    return '<div class="ego-cols"><div><div class="sec2">'+esc(ego.center.label||ego.center.id)+'</div><div class="ego-list">'+(edges.length?edges.map(function(e){return '<div class="ego-chip"><span title="'+escAttr(e.from+' -> '+e.to)+'">'+esc(shortName(e.from,22))+' → '+esc(shortName(e.to,22))+'</span><b>'+esc(e.count)+'</b></div>'}).join(''):'<div class="col-empty">No edges</div>')+'</div></div>'+
+      '<div><div class="sec2">Recent events</div><div class="ego-list">'+(events.length?events.map(function(e){return '<div class="ego-chip"><span title="'+escAttr(e.event_id)+'">'+esc(e.schema||e.msg_type)+'</span><b>'+esc(ago(Date.parse(e.observed_at)))+'</b></div>'}).join(''):'<div class="col-empty">No events</div>')+'</div></div></div>'}
   function setupTabs(){document.body.classList.add('tab-chat');var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++){(function(b){b.onclick=function(){setTab(b.dataset.tab)}})(bs[i])}}
-  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain');document.body.classList.add('tab-'+name);
+  function setTab(name){activeTab=name;document.body.classList.remove('tab-chat','tab-brain','tab-intelligence');document.body.classList.add('tab-'+name);
     var bs=document.querySelectorAll('#tabs .tab');for(var i=0;i<bs.length;i++)bs[i].classList.toggle('active',bs[i].dataset.tab===name);
-    closeNavOnMobile();if(name==='brain')loadBrain()}
+    closeNavOnMobile();if(name==='brain')loadBrain();if(name==='intelligence')loadIntelligence()}
   async function loadBrain(){try{var r=await(await fetch('/api/skills')).json();if(r){skillsData=r.skills||[];feedData=r.feed||[]}}catch(e){}renderSkills();renderFeed()}
   function renderSkills(){var el=$('#skills');if(!el)return;var cnt=$('#skillCount');if(cnt)cnt.textContent=skillsData.length;
     if(!skillsData.length){el.innerHTML='<div class="col-empty">No skills learned yet</div>';return}
@@ -910,9 +1076,10 @@ es.onmessage=e=>{const d=JSON.parse(e.data);
   if(d.kind!=='msg')return;
   const c=chans.find(x=>x.name===d.channel);if(c){c.count++;c.lastT=d.message.t}else loadChannels();renderSidebar();
   if(active===HOME)loadFleet();
+  if(activeTab==='intelligence')loadIntelligence();
   if(messageTouchesActive(d)){const el=$('#msgs');const stick=el.scrollTop+el.clientHeight>el.scrollHeight-40;
     fetch(activePath()).then(r=>r.json()).then(r=>{render(r.messages);if(!stick)el.scrollTop=el.scrollTop})}}
-  async function init(){setupNav();setupTabs();setupSidebarResize();setupPresenceClicks();setupChannelClicks();setupHome();setupRenderToggle();setupSendMode();await loadSendStatus();await loadLangChainStatus();await loadChannels();await loadFleet();setInterval(loadPresence,5000);setInterval(loadChannels,8000);setInterval(loadSendStatus,10000);setInterval(loadLangChainStatus,10000)}
+  async function init(){setupNav();setupTabs();setupSidebarResize();setupPresenceClicks();setupChannelClicks();setupHome();setupRenderToggle();setupSendMode();setupIntelControls();await loadSendStatus();await loadLangChainStatus();await loadChannels();await loadFleet();setInterval(loadPresence,5000);setInterval(loadChannels,8000);setInterval(loadSendStatus,10000);setInterval(loadLangChainStatus,10000)}
 init()
 </script></body></html>`
 
@@ -924,6 +1091,7 @@ async function shutdown(code = 0) {
   if (!shutdownPromise) {
     shutdownPromise = (async () => {
       await sendChannel?.stop().catch(() => {})
+      aciArchive?.close()
       await nc?.drain().catch(() => {})
     })()
   }
@@ -937,6 +1105,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
 
 ;(async () => {
   redis = new RedisClient(REDIS_URL)
+  startAciArchive()
   await persistInit(); await loadHistory()
   await startSendChannel()
   langchainAgent = new PortalLangChainAgent({
