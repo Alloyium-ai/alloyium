@@ -11,7 +11,7 @@ shared topic planes, and MCP-connected coding agents.
 
 ## Public Runtime Export
 
-This repository contains the public A2A runtime components: the TypeScript
+This repository contains the public Alloyium runtime components: the TypeScript
 message bus services, the Rust `a2a-shim`, protocol helpers, and local
 development utilities.
 
