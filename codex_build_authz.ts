@@ -36,7 +36,7 @@ export type AuthorizeWriteJobResult =
   | { ok: false; reason: string }
 
 /** Legacy default codex-build key prefix, used when no fleet namespace is configured. */
-export const DEFAULT_CODEX_BUILD_KEY_PREFIX = 'claude-channels:a2a:codex-build:'
+export const DEFAULT_CODEX_BUILD_KEY_PREFIX = 'alloyium:a2a:codex-build:'
 
 /**
  * Resolve the fleet-namespaced Redis key prefix for codex-build coordination keys.
@@ -46,7 +46,7 @@ export const DEFAULT_CODEX_BUILD_KEY_PREFIX = 'claude-channels:a2a:codex-build:'
  * `alloyium:a2a:codex-build:`) and the launcher forwards the SAME value to every codex
  * worker. Because the launcher's `registerCwd` and the worker's `isCwdRegistered` both
  * derive their key from this one value, they can never split across namespaces (the bug
- * this replaces: a hardcoded `claude-channels:` literal that ignored the fleet namespace).
+ * this replaces: a hardcoded `alloyium:` literal that ignored the fleet namespace).
  * Falls back to the legacy default so a fleet with no namespace env is unaffected.
  */
 export function codexBuildKeyPrefix(env: Record<string, string | undefined> = process.env): string {

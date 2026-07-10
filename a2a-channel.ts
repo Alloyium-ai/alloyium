@@ -1,4 +1,4 @@
-// Agent-to-agent (A2A) message bus over the claude-channels bridge.
+// Agent-to-agent (A2A) message bus over the alloyium bridge.
 //
 // Unlike nats-channel.ts (read-only, never publishes), this module DOES publish —
 // but only ever under a validated A2A subject prefix, from exactly one call
@@ -62,14 +62,14 @@ import {
 const TOKEN = '[a-z0-9-]{1,64}'
 
 // Full-match allowlist: a direct inbox or a topic. Nothing else is publishable.
-const ALLOW = new RegExp(`^claude\\.a2a\\.(agent\\.${TOKEN}\\.inbox|topic\\.${TOKEN})$`)
+const ALLOW = new RegExp(`^alloyium\\.a2a\\.(agent\\.${TOKEN}\\.inbox|topic\\.${TOKEN})$`)
 
 // Defense-in-depth: redundant with ALLOW, but independently testable. A subject
 // matching any of these is denied outright. Covers every trading/ops/fire/system
 // namespace this process can see on the bus.
 export const DENY_PREFIXES = [
   'trades.', 'orders.', 'fire.', 'exec.', 'ramp.', 'polymarket.', 'mlb.',
-  'coinbase.', 'binance.', '$JS.', '$SYS.', '_INBOX.', 'claude.channels.',
+  'coinbase.', 'binance.', '$JS.', '$SYS.', '_INBOX.', 'alloyium.channels.',
 ]
 
 export class A2ADenied extends Error {
@@ -79,7 +79,7 @@ export class A2ADenied extends Error {
   }
 }
 
-export const DEFAULT_A2A_SUBJECT_PREFIX = 'claude.a2a.'
+export const DEFAULT_A2A_SUBJECT_PREFIX = 'alloyium.a2a.'
 const SUBJECT_PREFIX_RE = /^(?:claude|alloyium)\.a2a(?:\.[a-z0-9-]{1,32})?\.$/
 
 export function normalizeA2ASubjectPrefix(prefix: string | undefined | null = DEFAULT_A2A_SUBJECT_PREFIX): string {
@@ -91,9 +91,9 @@ export function normalizeA2ASubjectPrefix(prefix: string | undefined | null = DE
 }
 
 // Throws A2ADenied unless `subject` is one of the two allowed shapes. ALWAYS the
-// first statement of the publish path. The default prefix is `claude.a2a.`; a
-// deployment may explicitly select the legacy Alloyium namespace with
-// A2A_SUBJECT_PREFIX, but only the audited A2A subject shapes are allowed.
+// first statement of the publish path. The default prefix is `alloyium.a2a.`; a
+// deployment may explicitly select a validated fleet namespace with A2A_SUBJECT_PREFIX,
+// but only the audited A2A subject shapes are allowed.
 //
 // NOTE on dev mode: this function takes no notion of A2A_DEV_NO_AUTH. The dev
 // bypass relaxes the NATS-creds (L2) and signing layers, NEVER this allowlist
@@ -105,7 +105,7 @@ export function assertA2ASubject(subject: string, prefix = DEFAULT_A2A_SUBJECT_P
   for (const p of DENY_PREFIXES) if (subject.startsWith(p)) throw new A2ADenied(subject)
   // Shape check against the canonical prefix form so a test prefix substitutes
   // cleanly (the tail after the prefix is what must match the two shapes).
-  if (!ALLOW.test('claude.a2a.' + subject.slice(prefix.length))) throw new A2ADenied(subject)
+  if (!ALLOW.test('alloyium.a2a.' + subject.slice(prefix.length))) throw new A2ADenied(subject)
 }
 
 // Build the inbox / topic subjects from an ALREADY-validated agent-id or topic
@@ -117,7 +117,7 @@ export const topicSubject = (prefix: string, topic: string) => `${prefix}topic.$
 // ── config (env-overridable; opts override env, like NatsChannelOpts) ───────
 const NATS_URL = process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
-const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'claude.channels.control'
+const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'alloyium.channels.control'
 const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS ?? 2500)
 const SELFHEAL_MS = Number(process.env.SELFHEAL_INTERVAL_MS ?? 30_000)
 const COUNTERS_MS = Number(process.env.COUNTERS_INTERVAL_MS ?? 60_000)
@@ -699,7 +699,7 @@ export const verifyEnvelope = (e: Envelope, key: VerifyKey, expectedAlg: SigAlg)
 
 export const SKILLS_GLOBAL_TOPIC = process.env.A2A_SKILLS_GLOBAL_TOPIC ?? 'skills-global'
 export const SKILLS_TOPIC = process.env.A2A_SKILLS_TOPIC ?? 'skills'
-const SKILLS_GLOBAL_KEY = process.env.A2A_SKILLS_GLOBAL_KEY ?? 'claude-channels:a2a:skills:global'
+const SKILLS_GLOBAL_KEY = process.env.A2A_SKILLS_GLOBAL_KEY ?? 'alloyium:a2a:skills:global'
 const SKILLS_MAX_TAGS = 24
 const SKILLS_MAX_TAG_LEN = 64
 
@@ -832,7 +832,7 @@ export type A2AChannelOpts = {
   transportAuth?: 'nkey' | 'creds' | 'none'
   stream?: string
   controlSubject?: string
-  prefix?: string // default 'claude.a2a.'; env A2A_SUBJECT_PREFIX may select a validated fleet namespace.
+  prefix?: string // default 'alloyium.a2a.'; env A2A_SUBJECT_PREFIX may select a validated fleet namespace.
   topicsKeyPrefix?: string
   secretKeyPrefix?: string
   pubkeyKeyPrefix?: string
@@ -1090,15 +1090,15 @@ export class A2AChannel {
     this.credsPath = opts.credsPath ?? e.A2A_CREDS
     this.nkeyPath = opts.nkeyPath ?? e.A2A_NKEY
     this.signingKeyPath = opts.signingKeyPath ?? e.A2A_SIGNING_KEY
-    this.stream = opts.stream ?? e.A2A_STREAM ?? 'CLAUDE_A2A'
+    this.stream = opts.stream ?? e.A2A_STREAM ?? 'ALLOYIUM_A2A'
     this.controlSubject = opts.controlSubject ?? CONTROL_SUBJECT
     this.prefix = normalizeA2ASubjectPrefix(opts.prefix ?? e.A2A_SUBJECT_PREFIX)
-    this.topicsKeyPrefix = opts.topicsKeyPrefix ?? e.A2A_TOPICS_KEY_PREFIX ?? 'claude-channels:a2a:topics:'
-    this.secretKeyPrefix = opts.secretKeyPrefix ?? e.A2A_SECRET_KEY_PREFIX ?? 'claude-channels:a2a:secret:'
-    this.pubkeyKeyPrefix = opts.pubkeyKeyPrefix ?? e.A2A_PUBKEY_KEY_PREFIX ?? 'claude-channels:a2a:pubkey:'
-    this.directEncCapKeyPrefix = opts.directEncCapKeyPrefix ?? e.A2A_DIRECT_ENC_CAP_KEY_PREFIX ?? 'claude-channels:a2a:direct-enc:'
+    this.topicsKeyPrefix = opts.topicsKeyPrefix ?? e.A2A_TOPICS_KEY_PREFIX ?? 'alloyium:a2a:topics:'
+    this.secretKeyPrefix = opts.secretKeyPrefix ?? e.A2A_SECRET_KEY_PREFIX ?? 'alloyium:a2a:secret:'
+    this.pubkeyKeyPrefix = opts.pubkeyKeyPrefix ?? e.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
+    this.directEncCapKeyPrefix = opts.directEncCapKeyPrefix ?? e.A2A_DIRECT_ENC_CAP_KEY_PREFIX ?? 'alloyium:a2a:direct-enc:'
     this.peerProtocolKeyPrefix = opts.peerProtocolKeyPrefix ?? e.A2A_PEER_PROTOCOL_KEY_PREFIX ?? DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX
-    this.presenceKeyPrefix = opts.presenceKeyPrefix ?? e.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
+    this.presenceKeyPrefix = opts.presenceKeyPrefix ?? e.A2A_PRESENCE_KEY_PREFIX ?? 'alloyium:a2a:presence:'
     const directEncryption = opts.directEncryption ?? e.A2A_DIRECT_ENCRYPTION ?? 'opportunistic'
     if (!isDirectEncryptionMode(directEncryption)) throw new Error(`invalid A2A_DIRECT_ENCRYPTION '${directEncryption}'`)
     this.directEncryption = directEncryption
@@ -1564,7 +1564,7 @@ export class A2AChannel {
     await this.reload() // initial topic membership
   }
 
-  // Ensure the shared CLAUDE_A2A stream exists, bound to the inbox subject space.
+  // Ensure the shared ALLOYIUM_A2A stream exists, bound to the inbox subject space.
   // A management call to $JS.API — NOT a data publish. A pre-existing stream with
   // different limits is ops-owned: log drift, do not mutate.
   private async ensureStream(): Promise<void> {
@@ -1642,7 +1642,7 @@ export class A2AChannel {
   }
 
   // TEST ONLY — exercise the publish allowlist at the real call site. Still goes
-  // through assertA2ASubject, so it cannot publish outside claude.a2a.> either.
+  // through assertA2ASubject, so it cannot publish outside alloyium.a2a.> either.
   async _publishForTest(subject: string, durable = false): Promise<{ seq?: number }> {
     return this.publishA2A(subject, new TextEncoder().encode('x'), durable)
   }
@@ -2178,7 +2178,7 @@ export class A2AChannel {
 
   private async subscribeInbox(): Promise<void> {
     const subject = inboxSubject(this.prefix, this.agentId)
-    const durable = `claude-a2a-${this.agentId}`
+    const durable = `alloyium-a2a-${this.agentId}`
     if (this.inboxMinIntervalMs > 0) {
       this.inboxGate = makeGate({ mode: 'core', subject, min_interval_ms: this.inboxMinIntervalMs }, this.now)
     }

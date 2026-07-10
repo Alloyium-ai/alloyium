@@ -1,5 +1,5 @@
 {
-  "name": "claude-channels",
+  "name": "alloyium",
   "version": "0.1.0",
   "scripts": {
     "start": "bun ./webhook.ts",

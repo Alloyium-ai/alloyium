@@ -29,9 +29,9 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000
 const KEY_CACHE_TTL_MS = 60_000
 const MAX_CACHE_KEYS = 4096
 
-const PUBKEY_PREFIX = process.env.A2A_PUBKEY_KEY_PREFIX ?? 'claude-channels:a2a:pubkey:'
-const PRESENCE_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
-const EPOCH_PREFIX = process.env.A2A_CORE_EPOCH_KEY_PREFIX ?? 'claude-channels:a2a:org:core-epoch:'
+const PUBKEY_PREFIX = process.env.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
+const PRESENCE_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'alloyium:a2a:presence:'
+const EPOCH_PREFIX = process.env.A2A_CORE_EPOCH_KEY_PREFIX ?? 'alloyium:a2a:org:core-epoch:'
 
 const PRESENCE_RECLAIM_SCRIPT =
   "local v=redis.call('GET',KEYS[1]); " +

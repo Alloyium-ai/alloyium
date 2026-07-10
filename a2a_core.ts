@@ -24,7 +24,7 @@
 // block runs it as a service.
 //
 // ADVISORY-ONLY, no fire authority (unchanged): the core can still only publish to
-// `claude.a2a.{agent.*.inbox|topic.*}` (the `assertA2ASubject` allowlist), signed per
+// `alloyium.a2a.{agent.*.inbox|topic.*}` (the `assertA2ASubject` allowlist), signed per
 // agent, and inbound verify stays fail-closed + anti-downgrade — all inherited from
 // `A2AChannel`, not reimplemented here.
 import './preamble.ts' // stdout→stderr reroute + global error handlers (MCP stdio purity; harmless for a service)
@@ -251,7 +251,7 @@ export class A2ACore {
     const e = process.env
     this.natsUrl = opts.natsUrl ?? e.NATS_URL ?? 'nats://127.0.0.1:4222'
     this.redisUrl = opts.redisUrl ?? e.REDIS_URL ?? 'redis://127.0.0.1:6379'
-    this.stream = opts.stream ?? e.A2A_STREAM ?? 'CLAUDE_A2A'
+    this.stream = opts.stream ?? e.A2A_STREAM ?? 'ALLOYIUM_A2A'
     this.prefix = opts.prefix !== undefined
       ? normalizeA2ASubjectPrefix(opts.prefix)
       : (e.A2A_SUBJECT_PREFIX ? normalizeA2ASubjectPrefix(e.A2A_SUBJECT_PREFIX) : undefined)
@@ -262,7 +262,7 @@ export class A2ACore {
     this.natsPoolSize = Math.max(1, Math.min(3, Math.trunc(opts.natsPoolSize ?? Number(e.A2A_CORE_NATS_POOL ?? 3)) || 3))
     this.statusBeatMs = Math.max(0, Math.trunc(opts.statusBeatMs ?? Number(e.A2A_CORE_BEAT_MS ?? 30_000)) || 0)
     this.peerProtocolKeyPrefix = opts.peerProtocolKeyPrefix ?? e.A2A_PEER_PROTOCOL_KEY_PREFIX ?? DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX
-    this.presenceKeyPrefix = opts.presenceKeyPrefix ?? e.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
+    this.presenceKeyPrefix = opts.presenceKeyPrefix ?? e.A2A_PRESENCE_KEY_PREFIX ?? 'alloyium:a2a:presence:'
     this.presenceTtlS = atLeast(opts.presenceTtlS ?? envNum(e.A2A_PRESENCE_TTL_S, 90), 5)
     this.heartbeatMs = atLeast(opts.heartbeatMs ?? envNum(e.A2A_HEARTBEAT_MS, 30_000), 1000)
     this.maxSendBytes = atLeast(opts.maxSendBytes ?? envNum(e.A2A_MAX_SEND_BYTES, 8192), 1)
@@ -485,7 +485,7 @@ export class A2ACore {
   }
 
   // Boot: open the shared connections + construct the shared stateless tool fronts.
-  // The CLAUDE_A2A stream is provisioned (idempotently) by the first session's
+  // The ALLOYIUM_A2A stream is provisioned (idempotently) by the first session's
   // A2AChannel.ensureStream — the core does not fork the stream config here.
   // Deliberately NOT `async`: returns the memoized in-flight promise BY IDENTITY so
   // concurrent callers share ONE start (an async wrapper would hand each caller a distinct
@@ -593,7 +593,7 @@ export class A2ACore {
   // The `prefix: this.prefix` lock is UNCONDITIONAL (gate review P2-1): in prod this.prefix is
   // undefined (test-isolation-only), and the old `...(this.prefix ? {prefix} : {})` let a
   // caller's opts.prefix survive the spread (self-DoS); `prefix: undefined` shadows it and
-  // A2AChannel still applies its 'claude.a2a.' default. Exposed so the LOCK is unit-tested
+  // A2AChannel still applies its 'alloyium.a2a.' default. Exposed so the LOCK is unit-tested
   // directly (no bus) — including the prod case this.prefix === undefined.
   buildSessionOpts(agentId: string, opts: Partial<A2AChannelOpts> = {}): A2AChannelOpts {
     return {

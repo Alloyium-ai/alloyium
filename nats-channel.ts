@@ -21,8 +21,8 @@ import { RedisClient } from 'bun'
 // ── config (env-overridable; defaults match docs/ops/nats_message_catalog.md) ──
 const NATS_URL = process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
-const SUBS_KEY = process.env.SUBS_KEY ?? 'claude-channels:subscriptions'
-const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'claude.channels.control'
+const SUBS_KEY = process.env.SUBS_KEY ?? 'alloyium:subscriptions'
+const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'alloyium.channels.control'
 const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS ?? 2500)
 const COUNTERS_MS = Number(process.env.COUNTERS_INTERVAL_MS ?? 60_000)
 const SELFHEAL_MS = Number(process.env.SELFHEAL_INTERVAL_MS ?? 30_000)
@@ -89,8 +89,8 @@ export type SubSpec = {
 // Redis only when the key is genuinely ABSENT (first run). Edit the Redis key (or
 // publish to the control subject) to change the live set without a redeploy.
 export const DEFAULT_SUBS: SubSpec[] = [
-  { subject: 'polymarket.ramp.alert', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'claude-channels-ramp', filter_subject: 'polymarket.ramp.alert' },
-  { subject: 'ramp.v4.velo', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'claude-channels-velo', filter_subject: 'ramp.v4.velo' },
+  { subject: 'polymarket.ramp.alert', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'alloyium-ramp', filter_subject: 'polymarket.ramp.alert' },
+  { subject: 'ramp.v4.velo', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'alloyium-velo', filter_subject: 'ramp.v4.velo' },
   { subject: 'polymarket.alpha.alarm', mode: 'core' },
   { subject: 'polymarket.alpha.deep_underdog_dip', mode: 'core' },
   { subject: 'polymarket.dip_alert.*', mode: 'core' }, // .tier1 + .push
@@ -164,7 +164,7 @@ export function validateSpecs(specs: SubSpec[]): { valid: SubSpec[]; errors: str
     // S2: A2A namespaces are owned by the A2A bus (a2a-channel.ts),
     // which has its own attr contract. The read-only advisory plane must never
     // bind there, or the two feeds' <channel> attributes would blur.
-    if (s.subject.startsWith('claude.a2a.') || s.subject.startsWith('alloyium.a2a.')) {
+    if (s.subject.startsWith('alloyium.a2a.')) {
       errors.push(`A2A namespace is bus-owned, not an advisory subject: ${s.subject}`)
       continue
     }
@@ -253,7 +253,7 @@ export class NatsChannel {
     // nats.js handles reconnects internally once connected.
     for (;;) {
       try {
-        this.nc = await connect({ servers: this.natsUrl, name: 'claude-channels', reconnect: true, maxReconnectAttempts: -1 })
+        this.nc = await connect({ servers: this.natsUrl, name: 'alloyium', reconnect: true, maxReconnectAttempts: -1 })
         break
       } catch (e) {
         log('warn', 'nats_connect_failed', { ...errFields(e), retry_in_s: 5 })

@@ -34,7 +34,7 @@ Optional:
 
 - `A2A_SIG_ALG`: signature algorithm, default `ed25519`.
 - `A2A_CORE_SOCK`: core Unix socket, default `/run/a2a-core/core.sock`.
-- `SUBS_KEY`: subscription key, default `claude-channels:subscriptions`.
+- `SUBS_KEY`: subscription key, default `alloyium:subscriptions`.
 
 ## Precondition Probe
 

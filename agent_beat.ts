@@ -325,7 +325,7 @@ async function persistedBootId(dir: string | undefined, agentId: string, session
 }
 
 function baseStateDir(override?: string): string {
-  return override || process.env.A2A_BEAT_STATE_DIR || join(process.env.XDG_RUNTIME_DIR || '/tmp', 'claude-channels', 'agent-beat')
+  return override || process.env.A2A_BEAT_STATE_DIR || join(process.env.XDG_RUNTIME_DIR || '/tmp', 'alloyium', 'agent-beat')
 }
 
 function beatStateFile(dir: string | undefined, agentId: string, sessionId: string, bootId: string): string {

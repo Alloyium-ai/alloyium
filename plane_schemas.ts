@@ -10,7 +10,7 @@
 //   - this lane (`wt-a2a-core-pm`) owns the CORE side: this schema module + the core StatusPlane
 //     relay/fan-out + `agent.status.v1` emit, on the core's CONTROL traffic-class connection.
 //   - SUBJECTS reuse the existing topic allowlist (so NO a2a-channel.ts change — 2C-safe both
-//     lanes): beat → `claude.a2a.topic.agent-beat`, status → `claude.a2a.topic.agent-status`.
+//     lanes): beat → `alloyium.a2a.topic.agent-beat`, status → `alloyium.a2a.topic.agent-status`.
 //   - Transport is EPHEMERAL core NATS (NOT JetStream): a replayed durable beat would reset the
 //     missed-beat clock and mask a wedge (§5.1). Consumers keep newest-per-agent client-side.
 //   - The beat may be ed25519-SIGNED for attribution (the detector decides on the RAW agent-signed
@@ -24,10 +24,10 @@ export const STATUS_SCHEMA = 'agent.status.v1' as const
 export const BEAT_TOPIC = 'agent-beat' as const
 export const STATUS_TOPIC = 'agent-status' as const
 
-// Subject builders. `prefix` mirrors A2AChannel's prefix (default 'claude.a2a.'; a test prefix
-// substitutes cleanly) so the planes stay inside the audited claude.a2a.> namespace.
-export const beatSubject = (prefix = 'claude.a2a.'): string => `${prefix}topic.${BEAT_TOPIC}`
-export const statusSubject = (prefix = 'claude.a2a.'): string => `${prefix}topic.${STATUS_TOPIC}`
+// Subject builders. `prefix` mirrors A2AChannel's prefix (default 'alloyium.a2a.'; a test prefix
+// substitutes cleanly) so the planes stay inside the audited alloyium.a2a.> namespace.
+export const beatSubject = (prefix = 'alloyium.a2a.'): string => `${prefix}topic.${BEAT_TOPIC}`
+export const statusSubject = (prefix = 'alloyium.a2a.'): string => `${prefix}topic.${STATUS_TOPIC}`
 
 // Structured driver state (id1058 §3 — NOT text-matched). `loop` = the standing /loop driver;
 // `goal` = a bounded auto-clearing drive; a service/relay (the core itself) uses `service`.

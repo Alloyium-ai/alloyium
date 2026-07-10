@@ -31,9 +31,9 @@ export type CodexA2AToolsConfig = {
    * (hello `subsKey`; NOT an authority boundary — the core routes from the
    * authenticated agentId). Threaded from the parent's `process.env.SUBS_KEY`
    * so a fleet-namespaced deployment (e.g. `alloyium:a2a:silent-subs:*`) forwards
-   * its OWN namespace instead of the legacy `claude-channels:` literal. Falls back
+   * its OWN namespace instead of the legacy `alloyium:` literal. Falls back
    * to the legacy silent default when unset — mirrors `scripts/run-codex-a2a.sh`'s
-   * `${SUBS_KEY:-claude-channels:a2a-silent-subs}` and `nats-channel.ts`'s
+   * `${SUBS_KEY:-alloyium:a2a-silent-subs}` and `nats-channel.ts`'s
    * `process.env.SUBS_KEY ?? …`.
    */
   subsKey?: string
@@ -146,9 +146,9 @@ export function buildCodexA2AToolsConfigArgs(cfg: CodexA2AToolsConfig): string[]
   addEnv(args, server, 'A2A_INBOX_DB', cfg.inboxDbPath)
   // Advisory silent-subs key. Honor the fleet namespace via the forwarded
   // SUBS_KEY (cfg.subsKey ← process.env.SUBS_KEY) so an alloyium deployment does
-  // not land on the legacy `claude-channels:` literal; legacy silent default when
+  // not land on the legacy `alloyium:` literal; legacy silent default when
   // unset (same mechanism as scripts/run-codex-a2a.sh and nats-channel.ts).
-  addEnv(args, server, 'SUBS_KEY', cfg.subsKey ?? 'claude-channels:a2a-silent-subs')
+  addEnv(args, server, 'SUBS_KEY', cfg.subsKey ?? 'alloyium:a2a-silent-subs')
 
   return args
 }

@@ -27,7 +27,7 @@ export type PresenceClaimerOpts = {
   }
 }
 
-const DEFAULT_KEY_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
+const DEFAULT_KEY_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'alloyium:a2a:presence:'
 const DEFAULT_TTL_S = 90
 const DEFAULT_HEARTBEAT_MS = 30_000
 const MIN_TTL_S = 5

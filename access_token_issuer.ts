@@ -237,7 +237,7 @@ export class RedisAccessIssuerStore implements AccessIssuerStore {
 export class RedisLauncherGrantRegistry implements AccessLauncherGrantRegistry {
   constructor(
     private readonly redis: RedisLike,
-    private readonly keyPrefix = process.env.A2A_LAUNCHER_KEY_PREFIX ?? 'claude-channels:a2a:launcher:',
+    private readonly keyPrefix = process.env.A2A_LAUNCHER_KEY_PREFIX ?? 'alloyium:a2a:launcher:',
     private readonly timeoutMs = Number(process.env.REDIS_TIMEOUT_MS ?? DEFAULT_REDIS_TIMEOUT_MS),
   ) {}
 
@@ -426,8 +426,8 @@ export class AccessTokenIssuerTools {
     'taskboard:task:10719:update, taskboard:task:10719:dependencies:read, ' +
     'taskboard:epic:10050:update, taskboard:epic:10050:comment, taskboard:projects:list, ' +
     'taskboard:projects:create, taskboard:review-request:12:verdict, ' +
-    'forgejo:repo:atcsecure/claude-channels:read, forgejo:org:atcsecure:repo:create, ' +
-    'forgejo:user:atcsecure:repo:create, forgejo:admin-user:atcsecure:repo:create, ' +
+    'forgejo:repo:example-org/alloyium:read, forgejo:org:example-org:repo:create, ' +
+    'forgejo:user:example-org:repo:create, forgejo:admin-user:example-org:repo:create, ' +
     'or vault:path:team/example:read; broad scopes such as taskboard:read are not valid.'
 
   constructor(opts: AccessTokenIssuerToolsOpts = {}) {
@@ -471,7 +471,7 @@ export class AccessTokenIssuerTools {
           additionalProperties: false,
           properties: {
             agent_id: { type: 'string', description: 'Registered A2A agent id. Optional for auto-signed current-session requests.' },
-            requested_scope: { type: 'string', description: 'Requested taskboard, Forgejo, or Vault scope, for example taskboard:project:13:read, taskboard:task:10719:comment, taskboard:projects:list, or forgejo:repo:atcsecure/claude-channels:read.' },
+            requested_scope: { type: 'string', description: 'Requested taskboard, Forgejo, or Vault scope, for example taskboard:project:13:read, taskboard:task:10719:comment, taskboard:projects:list, or forgejo:repo:example-org/alloyium:read.' },
             nonce: { type: 'string', description: 'Base64url random nonce, at least 128 bits.' },
             issued_at: { type: 'string', description: 'Request issue time as ISO-8601.' },
             expiry: { type: 'string', description: 'Request/lease expiry as ISO-8601.' },
@@ -748,7 +748,7 @@ function isForgejoMergeScope(scope: string): boolean {
 // Domain-wildcard prefixes: a policy pattern ending in `:*` grants a whole domain when the
 // text up to and including its last `:` matches one of these recognized prefixes. This lets a
 // role express "full access to a domain" (e.g. `taskboard:*`, `taskboard:task:*:*`,
-// `forgejo:repo:atcsecure/claude-channels:*`) without hand-enumerating every verb, even though
+// `forgejo:repo:example-org/alloyium:*`) without hand-enumerating every verb, even though
 // the `*`->`1` concrete probe below would not be a full valid scope.
 const DOMAIN_WILDCARD_PREFIXES: RegExp[] = [
   /^taskboard:$/,
@@ -758,7 +758,7 @@ const DOMAIN_WILDCARD_PREFIXES: RegExp[] = [
   /^taskboard:epic:(?:\d+|\*):$/,
   /^taskboard:review-request:(?:\d+|\*):$/,
   // The repo OWNER must be FULLY concrete (no `*` anywhere in the owner segment): a concrete-org
-  // wildcard like `atcsecure/*` is fine, but a bare (`*/*`) or partial (`a*/*`) owner — which spans
+  // wildcard like `example-org/*` is fine, but a bare (`*/*`) or partial (`a*/*`) owner — which spans
   // multiple orgs — is not (Finding 1). A `*` in the REPO segment stays allowed.
   /^forgejo:repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.*-]+:$/,
   // The vault logical-path ROOT segment (up to the first `/`) must be FULLY concrete (no `*`):
@@ -778,7 +778,7 @@ function isDomainWildcardPattern(pattern: string): boolean {
 // contain NO `*` at all: not a bare `*` (`vault:path:*:read`, `forgejo:repo:*/*:...`) nor a
 // partial one (`vault:path:a*:read`, `forgejo:repo:a*/*:...`), both of which fan a single grant
 // across sibling path roots / multiple orgs. A concrete-root prefix wildcard stays valid — the
-// `*` just has to live past the root (`vault:path:agents/developer/*:read`, `forgejo:repo:atcsecure/*:read`).
+// `*` just has to live past the root (`vault:path:agents/developer/*:read`, `forgejo:repo:example-org/*:read`).
 function hasBareWildcardRoot(pattern: string): boolean {
   // vault logical-path ROOT segment (up to the first `/` or `:`) contains a `*`
   if (/^vault:path:[^:\/]*\*/.test(pattern)) return true

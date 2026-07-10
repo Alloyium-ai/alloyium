@@ -55,19 +55,19 @@ const DEV_NAMESPACE: Record<NamespaceKey, string> = {
 }
 
 const PROD_NAMESPACE: Record<NamespaceKey, string> = {
-  A2A_STREAM: 'CLAUDE_A2A',
-  A2A_SUBJECT_PREFIX: 'claude.a2a.',
-  A2A_TOPICS_KEY_PREFIX: 'claude-channels:a2a:topics:',
-  A2A_SECRET_KEY_PREFIX: 'claude-channels:a2a:secret:',
-  A2A_PUBKEY_KEY_PREFIX: 'claude-channels:a2a:pubkey:',
-  A2A_PRESENCE_KEY_PREFIX: 'claude-channels:a2a:presence:',
-  A2A_DIRECT_ENC_CAP_KEY_PREFIX: 'claude-channels:a2a:direct-enc:',
-  A2A_PEER_PROTOCOL_KEY_PREFIX: 'claude-channels:a2a:peer-protocol:',
-  A2A_LAUNCHER_KEY_PREFIX: 'claude-channels:a2a:launcher:',
-  A2A_CORE_EPOCH_KEY_PREFIX: 'claude-channels:a2a:org:core-epoch:',
-  A2A_BLOB_KEY_PREFIX: 'claude-channels:a2a:blob:',
-  A2A_CODEX_BUILD_KEY_PREFIX: 'claude-channels:a2a:codex-build:',
-  A2A_SKILLS_GLOBAL_KEY: 'claude-channels:a2a:skills:global',
+  A2A_STREAM: 'ALLOYIUM_A2A',
+  A2A_SUBJECT_PREFIX: 'alloyium.a2a.',
+  A2A_TOPICS_KEY_PREFIX: 'alloyium:a2a:topics:',
+  A2A_SECRET_KEY_PREFIX: 'alloyium:a2a:secret:',
+  A2A_PUBKEY_KEY_PREFIX: 'alloyium:a2a:pubkey:',
+  A2A_PRESENCE_KEY_PREFIX: 'alloyium:a2a:presence:',
+  A2A_DIRECT_ENC_CAP_KEY_PREFIX: 'alloyium:a2a:direct-enc:',
+  A2A_PEER_PROTOCOL_KEY_PREFIX: 'alloyium:a2a:peer-protocol:',
+  A2A_LAUNCHER_KEY_PREFIX: 'alloyium:a2a:launcher:',
+  A2A_CORE_EPOCH_KEY_PREFIX: 'alloyium:a2a:org:core-epoch:',
+  A2A_BLOB_KEY_PREFIX: 'alloyium:a2a:blob:',
+  A2A_CODEX_BUILD_KEY_PREFIX: 'alloyium:a2a:codex-build:',
+  A2A_SKILLS_GLOBAL_KEY: 'alloyium:a2a:skills:global',
 }
 
 export const DEPLOYMENT_DEFINITIONS: Record<AlloyiumDeploymentId, DeploymentDefinition> = {
@@ -92,8 +92,8 @@ export const DEPLOYMENT_DEFINITIONS: Record<AlloyiumDeploymentId, DeploymentDefi
     redisUrl: 'redis://127.0.0.1:6380',
     redisPort: '6380',
     namespace: PROD_NAMESPACE,
-    silentSubsKey: 'claude-channels:a2a-silent-subs',
-    sentinelKey: 'claude-channels:a2a:deployment-contract:v1',
+    silentSubsKey: 'alloyium:a2a-silent-subs',
+    sentinelKey: 'alloyium:a2a:deployment-contract:v1',
     natsSentinelStream: 'ALLOYIUM_PROD_DEPLOYMENT_SENTINEL',
     natsSentinelSubject: '_ALLOYIUM.CONTRACT.PROD',
   },

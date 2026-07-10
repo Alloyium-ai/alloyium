@@ -7,7 +7,7 @@ use crate::ctrl::{Ctrl, CtrlApp, CtrlAppImage, CtrlProto, CtrlProtoRange};
 use crate::framing::{read_frame, write_frame, Frame, FrameType};
 
 const DEFAULT_A2A_PROTOCOL_VERSION: &str = "1.0.11";
-const DEFAULT_A2A_APP_NAME: &str = "claude-channels";
+const DEFAULT_A2A_APP_NAME: &str = "alloyium";
 const DEFAULT_A2A_APP_VERSION: &str = "0.1.0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

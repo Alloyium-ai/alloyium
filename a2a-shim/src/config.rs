@@ -53,7 +53,7 @@ impl Config {
         let core_sock =
             env::var("A2A_CORE_SOCK").unwrap_or_else(|_| "/run/a2a-core/core.sock".to_owned());
         let subs_key =
-            env::var("SUBS_KEY").unwrap_or_else(|_| "claude-channels:subscriptions".to_owned());
+            env::var("SUBS_KEY").unwrap_or_else(|_| "alloyium:subscriptions".to_owned());
         let tool_only = env_bool("A2A_TOOL_ONLY") || env_bool("A2A_SHIM_TOOL_ONLY");
         let inbox_db_path = env::var("A2A_INBOX_DB").ok().filter(|v| !v.is_empty());
         let deployment_id = env::var("ALLOYIUM_DEPLOYMENT_ID")

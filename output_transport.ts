@@ -23,7 +23,7 @@ export interface BlobRedis {
   send(cmd: string, args: string[]): Promise<any>
 }
 
-export const BLOB_KEY_PREFIX = process.env.A2A_BLOB_KEY_PREFIX ?? 'claude-channels:a2a:blob:'
+export const BLOB_KEY_PREFIX = process.env.A2A_BLOB_KEY_PREFIX ?? 'alloyium:a2a:blob:'
 export const REDIS_OP_TIMEOUT_MS = Number(process.env.A2A_BLOB_REDIS_TIMEOUT_MS ?? 2500)
 export const PREVIEW_BYTES = Number(process.env.A2A_OUTPUT_PREVIEW_BYTES ?? 1024)
 // Ceiling on a claim-checked INPUT blob — bounds Redis pressure (incl. the double-blob

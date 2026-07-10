@@ -1,10 +1,10 @@
 export const PEER_PROTOCOL_SCHEMA = 'a2a.peer.protocol.v1'
-export const DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX = process.env.A2A_PEER_PROTOCOL_KEY_PREFIX ?? 'claude-channels:a2a:peer-protocol:'
+export const DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX = process.env.A2A_PEER_PROTOCOL_KEY_PREFIX ?? 'alloyium:a2a:peer-protocol:'
 // Maintenance rule: any protocol-related behavior change must bump this default
 // and update docs/specs/2026-06-20-a2a-peer-protocol-versioning-spec.md.
 export const DEFAULT_A2A_PROTOCOL_VERSION = process.env.A2A_PROTOCOL_VERSION ?? '1.0.11'
 export const DEFAULT_ALLOYIUM_PRODUCT_VERSION = process.env.A2A_PRODUCT_VERSION ?? '0.1.0'
-export const DEFAULT_A2A_APP_NAME = process.env.A2A_APP_NAME ?? process.env.npm_package_name ?? 'claude-channels'
+export const DEFAULT_A2A_APP_NAME = process.env.A2A_APP_NAME ?? process.env.npm_package_name ?? 'alloyium'
 export const DEFAULT_A2A_APP_VERSION = process.env.A2A_APP_VERSION ?? process.env.npm_package_version ?? '0.1.0'
 export const WORKER_EXECUTION_POLICY_SCHEMA = 'alloyium.worker.execution-policy.v1'
 
@@ -309,7 +309,7 @@ export function peerAppMetadataFromEnv(env: EnvLike = process.env): PeerAppMetad
     build_id: firstEnv(env, ['A2A_BUILD_ID', 'BUILD_ID']),
     ...(Object.keys(image).length > 0 ? { image } : {}),
   })
-  return app ?? { name: 'claude-channels', version: '0.1.0' }
+  return app ?? { name: 'alloyium', version: '0.1.0' }
 }
 
 function parseRuntime(value: unknown): PeerRuntime | null {

@@ -6,7 +6,7 @@
 //      locally (0600), public key self-registered in Redis with SET NX;
 //   2. a NATS nkey (the transport identity) — seed written locally (0600);
 //   3. a nats-server.conf authorization block restricting that nkey's PUBLISH
-//      to claude.a2a.>, $JS.ACK.>, $JS.API.> (the operator applies + reloads);
+//      to alloyium.a2a.>, $JS.ACK.>, $JS.API.> (the operator applies + reloads);
 //   4. an env file the bridge can source;
 //   5. a verify step that signs a probe and checks the Redis pubkey verifies it.
 //
@@ -30,8 +30,8 @@ import { materializeDeploymentEnv, type AlloyiumDeploymentId } from './deploymen
 
 // Read lazily (a function, not a module const captured at import) so the CLI's --dev/--prod
 // profile can pin the namespace via process.env BEFORE registration/verification run. Default =
-// claude-channels; a2a-launch.sh (and the dev profile below) set A2A_PUBKEY_KEY_PREFIX explicitly.
-const pubkeyPrefix = (): string => process.env.A2A_PUBKEY_KEY_PREFIX ?? 'claude-channels:a2a:pubkey:'
+// alloyium; a2a-launch.sh (and the dev profile below) set A2A_PUBKEY_KEY_PREFIX explicitly.
+const pubkeyPrefix = (): string => process.env.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
 const DEFAULT_SUBJECT_PREFIX = normalizeA2ASubjectPrefix(process.env.A2A_SUBJECT_PREFIX ?? DEFAULT_A2A_SUBJECT_PREFIX)
 const ID_RE = /^[a-z0-9-]{1,64}$/
 const b64 = (u8: Uint8Array): string => Buffer.from(u8).toString('base64')
@@ -97,7 +97,7 @@ export async function registerPubkey(redis: RedisClient, id: string, pubB64: str
 // this agent's bridge needs for its OWN stream. A broad `$JS.API.>` would let a
 // compromised A2A nkey manage/purge other streams (e.g. RAMP_ALERTS); these are
 // limited to `<stream>` so it can't touch anything else.
-export function natsUserBlock(id: string, nkeyPublic: string, stream = 'CLAUDE_A2A', subjectPrefix = DEFAULT_SUBJECT_PREFIX): string {
+export function natsUserBlock(id: string, nkeyPublic: string, stream = 'ALLOYIUM_A2A', subjectPrefix = DEFAULT_SUBJECT_PREFIX): string {
   subjectPrefix = normalizeA2ASubjectPrefix(subjectPrefix)
   return `    # a2a agent: ${id}\n` +
     `    { nkey: ${nkeyPublic}, permissions: {\n` +
@@ -134,7 +134,7 @@ export function writeAgentFiles(dir: string, id: string, opts: { ed25519SeedB64:
   const lines = ['A2A_ENABLED=1', `A2A_AGENT_ID=${id}`, 'A2A_SIG_ALG=ed25519', `A2A_SIGNING_KEY=${seedPath}`]
   if (opts.transport === 'none') lines.push('A2A_TRANSPORT_AUTH=none') // anonymous NATS connect; signing stays ON
   else lines.push(`A2A_NKEY=${nkeyPath}`)
-  if (opts.stream && opts.stream !== 'CLAUDE_A2A') lines.push(`A2A_STREAM=${opts.stream}`)
+  if (opts.stream && opts.stream !== 'ALLOYIUM_A2A') lines.push(`A2A_STREAM=${opts.stream}`)
   const subjectPrefix = normalizeA2ASubjectPrefix(opts.subjectPrefix ?? DEFAULT_SUBJECT_PREFIX)
   if (subjectPrefix !== DEFAULT_A2A_SUBJECT_PREFIX) lines.push(`A2A_SUBJECT_PREFIX=${subjectPrefix}`)
   if (opts.natsUrl) lines.push(`NATS_URL=${opts.natsUrl}`)
@@ -179,7 +179,7 @@ export type OnboardResult = {
 export async function onboard(opts: { id: string; dir: string; redis: RedisClient; force?: boolean; verify?: boolean; natsUrl?: string; redisUrl?: string; stream?: string; subjectPrefix?: string; transport?: 'nkey' | 'none'; deploymentEnv?: Record<string, string> }): Promise<OnboardResult> {
   if (!ID_RE.test(opts.id)) throw new Error(`invalid agent-id '${opts.id}' (must match ^[a-z0-9-]{1,64}$)`)
   const force = opts.force ?? false
-  const stream = opts.stream ?? 'CLAUDE_A2A'
+  const stream = opts.stream ?? 'ALLOYIUM_A2A'
   const subjectPrefix = normalizeA2ASubjectPrefix(opts.subjectPrefix ?? DEFAULT_SUBJECT_PREFIX)
   const transport = opts.transport ?? 'nkey'
   // Reuse existing key files for an idempotent re-onboard; --force rotates.
@@ -244,7 +244,7 @@ if (import.meta.main) {
   }
   const redisUrl = (flags.redis as string) ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
   const natsUrl = (flags.nats as string) ?? process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
-  const stream = (flags.stream as string) ?? process.env.A2A_STREAM ?? 'CLAUDE_A2A'
+  const stream = (flags.stream as string) ?? process.env.A2A_STREAM ?? 'ALLOYIUM_A2A'
   const subjectPrefix = normalizeA2ASubjectPrefix((flags['subject-prefix'] as string) ?? process.env.A2A_SUBJECT_PREFIX ?? DEFAULT_A2A_SUBJECT_PREFIX)
   const transport = ((flags.transport as string) ?? 'nkey') as 'nkey' | 'none'
   if (transport !== 'nkey' && transport !== 'none') { console.error(`--transport must be 'none' or 'nkey'\n${usage}`); process.exit(2) }
