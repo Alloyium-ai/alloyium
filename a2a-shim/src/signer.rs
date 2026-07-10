@@ -62,7 +62,7 @@ fn with_cached_signing_key<T>(
     let cache = SIGNING_KEY_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache
         .lock()
-        .map_err(|_| io::Error::new(ErrorKind::Other, "signing key cache mutex is poisoned"))?;
+        .map_err(|_| io::Error::other("signing key cache mutex is poisoned"))?;
 
     let needs_load = guard
         .as_ref()

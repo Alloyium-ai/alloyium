@@ -15,12 +15,14 @@ import {
 import type { CtrlRequestId, DecodedFrame } from './uds_frame.ts'
 import {
   UdsServerTransport,
+  UdsDrainTimeoutError,
   feedCtrlDelivered,
   feedCtrlSig,
   makeUdsInject,
   makeUdsSign,
 } from './uds_transport.ts'
 import type { DeliveryReply, SignReply } from './uds_transport.ts'
+import type { DeploymentContract } from './deployment_contract.ts'
 
 const enc = new TextEncoder()
 const dec = new TextDecoder()
@@ -36,6 +38,8 @@ export interface UdsAcceptorOptions {
   idleTimeoutMs?: number // close a connection that makes no frame progress for this long (0 disables)
   helloTimeoutMs?: number // bound the pre-auth hello/challenge/auth handshake (runHello default 5s)
   maxConnections?: number // total live UDS connections accepted by this core process
+  controlDrainTimeoutMs?: number // test/ops override for bounded CTRL/terminal flushes
+  deploymentContract?: Pick<DeploymentContract, 'deploymentId' | 'busId' | 'hostId'>
 }
 
 export interface UdsAcceptorHandle {
@@ -62,6 +66,11 @@ function positiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name]
   const parsed = raw === undefined || raw === '' ? fallback : Number(raw)
   const n = Math.trunc(parsed)
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+function positiveDrainTimeout(value: number | undefined, fallback: number): number {
+  const n = Math.trunc(value ?? fallback)
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
@@ -275,6 +284,7 @@ class UdsConnection {
       peerUid: peerUidFromSocket(this.socket),
       expectedUid: this.opts.expectedUid,
       helloTimeoutMs: this.opts.helloTimeoutMs,
+      deploymentContract: this.opts.deploymentContract,
     })
 
     if (this.phase === 'closed') return
@@ -296,24 +306,47 @@ class UdsConnection {
 
     const agentId = result.agentId
     const epoch = result.epoch
-    const transport = new UdsServerTransport(this.writer)
+    const onDrainTimeout = (err: Error) => this.fail('uds_drain_timeout', err)
+    const transport = new UdsServerTransport(this.writer, {
+      drainTimeoutMs: DELIVERY_ACK_TIMEOUT_MS,
+      onDrainTimeout,
+    })
     this.transport = transport
+    const flushDelivery = {
+      drainTimeoutMs: DELIVERY_ACK_TIMEOUT_MS,
+      onEvent: (event: string, fields = {}) => log(event === 'a2a_delivery_inflight_full' || event === 'a2a_delivery_drain_timeout' ? 'warn' : 'info', event, { agent_id: agentId, ...fields }),
+      onDrainTimeout,
+    }
     const delivery = result.deliveryCapable === true
       ? {
           pending: this.deliveryPending,
           epoch,
           timeoutMs: DELIVERY_ACK_TIMEOUT_MS,
           maxInflight: DELIVERY_MAX_INFLIGHT,
-          onEvent: (event: string, fields = {}) => log(event === 'a2a_delivery_inflight_full' ? 'warn' : 'info', event, { agent_id: agentId, ...fields }),
+          drainTimeoutMs: DELIVERY_ACK_TIMEOUT_MS,
+          onEvent: flushDelivery.onEvent,
+          onDrainTimeout,
         }
       : undefined
 
     const add = await this.opts.core.addUdsSession(agentId, {
       epoch,
       transport,
-      ctxInject: makeUdsInject(this.writer, delivery),
+      ctxInject: makeUdsInject(this.writer, delivery, flushDelivery),
       externalSign: makeUdsSign({ writer: this.writer, pending: this.ctrlPending, timeoutMs: 10_000 }),
-    }, result.toolOnly ? { toolOnly: true } : {})
+    }, {
+      ...(result.toolOnly ? { toolOnly: true } : {}),
+      ...(result.toolOnly ? {} : { inboxInjectPaused: true }),
+      ...(result.toolOnly && result.inboxDbPath ? { inboxDbPath: result.inboxDbPath } : {}),
+      runtimeKind: 'shim-session',
+      mcpPath: 'shim',
+      protocolVersion: result.protocolVersion,
+      app: result.app,
+      featureTokens: [
+        ...(result.protoFeatures ?? []),
+        ...(result.deliveryCapable ? ['shim.delivered.v1'] : []),
+      ],
+    })
 
     if (this.phase === 'closed') {
       if (add.ok) {
@@ -351,14 +384,40 @@ class UdsConnection {
         break
       }
     }
+    this.opts.core.resumeUdsSessionInboxInject(agentId, epoch)
   }
 
   // FOLD5: await a real writer flush so a terminal hello CTRL ({t:ok}/{t:err}) reaches the peer
   // before the socket is torn down (otherwise the peer can see EOF instead of the hello result).
   private async flushTerminal(): Promise<void> {
     try {
-      await this.writer.drain()
-    } catch {}
+      await this.drainWriterBounded('terminal')
+    } catch (err) {
+      this.fail('writer_drain_failed', err)
+    }
+  }
+
+  private async drainWriterBounded(path: string): Promise<void> {
+    if (this.phase === 'closed') return
+    const timeoutMs = positiveDrainTimeout(this.opts.controlDrainTimeoutMs, DELIVERY_ACK_TIMEOUT_MS)
+    const startedAt = Date.now()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.writer.drain(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new UdsDrainTimeoutError(timeoutMs)), timeoutMs)
+        }),
+      ])
+    } catch (err) {
+      if (err instanceof UdsDrainTimeoutError) {
+        try { this.writer.close(err) } catch {}
+        log('warn', 'uds_acceptor_drain_timeout', { path, phase: this.phase, drain_ms: Date.now() - startedAt, drain_timeout_ms: timeoutMs })
+      }
+      throw err
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   private routeFrame(frame: DecodedFrame): void {
@@ -471,7 +530,7 @@ class UdsConnection {
   private flushWriter(): void {
     this.drainTail = this.drainTail
       .then(() => {
-        if (this.phase !== 'closed') return this.writer.drain()
+        if (this.phase !== 'closed') return this.drainWriterBounded('control')
       })
       .catch((err) => this.fail('writer_drain_failed', err))
   }

@@ -80,7 +80,7 @@ export function scrubForModel(value: unknown, maxBytes = MAX_TOOL_RESULT_BYTES):
   return truncateBytes(text
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-[redacted]')
     .replace(/\b[A-Za-z0-9._%+-]+:[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\b/g, '[redacted-basic-auth]')
-    .replace(/\b(OPENAI_API_KEY|A2A_SIGNING_KEY|KAI_TOKEN|GITHUB_TOKEN)\s*=\s*[^,\s]+/gi, '$1=[redacted]'), maxBytes)
+    .replace(/\b(OPENAI_API_KEY|A2A_SIGNING_KEY|KAI_TOKEN|FORGEJO_TOKEN|GITHUB_TOKEN)\s*=\s*[^,\s]+/gi, '$1=[redacted]'), maxBytes)
 }
 
 function normalizeSendType(value: unknown): PortalSendType {

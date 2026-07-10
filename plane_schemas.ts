@@ -83,7 +83,7 @@ export type AgentStatus = {
   driver_mode: DriverMode
   state: AgentState
   // rich status (#18) — all optional / on-change:
-  phase?: string                  // e.g. 'SLICE 2C', 'analysis'
+  phase?: string                  // e.g. 'SLICE 2C', 'gameday-analysis'
   progress?: string               // free-form or 'n/m'
   current_action?: string
   blocker?: string

@@ -4,7 +4,7 @@ import { hostname as osHostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { mkdir, readFile, rename, writeFile, readdir, stat, unlink } from 'node:fs/promises'
 import { connect, credsAuthenticator, nkeyAuthenticator } from 'nats'
-import { importEd25519Seed, signEnvelope, topicSubject, type Envelope, type SigAlg, type SignKey } from './a2a-channel.ts'
+import { importEd25519Seed, normalizeA2ASubjectPrefix, signEnvelope, topicSubject, type Envelope, type SigAlg, type SignKey } from './a2a-channel.ts'
 
 /** Frozen heartbeat schema emitted to `topic:agent-beat`. */
 export const AGENT_BEAT_SCHEMA = 'agent.beat.v1' as const
@@ -230,7 +230,7 @@ export async function publishBeat(
   if (sigAlg !== 'ed25519' && sigAlg !== 'hmac') return { ok: false, error: `bad_sig_alg:${sigAlg}` }
 
   const signKey = await loadBeatSignKey(sigAlg, beat.agent_id, emitterId, input.signing_key_path)
-  const subject = topicSubject('alloyium.a2a.', AGENT_BEAT_TOPIC)
+  const subject = topicSubject(normalizeA2ASubjectPrefix(process.env.A2A_SUBJECT_PREFIX), AGENT_BEAT_TOPIC)
   const env: Envelope = {
     v: 1,
     id: randomUUID(),
@@ -293,7 +293,7 @@ async function natsConnectOpts(name: string): Promise<Record<string, unknown>> {
   // per-tool-call path. #32 residual-(b) fusion gate (Opus 4.8 + GPT-5.5 P1). Env-overridable.
   const ct = Number(process.env.A2A_BEAT_CONNECT_TIMEOUT_MS)
   const opts: Record<string, unknown> = {
-    servers: process.env.NATS_URL || 'nats://nats:4222',
+    servers: process.env.NATS_URL || 'nats://127.0.0.1:4222',
     name: `a2a-beat-${name}`,
     reconnect: true,
     maxReconnectAttempts: 2,

@@ -199,7 +199,7 @@ async fn canonical_byte_vectors_match_typescript_and_rust() {
                 .get("reqId")
                 .or_else(|| sig_json.get("req_id"))
                 .and_then(Value::as_u64),
-            Some(req_id as u64)
+            Some(req_id)
         );
         let sig = sig_json["sig"].as_str().expect("sig field");
         assert_eq!(sig, expected_sig);
@@ -789,7 +789,7 @@ fn decode_wire_string(text: &str) -> Vec<u8> {
         .collect();
     let hex = compact.strip_prefix("0x").unwrap_or(&compact);
 
-    if hex.len() % 2 == 0 && hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+    if hex.len().is_multiple_of(2) && hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         parse_hex(hex)
     } else {
         STANDARD

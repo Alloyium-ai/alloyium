@@ -77,6 +77,8 @@ export class CodexRealtimeSessionRegistry {
   create(args: CodexRealtimeSessionCreate): CodexRealtimeSession {
     const sessionId = normalizeSessionId(args.sessionId ?? args.threadKey ?? `session-${crypto.randomUUID()}`)
     const existing = this.sessions.get(sessionId)
+    const boundSessionId = this.byThreadId.get(args.threadId)
+    if (boundSessionId && boundSessionId !== sessionId) throw new Error('thread_already_bound')
     const now = args.now ?? new Date().toISOString()
     if (existing) {
       if (existing.thread_id !== args.threadId || existing.cwd !== args.cwd || existing.sandbox !== args.sandbox || existing.approval_policy !== args.approvalPolicy) {
@@ -124,6 +126,15 @@ export class CodexRealtimeSessionRegistry {
 
   list(): CodexRealtimeSession[] {
     return [...this.sessions.values()].map((session) => ({ ...session }))
+  }
+
+  delete(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId)
+    if (!session) return false
+    this.sessions.delete(sessionId)
+    this.byThreadId.delete(session.thread_id)
+    if (session.active_turn_id) this.byTurnId.delete(session.active_turn_id)
+    return true
   }
 
   setActiveTurn(sessionId: string, turnId: string, status: CodexRealtimeSessionStatus = 'running'): CodexRealtimeSession {

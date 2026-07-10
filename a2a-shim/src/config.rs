@@ -17,6 +17,8 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_RECONNECT_MIN_MS: u64 = 100;
 const DEFAULT_RECONNECT_MAX_MS: u64 = 2_000;
 const DEFAULT_PING_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_INBOX_WAIT_GRACE_MS: u64 = 5_000;
+const DEFAULT_INBOX_WAIT_MAX_MS: u64 = 605_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -25,7 +27,11 @@ pub struct Config {
     pub sig_alg: String,
     pub core_sock: String,
     pub subs_key: String,
+    pub deployment_id: Option<String>,
+    pub bus_id: Option<String>,
+    pub host_id: Option<String>,
     pub tool_only: bool,
+    pub inbox_db_path: Option<String>,
     pub hello_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub mcp_request_timeout_ms: u64,
@@ -33,6 +39,8 @@ pub struct Config {
     pub reconnect_min_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
+    pub inbox_wait_grace_ms: u64,
+    pub inbox_wait_max_ms: u64,
 }
 
 impl Config {
@@ -47,6 +55,27 @@ impl Config {
         let subs_key =
             env::var("SUBS_KEY").unwrap_or_else(|_| "alloyium:subscriptions".to_owned());
         let tool_only = env_bool("A2A_TOOL_ONLY") || env_bool("A2A_SHIM_TOOL_ONLY");
+        let inbox_db_path = env::var("A2A_INBOX_DB").ok().filter(|v| !v.is_empty());
+        let deployment_id = env::var("ALLOYIUM_DEPLOYMENT_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let bus_id = env::var("ALLOYIUM_BUS_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let host_id = env::var("ALLOYIUM_HOST_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        if env_bool("ALLOYIUM_CONTRACT_REQUIRED") {
+            if deployment_id.is_none() {
+                return Err(ConfigError::MissingVar("ALLOYIUM_DEPLOYMENT_ID"));
+            }
+            if bus_id.is_none() {
+                return Err(ConfigError::MissingVar("ALLOYIUM_BUS_ID"));
+            }
+            if host_id.is_none() {
+                return Err(ConfigError::MissingVar("ALLOYIUM_HOST_ID"));
+            }
+        }
 
         Ok(Config {
             agent_id,
@@ -54,7 +83,11 @@ impl Config {
             sig_alg,
             core_sock,
             subs_key,
+            deployment_id,
+            bus_id,
+            host_id,
             tool_only,
+            inbox_db_path,
             hello_timeout_ms: env_ms("A2A_HELLO_TIMEOUT_MS", DEFAULT_HELLO_TIMEOUT_MS),
             request_timeout_ms: env_ms("A2A_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
             mcp_request_timeout_ms: env_ms(
@@ -65,6 +98,8 @@ impl Config {
             reconnect_min_ms: env_ms("A2A_RECONNECT_MIN_MS", DEFAULT_RECONNECT_MIN_MS),
             reconnect_max_ms: env_ms("A2A_RECONNECT_MAX_MS", DEFAULT_RECONNECT_MAX_MS),
             ping_interval_ms: env_ms("A2A_PING_INTERVAL_MS", DEFAULT_PING_INTERVAL_MS),
+            inbox_wait_grace_ms: env_ms("A2A_INBOX_WAIT_GRACE_MS", DEFAULT_INBOX_WAIT_GRACE_MS),
+            inbox_wait_max_ms: env_ms("A2A_INBOX_WAIT_MAX_MS", DEFAULT_INBOX_WAIT_MAX_MS),
         })
     }
 
@@ -96,6 +131,14 @@ impl Config {
     /// zero ping interval is never useful.
     pub fn ping_interval(&self) -> Duration {
         Duration::from_millis(self.ping_interval_ms.max(1))
+    }
+
+    pub fn inbox_wait_grace(&self) -> Duration {
+        Duration::from_millis(self.inbox_wait_grace_ms)
+    }
+
+    pub fn inbox_wait_max(&self) -> Duration {
+        Duration::from_millis(self.inbox_wait_max_ms)
     }
 }
 

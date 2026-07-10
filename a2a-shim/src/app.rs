@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     error::Error,
     fmt, io,
     sync::Arc,
@@ -22,8 +22,8 @@ use crate::{
     ctrl::Ctrl,
     framing::{read_frame, write_frame, write_frame_chunked, FrameType},
     hello::run_handshake,
-    mcp_pump::{peek_id_method, read_stdio, write_stdio, StdinGate, StdioMode},
-    resilience::{backoff, should_drop_late_reply, timeout_budget, Epoch},
+    mcp_pump::{peek_id_method, peek_tool_call, read_stdio, write_stdio, StdinGate, StdioMode},
+    resilience::{backoff, inbox_wait_budget, should_drop_late_reply, timeout_budget, Epoch},
     signer::sign_canon,
     transport::connect,
 };
@@ -119,8 +119,8 @@ impl Tombstones {
 
     fn insert(&mut self, epoch: Epoch, key: &str) {
         let epoch_key = epoch.0;
-        if !self.epochs.contains_key(&epoch_key) {
-            self.epochs.insert(epoch_key, EpochTombstones::default());
+        if let Entry::Vacant(entry) = self.epochs.entry(epoch_key) {
+            entry.insert(EpochTombstones::default());
             self.epoch_order.push_back(epoch_key);
         }
 
@@ -161,7 +161,8 @@ impl AppState {
 
     fn record_notification_dedup(&mut self, notif_id: &str) {
         if self.notification_dedup.insert(notif_id.to_string()) {
-            self.notification_dedup_order.push_back(notif_id.to_string());
+            self.notification_dedup_order
+                .push_back(notif_id.to_string());
         }
 
         while self.notification_dedup_order.len() > NOTIFICATION_DEDUP_CAP {
@@ -357,6 +358,8 @@ where
                 &init,
                 cfg.request_timeout(),
                 cfg.mcp_request_timeout(),
+                cfg.inbox_wait_grace(),
+                cfg.inbox_wait_max(),
             );
         }
         if mcp_tx.try_send(init).is_err() {
@@ -403,6 +406,8 @@ where
                             &body,
                             cfg.request_timeout(),
                             cfg.mcp_request_timeout(),
+                            cfg.inbox_wait_grace(),
+                            cfg.inbox_wait_max(),
                         );
 
                         if saw_initialized {
@@ -641,7 +646,10 @@ where
                     let meta = notification_meta(&payload);
                     if let Some(notif_id) = meta.direct_notif_id() {
                         if state.notification_dedup.contains(notif_id) {
-                            shim_debug("notif_duplicate_drain_suppressed", format_args!("notif_id={notif_id}"));
+                            shim_debug(
+                                "notif_duplicate_drain_suppressed",
+                                format_args!("notif_id={notif_id}"),
+                            );
                             continue;
                         }
                     }
@@ -718,6 +726,8 @@ fn track_body_if_request(
     body: &[u8],
     normal: Duration,
     long: Duration,
+    inbox_wait_grace: Duration,
+    inbox_wait_max: Duration,
 ) {
     let (id, method) = peek_id_method(body);
     let Some(id) = id else {
@@ -725,8 +735,25 @@ fn track_body_if_request(
     };
 
     let method = method.unwrap_or_default();
-    let deadline = Instant::now() + timeout_budget(&method, normal, long);
+    let budget = inbox_wait_tool_budget(body, inbox_wait_grace, inbox_wait_max)
+        .unwrap_or_else(|| timeout_budget(&method, normal, long));
+    let deadline = Instant::now() + budget;
     pending.insert(id_key(&id), (epoch, deadline));
+}
+
+fn inbox_wait_tool_budget(body: &[u8], grace: Duration, max: Duration) -> Option<Duration> {
+    let (name, arguments) = peek_tool_call(body)?;
+    if name != "a2a-inbox-messages" {
+        return None;
+    }
+
+    let action = arguments.get("action").and_then(Value::as_str)?;
+    let timeout_ms = match arguments.get("timeout_ms") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_i64()?),
+    };
+
+    inbox_wait_budget(action, timeout_ms, grace, max)
 }
 
 async fn handle_mcp_from_core<O>(
@@ -822,12 +849,18 @@ where
 
     if let Some(notif_id) = meta.direct_notif_id() {
         if state.notification_dedup.contains(notif_id) {
-            shim_debug("notif_duplicate_delivered", format_args!("notif_id={notif_id}"));
+            shim_debug(
+                "notif_duplicate_delivered",
+                format_args!("notif_id={notif_id}"),
+            );
             send_delivered(ctrl_tx, current_epoch, notif_id).await?;
             return Ok(());
         }
     } else if meta.direct {
-        shim_debug("notif_missing_notif_id", "direct notification missing notifId");
+        shim_debug(
+            "notif_missing_notif_id",
+            "direct notification missing notifId",
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "direct notification missing notifId",
@@ -858,7 +891,10 @@ where
 
 fn buffer_inbound_notification(state: &mut AppState, payload: Vec<u8>) -> io::Result<()> {
     if state.notification_buffer.len() >= INBOUND_NOTIFICATION_BUFFER_CAP {
-        shim_debug("notif_buffer_full_no_delivered", "inbound notification buffer full");
+        shim_debug(
+            "notif_buffer_full_no_delivered",
+            "inbound notification buffer full",
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "inbound notification buffer exceeds limit",
@@ -944,13 +980,9 @@ fn notification_meta(payload: &[u8]) -> NotificationMeta {
         .get("params")
         .and_then(|p| p.get("meta"))
         .and_then(|m| m.as_object());
-    let direct = meta
-        .and_then(|m| m.get("kind"))
-        .and_then(|v| v.as_str())
-        == Some("direct");
+    let direct = meta.and_then(|m| m.get("kind")).and_then(|v| v.as_str()) == Some("direct");
     let notif_id = if direct {
-        meta
-            .and_then(|m| m.get("notifId"))
+        meta.and_then(|m| m.get("notifId"))
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty() && s.len() <= 128)
             .map(ToOwned::to_owned)
@@ -1170,7 +1202,9 @@ fn id_from_key(key: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::should_track_replayed_init;
+    use super::{inbox_wait_tool_budget, should_track_replayed_init};
+    use serde_json::json;
+    use std::time::Duration;
 
     #[test]
     fn replayed_init_tracked_only_while_unanswered() {
@@ -1186,6 +1220,41 @@ mod tests {
         assert!(
             !should_track_replayed_init(true),
             "do NOT track once answered"
+        );
+    }
+
+    #[test]
+    fn inbox_wait_tool_budget_requires_valid_integer_timeout() {
+        let grace = Duration::from_millis(5_000);
+        let max = Duration::from_millis(605_000);
+        let wait = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "a2a-inbox-messages",
+                "arguments": { "action": "wait", "timeout_ms": 150000 }
+            }
+        }))
+        .unwrap();
+        let non_integer_timeout = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "a2a-inbox-messages",
+                "arguments": { "action": "wait", "timeout_ms": "150000" }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            inbox_wait_tool_budget(&wait, grace, max),
+            Some(Duration::from_millis(155_000))
+        );
+        assert_eq!(
+            inbox_wait_tool_budget(&non_integer_timeout, grace, max),
+            None
         );
     }
 }

@@ -31,18 +31,37 @@ import './preamble.ts' // stdout→stderr reroute + global error handlers (MCP s
 import { connect, credsAuthenticator, nkeyAuthenticator, type NatsConnection, type JetStreamClient } from 'nats'
 import { RedisClient } from 'bun'
 import { hostname } from 'node:os'
-import { A2AChannel, type A2AChannelOpts, type VerifyKey, importEd25519Seed, type SignKey } from './a2a-channel.ts'
+import { A2AChannel, DEFAULT_A2A_SUBJECT_PREFIX, normalizeA2ASubjectPrefix, type A2AChannelOpts, type VerifyKey, importEd25519Seed, type SignKey } from './a2a-channel.ts'
 import { BrainTools } from './brain_tools.ts'
 import { KaiTools } from './kai_tools.ts'
 import { VaultTools } from './vault_tools.ts'
+import { AccessTokenIssuerTools } from './access_token_issuer.ts'
 import { AgentLauncherTools } from './agent_launcher_tools.ts'
+import { TaskboardTools } from './taskboard_tools.ts'
+import { ForgejoTools } from './forgejo_tools.ts'
 import { StatusPlane, type CoreSigner } from './status_plane.ts'
 import { PresenceClaimer } from './presence.ts'
+import {
+  DEFAULT_A2A_PROTOCOL_VERSION,
+  DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX,
+  buildPeerProtocolDescriptor,
+  normalizePeerAppMetadata,
+  normalizeFeatureList,
+  peerAppMetadataFromEnv,
+  type PeerAppMetadata,
+} from './peer_protocol.ts'
 import type { Inject } from './nats-channel.ts'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { buildSessionMcpServer } from './mcp_session.ts'
 import { sanitizeBody } from './nats-channel.ts'
+import {
+  deploymentContractRequired,
+  ensureNatsDeploymentSentinel,
+  ensureRedisDeploymentSentinel,
+  resolveDeploymentContract,
+  type DeploymentContract,
+} from './deployment_contract.ts'
 
 // ── structured, leveled, stderr-only logger (stdout is reserved; mirror a2a-channel) ──
 type Level = 'debug' | 'info' | 'warn' | 'error'
@@ -54,6 +73,32 @@ function log(level: Level, event: string, fields: Record<string, unknown> = {}):
   console.error(`${new Date().toISOString()} ${level} [a2a-core] ${event}${kv ? ' ' + kv : ''}`)
 }
 const errFields = (e: any): Record<string, unknown> => ({ err: e instanceof Error ? e.message : String(e), code: e?.code })
+const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS ?? 2500)
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout>
+  const timeout = new Promise<never>((_, rej) => { t = setTimeout(() => rej(new Error(`a2a_core_timeout:${label}`)), ms); (t as any).unref?.() })
+  return Promise.race([p.finally(() => clearTimeout(t)), timeout])
+}
+
+function envNum(value: string | undefined, fallback: number): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function atLeast(n: number, min: number): number {
+  return Number.isFinite(n) && n >= min ? n : min
+}
+
+function parseFeatureTokens(spec: unknown): string[] {
+  if (spec == null || spec === '') return []
+  const values = Array.isArray(spec)
+    ? spec
+    : String(spec).split(/[,\s]+/).map((x) => x.trim()).filter(Boolean)
+  const normalized = normalizeFeatureList(values)
+  if (!normalized) throw new Error('invalid A2A core feature token list')
+  return normalized
+}
 
 // Sanitize a hostname into a charset-safe token for the per-host core id 'a2a-core-<host>'
 // (dev-pm's parseAgentBeat requires ^[a-z0-9-]{1,64}$ — NO '@'/'.'); keep the whole id ≤ 64.
@@ -78,7 +123,7 @@ export type A2ACoreOpts = {
   natsUrl?: string
   redisUrl?: string
   stream?: string
-  prefix?: string // TEST ISOLATION ONLY (forwarded to every session's A2AChannel)
+  prefix?: string // forwarded to every session's A2AChannel; env A2A_SUBJECT_PREFIX may select a fleet namespace.
   // Transport (L2) auth posture for the ONE shared NATS connection. Mirrors A2AChannel:
   // 'none' connects anonymously, 'nkey'/'creds' authenticate. devNoAuth ⇒ none.
   transportAuth?: 'nkey' | 'creds' | 'none'
@@ -100,6 +145,17 @@ export type A2ACoreOpts = {
   coreAgentId?: string
   coreSigningKey?: SignKey
   coreSigningKeyPath?: string
+  peerProtocolKeyPrefix?: string
+  presenceKeyPrefix?: string
+  presenceTtlS?: number
+  heartbeatMs?: number
+  maxSendBytes?: number
+  protocolVersion?: string
+  productVersion?: string
+  app?: PeerAppMetadata
+  runtimeKind?: string
+  runtimeHost?: string
+  featureTokens?: string[]
   // Applied to EVERY session's A2AChannel (before the core forces the shared conns).
   // e.g. { devNoAuth: true } in tests, or signing/limit knobs shared by all sessions.
   sessionDefaults?: Partial<A2AChannelOpts>
@@ -115,6 +171,9 @@ type Session = {
   a2a: A2AChannel
   inject: Inject
   launcher: AgentLauncherTools
+  access: AccessTokenIssuerTools
+  taskboard: TaskboardTools
+  forgejo: ForgejoTools
   toolList?: any[]
   toolOnly?: boolean
   epoch?: number
@@ -145,6 +204,8 @@ export class A2ACore {
   private vault!: VaultTools
   private statusPlane?: StatusPlane // SLICE 3: beat/status planes on the CONTROL traffic class
   private presence?: PresenceClaimer
+  private peerProtocolTimer?: ReturnType<typeof setInterval>
+  private coreProtocolStartedAt = ''
   // ONE verify-key cache shared by every session (pubkeys/hmac secrets are
   // fleet-global identities — no reason for 300 copies). Injected into each channel.
   private keyCache = new Map<string, { key: VerifyKey; exp: number }>()
@@ -161,6 +222,7 @@ export class A2ACore {
 
   private natsUrl: string
   private redisUrl: string
+  private deploymentContract: DeploymentContract | null
   private stream: string
   private prefix?: string
   private transportAuth?: 'nkey' | 'creds' | 'none'
@@ -169,6 +231,17 @@ export class A2ACore {
   private devNoAuth: boolean
   private natsPoolSize: number
   private statusBeatMs: number
+  private peerProtocolKeyPrefix: string
+  private presenceKeyPrefix: string
+  private presenceTtlS: number
+  private heartbeatMs: number
+  private maxSendBytes: number
+  private protocolVersion?: string
+  private productVersion?: string
+  private app: PeerAppMetadata
+  private runtimeKind: string
+  private runtimeHost: string
+  private extraFeatureTokens: string[]
   private coreAgentId: string
   private coreSigningKey?: SignKey
   private coreSigningKeyPath?: string
@@ -176,22 +249,157 @@ export class A2ACore {
 
   constructor(opts: A2ACoreOpts = {}) {
     const e = process.env
-    this.natsUrl = opts.natsUrl ?? e.NATS_URL ?? 'nats://nats:4222'
-    this.redisUrl = opts.redisUrl ?? e.REDIS_URL ?? 'redis://redis:6379'
+    this.natsUrl = opts.natsUrl ?? e.NATS_URL ?? 'nats://127.0.0.1:4222'
+    this.redisUrl = opts.redisUrl ?? e.REDIS_URL ?? 'redis://127.0.0.1:6379'
     this.stream = opts.stream ?? e.A2A_STREAM ?? 'ALLOYIUM_A2A'
-    this.prefix = opts.prefix
+    this.prefix = opts.prefix !== undefined
+      ? normalizeA2ASubjectPrefix(opts.prefix)
+      : (e.A2A_SUBJECT_PREFIX ? normalizeA2ASubjectPrefix(e.A2A_SUBJECT_PREFIX) : undefined)
     this.devNoAuth = opts.devNoAuth ?? (e.A2A_DEV_NO_AUTH === '1' || e.A2A_DEV_NO_AUTH === 'true')
     this.transportAuth = opts.transportAuth ?? (e.A2A_TRANSPORT_AUTH as 'nkey' | 'creds' | 'none' | undefined)
     this.credsPath = opts.credsPath ?? e.A2A_CREDS
     this.nkeyPath = opts.nkeyPath ?? e.A2A_NKEY
     this.natsPoolSize = Math.max(1, Math.min(3, Math.trunc(opts.natsPoolSize ?? Number(e.A2A_CORE_NATS_POOL ?? 3)) || 3))
     this.statusBeatMs = Math.max(0, Math.trunc(opts.statusBeatMs ?? Number(e.A2A_CORE_BEAT_MS ?? 30_000)) || 0)
+    this.peerProtocolKeyPrefix = opts.peerProtocolKeyPrefix ?? e.A2A_PEER_PROTOCOL_KEY_PREFIX ?? DEFAULT_A2A_PEER_PROTOCOL_KEY_PREFIX
+    this.presenceKeyPrefix = opts.presenceKeyPrefix ?? e.A2A_PRESENCE_KEY_PREFIX ?? 'alloyium:a2a:presence:'
+    this.presenceTtlS = atLeast(opts.presenceTtlS ?? envNum(e.A2A_PRESENCE_TTL_S, 90), 5)
+    this.heartbeatMs = atLeast(opts.heartbeatMs ?? envNum(e.A2A_HEARTBEAT_MS, 30_000), 1000)
+    this.maxSendBytes = atLeast(opts.maxSendBytes ?? envNum(e.A2A_MAX_SEND_BYTES, 8192), 1)
+    this.protocolVersion = opts.protocolVersion ?? e.A2A_PROTOCOL_VERSION
+    this.productVersion = opts.productVersion ?? e.A2A_PRODUCT_VERSION
+    this.app = normalizePeerAppMetadata(opts.app) ?? peerAppMetadataFromEnv(e)
+    this.runtimeKind = opts.runtimeKind ?? e.A2A_RUNTIME_KIND ?? 'a2a-core'
+    this.runtimeHost = opts.runtimeHost ?? e.ALLOYIUM_HOST_ID ?? e.A2A_LOGICAL_HOST ?? e.A2A_HOST_ID ?? hostname()
+    this.extraFeatureTokens = [...new Set([
+      ...parseFeatureTokens(e.A2A_CORE_FEATURES),
+      ...parseFeatureTokens(opts.featureTokens ?? []),
+    ])].sort()
     // SLICE 3.1: per-host core signing identity. id = A2A_CORE_AGENT_ID or 'a2a-core-<sanitized host>'
     // (charset-safe per dev-pm's parseAgentBeat — no '@'/'.'). seed via A2A_CORE_SIGNING_KEY (or opts).
     this.coreAgentId = opts.coreAgentId ?? e.A2A_CORE_AGENT_ID ?? `a2a-core-${safeHostId(hostname())}`
     this.coreSigningKey = opts.coreSigningKey
     this.coreSigningKeyPath = opts.coreSigningKeyPath ?? e.A2A_CORE_SIGNING_KEY
     this.sessionDefaults = opts.sessionDefaults ?? {}
+    this.deploymentContract = resolveDeploymentContract({
+      ...e,
+      NATS_URL: this.natsUrl,
+      REDIS_URL: this.redisUrl,
+      A2A_STREAM: this.stream,
+      A2A_SUBJECT_PREFIX: this.prefix ?? e.A2A_SUBJECT_PREFIX,
+      A2A_PEER_PROTOCOL_KEY_PREFIX: this.peerProtocolKeyPrefix,
+      A2A_PRESENCE_KEY_PREFIX: this.presenceKeyPrefix,
+      A2A_TOPICS_KEY_PREFIX: e.A2A_TOPICS_KEY_PREFIX,
+      A2A_SECRET_KEY_PREFIX: e.A2A_SECRET_KEY_PREFIX,
+      A2A_PUBKEY_KEY_PREFIX: e.A2A_PUBKEY_KEY_PREFIX,
+      A2A_DIRECT_ENC_CAP_KEY_PREFIX: e.A2A_DIRECT_ENC_CAP_KEY_PREFIX,
+      A2A_LAUNCHER_KEY_PREFIX: e.A2A_LAUNCHER_KEY_PREFIX,
+      A2A_CORE_EPOCH_KEY_PREFIX: e.A2A_CORE_EPOCH_KEY_PREFIX,
+      A2A_BLOB_KEY_PREFIX: e.A2A_BLOB_KEY_PREFIX,
+      A2A_CODEX_BUILD_KEY_PREFIX: e.A2A_CODEX_BUILD_KEY_PREFIX,
+      A2A_SKILLS_GLOBAL_KEY: e.A2A_SKILLS_GLOBAL_KEY,
+    }, { required: deploymentContractRequired(e) })
+  }
+
+  private currentCoreFeatureTokens(): string[] {
+    const transportFeature = (this.devNoAuth || this.transportAuth === 'none')
+      ? 'a2a.transport.none.v1'
+      : this.nkeyPath
+        ? 'a2a.transport.nkey.v1'
+        : 'a2a.transport.creds.v1'
+    const signerFeature = (this.coreSigningKey || this.coreSigningKeyPath)
+      ? 'a2a.core.sign.ed25519.v1'
+      : 'a2a.core.sign.none.v1'
+    const features = [
+      'a2a.envelope.v1',
+      'a2a.peer.protocol.v1',
+      'a2a.app.version.v1',
+      'a2a.presence.redis.v1',
+      'a2a.stream.jetstream.v1',
+      'a2a.topic.core.v1',
+      'a2a.core.v1',
+      'a2a.core.shared-connections.v1',
+      'a2a.core.session-registry.v1',
+      'a2a.core.uds-session.v1',
+      'a2a.core.traffic-pool.v1',
+      ...(this.deploymentContract ? ['a2a.deployment-contract.v1'] : []),
+      'a2a.status-plane.v1',
+      'a2a.launcher.tools.v1',
+      'a2a.access-token.issuer.v1',
+      'a2a.access-token.auto-sign.v1',
+      'mcp.taskboard.read.v1',
+      'mcp.taskboard.lifecycle.v1',
+      'mcp.taskboard.planning.v1',
+      'mcp.forgejo.repo-create.v1',
+      'a2a.inbox.wait.v1',
+      'mcp.a2a.tools.v1',
+      'mcp.alloyium.channel.v1',
+      transportFeature,
+      signerFeature,
+      ...(this.statusBeatMs > 0 && (this.coreSigningKey || this.coreSigningKeyPath) ? ['a2a.core.status-self-beat.v1'] : []),
+      ...this.extraFeatureTokens,
+    ]
+    const normalized = normalizeFeatureList(features)
+    if (!normalized) throw new Error('invalid built-in A2A core feature token list')
+    return normalized
+  }
+
+  private async refreshPeerProtocolDescriptor(): Promise<void> {
+    if (!this.redis || !this.presence?.isOwned()) return
+    const now = new Date().toISOString()
+    if (!this.coreProtocolStartedAt) this.coreProtocolStartedAt = now
+    try {
+      const descriptor = buildPeerProtocolDescriptor({
+        agentId: this.coreAgentId,
+        features: this.currentCoreFeatureTokens(),
+        runtime: {
+          kind: this.runtimeKind,
+          mcp_path: 'a2a-core',
+          host: this.runtimeHost,
+          pid: process.pid,
+        },
+        maxSendBytes: this.maxSendBytes,
+        startedAt: this.coreProtocolStartedAt,
+        lastSeen: now,
+        ttlS: this.presenceTtlS,
+        protocolVersion: this.protocolVersion,
+        productVersion: this.productVersion,
+        app: this.app,
+        deployment: this.deploymentContract ? {
+          deployment_id: this.deploymentContract.deploymentId,
+          bus_id: this.deploymentContract.busId,
+          host_id: this.deploymentContract.hostId,
+          contract_fingerprint: this.deploymentContract.fingerprint,
+        } : undefined,
+      })
+      await withTimeout(
+        this.redis.send('SET', [this.peerProtocolKeyPrefix + this.coreAgentId, JSON.stringify(descriptor), 'EX', String(this.presenceTtlS)]),
+        REDIS_TIMEOUT_MS,
+        'redis.peer_protocol.set',
+      )
+    } catch (e) {
+      log('warn', 'a2a_core_peer_protocol_refresh_failed', { agent_id: this.coreAgentId, ...errFields(e) })
+    }
+  }
+
+  private armPeerProtocolRefresh(): void {
+    if (this.peerProtocolTimer) return
+    this.peerProtocolTimer = setInterval(() => { void this.refreshPeerProtocolDescriptor() }, this.heartbeatMs)
+    ;(this.peerProtocolTimer as any).unref?.()
+  }
+
+  private stopPeerProtocolRefresh(): void {
+    if (this.peerProtocolTimer) clearInterval(this.peerProtocolTimer)
+    this.peerProtocolTimer = undefined
+  }
+
+  private async releasePeerProtocolDescriptor(): Promise<void> {
+    if (!this.redis || !this.presence?.isOwned()) return
+    try {
+      await withTimeout(this.redis.send('DEL', [this.peerProtocolKeyPrefix + this.coreAgentId]), REDIS_TIMEOUT_MS, 'redis.peer_protocol.del')
+    } catch (e) {
+      log('warn', 'a2a_core_peer_protocol_release_failed', { agent_id: this.coreAgentId, ...errFields(e) })
+    }
   }
 
   // Resolve the core's PER-HOST signing identity (SLICE 3.1). An injected key wins (tests); else load
@@ -225,6 +433,15 @@ export class A2ACore {
 
   private makeToolOnlySessionKey(agentId: string, epoch: number): string {
     return `${agentId}#tool:${epoch}`
+  }
+
+  resumeUdsSessionInboxInject(agentId: string, epoch?: number): boolean {
+    const found = this.findSession(agentId, epoch)
+    if (!found) return false
+    const [, session] = found
+    if (session.toolOnly) return false
+    session.a2a.resumeInboxInject('uds_session_ready')
+    return true
   }
 
   private findSession(agentId: string, epoch?: number): [string, Session] | null {
@@ -292,15 +509,36 @@ export class A2ACore {
       // connect throws, the catch's drain-Set already holds every conn opened so far — no leak.
       const n = this.natsPoolSize
       this.nc = await this.connectShared('consume')
+      if (this.deploymentContract) {
+        const bootstrapIfMissing = process.env.ALLOYIUM_BUS_SENTINEL_BOOTSTRAP === '1' || process.env.ALLOYIUM_BUS_SENTINEL_BOOTSTRAP === 'true'
+        await ensureNatsDeploymentSentinel(this.nc, this.deploymentContract, { bootstrapIfMissing })
+      }
       this.ncPublish = n >= 2 ? await this.connectShared('publish') : this.nc
       this.ncControl = n >= 3 ? await this.connectShared('control') : this.ncPublish
       this.js = this.nc.jetstream()
       this.jsPublish = this.ncPublish.jetstream()
       this.redis = new RedisClient(this.redisUrl)
+      if (this.deploymentContract) {
+        await ensureRedisDeploymentSentinel(this.redis, this.deploymentContract, {
+          bootstrapIfMissing: process.env.ALLOYIUM_BUS_SENTINEL_BOOTSTRAP === '1' || process.env.ALLOYIUM_BUS_SENTINEL_BOOTSTRAP === 'true',
+        })
+      }
       this.brain = new BrainTools()
       this.kai = new KaiTools()
       this.vault = new VaultTools()
-      this.presence = new PresenceClaimer(this.redis, { agentId: this.coreAgentId, host: hostname() })
+      this.presence = new PresenceClaimer(this.redis, {
+        agentId: this.coreAgentId,
+        host: this.runtimeHost,
+        keyPrefix: this.presenceKeyPrefix,
+        ttlS: this.presenceTtlS,
+        heartbeatMs: this.heartbeatMs,
+        deployment: this.deploymentContract ? {
+          deployment_id: this.deploymentContract.deploymentId,
+          bus_id: this.deploymentContract.busId,
+          host_id: this.deploymentContract.hostId,
+          contract_fingerprint: this.deploymentContract.fingerprint,
+        } : undefined,
+      })
       const claim = await this.presence.start()
       // 'dup' is NOT terminal: PresenceClaimer keeps retrying until it owns the key (e.g. after a dead
       // predecessor's stale key expires), and the status plane gates its self-beat on isOwned() — so a
@@ -313,11 +551,16 @@ export class A2ACore {
       this.statusPlane = new StatusPlane(this.ncControl!, { prefix: this.prefix, coreBeatMs: this.statusBeatMs, coreSigner, presenceOwned: () => this.presence?.isOwned() ?? false })
       this.statusPlane.setCoreStateProvider(() => ({ sessions: this.sessions.size }))
       this.statusPlane.start()
+      this.coreProtocolStartedAt = new Date().toISOString()
+      await this.refreshPeerProtocolDescriptor()
+      this.armPeerProtocolRefresh()
       this.started = true
-      log('info', 'a2a_core_started', { nats: this.natsUrl, pool: n, stream: this.stream, transport: this.devNoAuth ? 'devNoAuth' : (this.transportAuth ?? 'creds'), prefix: this.prefix ?? 'alloyium.a2a.' })
+      log('info', 'a2a_core_started', { nats: this.natsUrl, pool: n, stream: this.stream, transport: this.devNoAuth ? 'devNoAuth' : (this.transportAuth ?? 'creds'), prefix: this.prefix ?? DEFAULT_A2A_SUBJECT_PREFIX, deployment_id: this.deploymentContract?.deploymentId, bus_id: this.deploymentContract?.busId, host_id: this.deploymentContract?.hostId, contract_fingerprint: this.deploymentContract?.fingerprint, protocol_version: this.protocolVersion ?? DEFAULT_A2A_PROTOCOL_VERSION, features: this.currentCoreFeatureTokens().length })
     } catch (e) {
       // Partial-failure cleanup: drain every DISTINCT pool conn already opened + close Redis so
       // a failed boot leaks nothing. (Set dedups when natsPoolSize<3 shares conns.) (Review P2.)
+      this.stopPeerProtocolRefresh()
+      await this.releasePeerProtocolDescriptor().catch(() => {})
       try { this.statusPlane?.stop() } catch {}; this.statusPlane = undefined
       try { await this.presence?.stop() } catch {}; this.presence = undefined
       for (const c of new Set([this.nc, this.ncPublish, this.ncControl])) { try { await c?.drain() } catch {} }
@@ -371,6 +614,15 @@ export class A2ACore {
   private async _doAddSession(agentId: string, inject: Inject, opts: Partial<A2AChannelOpts>): Promise<AddSessionResult> {
     const a2a = new A2AChannel(inject, this.buildSessionOpts(agentId, opts))
     const launcher = new AgentLauncherTools({ agentId })
+    const access = new AccessTokenIssuerTools({
+      redis: this.redis!,
+      runtimeId: agentId,
+      agentId,
+      externalSign: opts.externalSign,
+      signingKeyPath: opts.signingKeyPath,
+    })
+    const taskboard = new TaskboardTools({ access, agentId })
+    const forgejo = new ForgejoTools({ access, agentId })
     // Wrap start() in try/catch: A2AChannel.start() self-heals + returns today, but the
     // AddSessionResult contract must not depend on "start never throws" (GPT5.5-1).
     let startErr: unknown
@@ -385,7 +637,7 @@ export class A2ACore {
       log('warn', 'a2a_core_session_start_failed', { agent_id: agentId, ...(startErr ? errFields(startErr) : {}) })
       return { ok: false, agentId, error: 'session_start_failed' }
     }
-    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher) })
+    this.sessions.set(agentId, { sessionKey: agentId, agentId, a2a, inject, launcher, access, taskboard, forgejo, toolList: this.makeToolList(a2a, launcher, access, taskboard, forgejo) })
     log('info', 'a2a_core_session_added', { agent_id: agentId, sessions: this.sessions.size })
     return { ok: true, agentId }
   }
@@ -410,6 +662,15 @@ export class A2ACore {
     // sanitizeBody is applied HERE (A2AChannel passes RAW body to inject) for byte-parity with webhook.ts.
     let serverRef: Server | undefined
     const launcher = new AgentLauncherTools({ agentId })
+    const access = new AccessTokenIssuerTools({
+      redis: this.redis!,
+      runtimeId: agentId,
+      agentId,
+      externalSign: wiring.externalSign,
+      signingKeyPath: opts.signingKeyPath,
+    })
+    const taskboard = new TaskboardTools({ access, agentId })
+    const forgejo = new ForgejoTools({ access, agentId })
     const inject: Inject = async (content, attrs) => {
       if (!serverRef) throw new Error('a2a-core: session mcp server not ready')
       const meta = attrs && attrs.kind === 'direct' && typeof attrs.id === 'string'
@@ -420,7 +681,8 @@ export class A2ACore {
         params: { content: sanitizeBody(content), meta },
       })
     }
-    const a2a = new A2AChannel(inject, this.buildSessionOpts(agentId, { ...opts, externalSign: wiring.externalSign }))
+    const channelOpts = { ...opts, externalSign: wiring.externalSign }
+    const a2a = new A2AChannel(inject, this.buildSessionOpts(agentId, channelOpts))
     let startErr: unknown
     try { await a2a.start() } catch (e) { startErr = e }
 
@@ -434,6 +696,9 @@ export class A2ACore {
           brain: this.brain,
           kai: this.kai,
           vault: this.vault,
+          access,
+          taskboard,
+          forgejo,
           launcher,
           inject: wiring.ctxInject,
         })
@@ -454,7 +719,7 @@ export class A2ACore {
       return { ok: false, agentId, error: 'session_start_failed' }
     }
 
-    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher, toolList: this.makeToolList(a2a, launcher), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
+    this.sessions.set(sessionKey, { sessionKey, agentId, a2a, inject, launcher, access, taskboard, forgejo, toolList: this.makeToolList(a2a, launcher, access, taskboard, forgejo), toolOnly, epoch: wiring.epoch, mcpServer, transport: wiring.transport })
     log('info', 'a2a_core_uds_session_added', { agent_id: agentId, session_key: sessionKey, tool_only: toolOnly, epoch: wiring.epoch, sessions: this.sessions.size })
     return { ok: true, agentId, epoch: wiring.epoch }
   }
@@ -489,11 +754,11 @@ export class A2ACore {
   listTools(agentId: string): any[] {
     const s = this.getSession(agentId)
     if (!s) return []
-    return [...(s.toolList ?? this.makeToolList(s.a2a, s.launcher))]
+    return [...(s.toolList ?? this.makeToolList(s.a2a, s.launcher, s.access, s.taskboard, s.forgejo))]
   }
 
-  private makeToolList(a2a: A2AChannel, launcher: AgentLauncherTools): any[] {
-    return [...a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...launcher.listTools()]
+  private makeToolList(a2a: A2AChannel, launcher: AgentLauncherTools, access: AccessTokenIssuerTools, taskboard: TaskboardTools, forgejo: ForgejoTools): any[] {
+    return [...a2a.listTools(), ...this.brain.listTools(), ...this.kai.listTools(), ...this.vault.listTools(), ...access.listTools(), ...taskboard.listTools(), ...forgejo.listTools(), ...launcher.listTools()]
   }
 
   // Dispatch a tool call for a session. Routing mirrors webhook.ts exactly: kai tools
@@ -525,13 +790,16 @@ export class A2ACore {
       return res
     }
     if (this.vault.handles(name)) return this.vault.callTool(name, args)
+    if (s.access.handles(name)) return s.access.callTool(name, args)
+    if (s.taskboard.handles(name)) return s.taskboard.callTool(name, args)
+    if (s.forgejo.handles(name)) return s.forgejo.callTool(name, args)
     if (s.launcher.handles(name)) return s.launcher.callTool(name, args)
     return s.a2a.callTool(name, args)
   }
 
   // The combined MCP server instructions a session advertises.
   instructions(): string {
-    return BASE_INSTRUCTIONS + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS
+    return BASE_INSTRUCTIONS + A2AChannel.INSTRUCTIONS + BrainTools.INSTRUCTIONS + KaiTools.INSTRUCTIONS + VaultTools.INSTRUCTIONS + AccessTokenIssuerTools.INSTRUCTIONS + TaskboardTools.INSTRUCTIONS + ForgejoTools.INSTRUCTIONS
   }
 
   // Graceful shutdown: stop every session first (each releases presence + its consumer
@@ -555,6 +823,8 @@ export class A2ACore {
     // `stopping`) over the still-live shared conns, BEFORE we drain them — no stranded
     // presence / durable consumer / orphan {ok:true}.
     if (this.inflightAdds.size) await Promise.allSettled([...this.inflightAdds])
+    this.stopPeerProtocolRefresh()
+    await this.releasePeerProtocolDescriptor().catch(() => {})
     try { this.statusPlane?.stop() } catch {} // SLICE 3: clear the core-beat timer before draining ncControl
     this.statusPlane = undefined
     try { await this.presence?.stop() } catch {}
@@ -587,8 +857,9 @@ if (import.meta.main) {
   // sessions (one A2AChannel + MCP server per agent over the core's shared NATS+Redis).
   // Dynamic import keeps uds_acceptor out of the module graph for library users of A2ACore.
   const { startUdsAcceptor } = await import('./uds_acceptor.ts')
-  const redis = new RedisClient(process.env.REDIS_URL ?? 'redis://redis:6379')
+  const redis = new RedisClient(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379')
   const socketPath = process.env.A2A_UDS_SOCKET_PATH ?? '/run/a2a-core/core.sock'
+  const deploymentContract = resolveDeploymentContract(process.env)
   // Peercred enforcement is OPT-IN (A2A_UDS_EXPECTED_UID): Bun exposes no SO_PEERCRED, so the
   // socket dir's 0700 mode is the access control. Set the env on a peercred-capable runtime to enforce.
   // P2 fold: validate at boot — a non-numeric value would become NaN and silently fail EVERY connection
@@ -601,7 +872,7 @@ if (import.meta.main) {
       throw new Error(`A2A_UDS_EXPECTED_UID must be a non-negative integer uid, got: ${JSON.stringify(expectedUidRaw)}`)
     }
   }
-  const acceptor = await startUdsAcceptor({ core, redis, socketPath, expectedUid })
+  const acceptor = await startUdsAcceptor({ core, redis, socketPath, expectedUid, deploymentContract: deploymentContract ?? undefined })
   log('info', 'a2a_core_ready', { socket: socketPath, note: 'UDS acceptor listening — shims may attach' })
   for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, async () => {
     await acceptor.close().catch(() => {})

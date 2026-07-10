@@ -35,14 +35,39 @@ export type AuthorizeWriteJobResult =
   | { ok: true; realpath: string }
   | { ok: false; reason: string }
 
-/** Redis set of canonical realpaths allowed for codex-build workspace-write jobs. */
-export const CWD_ALLOW_SET_KEY = 'alloyium:a2a:codex-build:cwd-allow'
+/** Legacy default codex-build key prefix, used when no fleet namespace is configured. */
+export const DEFAULT_CODEX_BUILD_KEY_PREFIX = 'alloyium:a2a:codex-build:'
+
+/**
+ * Resolve the fleet-namespaced Redis key prefix for codex-build coordination keys.
+ *
+ * Mirrors every other a2a key prefix (`A2A_PRESENCE_KEY_PREFIX`, `A2A_PUBKEY_KEY_PREFIX`,
+ * …): the deployment sets `A2A_CODEX_BUILD_KEY_PREFIX` to the fleet namespace (e.g.
+ * `alloyium:a2a:codex-build:`) and the launcher forwards the SAME value to every codex
+ * worker. Because the launcher's `registerCwd` and the worker's `isCwdRegistered` both
+ * derive their key from this one value, they can never split across namespaces (the bug
+ * this replaces: a hardcoded `alloyium:` literal that ignored the fleet namespace).
+ * Falls back to the legacy default so a fleet with no namespace env is unaffected.
+ */
+export function codexBuildKeyPrefix(env: Record<string, string | undefined> = process.env): string {
+  const raw = (env.A2A_CODEX_BUILD_KEY_PREFIX ?? '').trim()
+  return raw || DEFAULT_CODEX_BUILD_KEY_PREFIX
+}
+
+/** Redis set of canonical realpaths allowed for codex-build full-access jobs. */
+export function cwdAllowSetKey(env?: Record<string, string | undefined>): string {
+  return `${codexBuildKeyPrefix(env)}cwd-allow`
+}
 
 /** Redis sorted-set companion for per-entry cwd allow-list expiry timestamps. */
-export const CWD_ALLOW_EXPIRY_ZSET_KEY = `${CWD_ALLOW_SET_KEY}:expiry`
+export function cwdAllowExpiryZsetKey(env?: Record<string, string | undefined>): string {
+  return `${cwdAllowSetKey(env)}:expiry`
+}
 
-/** Redis key prefix binding a thread_key to its first workspace-write requester. */
-export const THREAD_OWNER_KEY_PREFIX = 'alloyium:a2a:codex-build:thread-owner:'
+/** Redis key binding a thread_key to its first workspace-write requester. */
+export function threadOwnerKey(threadKey: string, env?: Record<string, string | undefined>): string {
+  return `${codexBuildKeyPrefix(env)}thread-owner:${threadKey}`
+}
 
 /** TTL for thread_key ownership claims, in seconds. */
 export const THREAD_OWNER_TTL_S = Math.max(1, Number(process.env.CODEX_BUILD_THREAD_OWNER_TTL_S ?? 24 * 3600) || 24 * 3600)
@@ -130,12 +155,12 @@ function redisBool(v: any): boolean {
 }
 
 /**
- * Register a canonical realpath as eligible for codex-build workspace-write jobs.
+ * Register a canonical realpath as eligible for codex-build full-access jobs.
  *
- * Scheme: `CWD_ALLOW_SET_KEY` stores active realpaths with `SADD`; optional per-entry
- * expiry is stored in `CWD_ALLOW_EXPIRY_ZSET_KEY` as score=`expiresAtMs`,
- * member=`realpath`. Expired entries are denied and lazily removed by
- * `isCwdRegistered`.
+ * Scheme: the cwd-allow set (`cwdAllowSetKey`) stores active realpaths with `SADD`;
+ * optional per-entry expiry is stored in the companion zset (`cwdAllowExpiryZsetKey`)
+ * as score=`expiresAtMs`, member=`realpath`. Expired entries are denied and lazily
+ * removed by `isCwdRegistered`.
  */
 export async function registerCwd(redis: BuildAuthzRedis, realpath: string, opts: RegisterCwdOpts = {}): Promise<boolean> {
   const rp = normalizeRegisteredRealpath(realpath)
@@ -145,11 +170,11 @@ export async function registerCwd(redis: BuildAuthzRedis, realpath: string, opts
     if (opts.ttlS !== undefined) {
       const ttlS = Number(opts.ttlS)
       if (!Number.isFinite(ttlS)) return false
-      await redisSend(redis, 'ZADD', [CWD_ALLOW_EXPIRY_ZSET_KEY, String(Date.now() + Math.max(0, ttlS) * 1000), rp])
+      await redisSend(redis, 'ZADD', [cwdAllowExpiryZsetKey(), String(Date.now() + Math.max(0, ttlS) * 1000), rp])
     } else {
-      await redisSend(redis, 'ZREM', [CWD_ALLOW_EXPIRY_ZSET_KEY, rp])
+      await redisSend(redis, 'ZREM', [cwdAllowExpiryZsetKey(), rp])
     }
-    await redisSend(redis, 'SADD', [CWD_ALLOW_SET_KEY, rp])
+    await redisSend(redis, 'SADD', [cwdAllowSetKey(), rp])
     return true
   } catch {
     return false
@@ -167,9 +192,9 @@ export async function unregisterCwd(redis: BuildAuthzRedis, realpath: string): P
   if (!rp) return false
 
   try {
-    await redisSend(redis, 'ZADD', [CWD_ALLOW_EXPIRY_ZSET_KEY, String(Date.now() - 1), rp])
-    await redisSend(redis, 'SREM', [CWD_ALLOW_SET_KEY, rp])
-    await redisSend(redis, 'ZREM', [CWD_ALLOW_EXPIRY_ZSET_KEY, rp])
+    await redisSend(redis, 'ZADD', [cwdAllowExpiryZsetKey(), String(Date.now() - 1), rp])
+    await redisSend(redis, 'SREM', [cwdAllowSetKey(), rp])
+    await redisSend(redis, 'ZREM', [cwdAllowExpiryZsetKey(), rp])
     return true
   } catch {
     return false
@@ -186,23 +211,23 @@ export async function isCwdRegistered(redis: BuildAuthzRedis, realpath: string):
   if (!rp) return false
 
   try {
-    const score = await redisSend(redis, 'ZSCORE', [CWD_ALLOW_EXPIRY_ZSET_KEY, rp])
+    const score = await redisSend(redis, 'ZSCORE', [cwdAllowExpiryZsetKey(), rp])
     if (score != null) {
       const expiresAt = Number(score)
       if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-        await redisSend(redis, 'SREM', [CWD_ALLOW_SET_KEY, rp]).catch(() => {})
-        await redisSend(redis, 'ZREM', [CWD_ALLOW_EXPIRY_ZSET_KEY, rp]).catch(() => {})
+        await redisSend(redis, 'SREM', [cwdAllowSetKey(), rp]).catch(() => {})
+        await redisSend(redis, 'ZREM', [cwdAllowExpiryZsetKey(), rp]).catch(() => {})
         return false
       }
     }
-    return redisBool(await redisSend(redis, 'SISMEMBER', [CWD_ALLOW_SET_KEY, rp]))
+    return redisBool(await redisSend(redis, 'SISMEMBER', [cwdAllowSetKey(), rp]))
   } catch {
     return false
   }
 }
 
 async function claimThreadKey(redis: BuildAuthzRedis, threadKey: string, requesterId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const key = THREAD_OWNER_KEY_PREFIX + threadKey
+  const key = threadOwnerKey(threadKey)
   const claimed = await redisSend(redis, 'SET', [key, requesterId, 'NX', 'EX', String(THREAD_OWNER_TTL_S)])
   if (claimed) return { ok: true }
 

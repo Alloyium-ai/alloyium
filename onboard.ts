@@ -16,15 +16,23 @@
 // and safe against silent takeover, but a Redis-writer could squat an UNCLAIMED
 // id, so keep the pubkey namespace write-restricted in any hardened deployment.
 //
-// CLI:  bun onboard.ts <agent-id> [--dir <out>] [--redis <url>] [--nats <url>]
-//                       [--force] [--no-verify]
+// CLI:  bun onboard.ts <agent-id> [--dev|--prod|--unmanaged] [--dir <out>] [--redis <url>]
+//                       [--nats <url>] [--force] [--no-verify]
+//   Profile: --dev (DEFAULT) targets the local demo deployment contract.
+//   --prod remains fail-closed while production is held. --unmanaged is
+//   available for isolated/custom buses.
 import { RedisClient } from 'bun'
 import { writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { createUser, fromSeed } from 'nkeys.js'
-import { importEd25519Seed, importEd25519Pub, signEnvelope, verifyEnvelope, type Envelope } from './a2a-channel.ts'
+import { DEFAULT_A2A_SUBJECT_PREFIX, importEd25519Seed, importEd25519Pub, normalizeA2ASubjectPrefix, signEnvelope, verifyEnvelope, type Envelope } from './a2a-channel.ts'
+import { materializeDeploymentEnv, type AlloyiumDeploymentId } from './deployment_contract.ts'
 
-const PUBKEY_PREFIX = process.env.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
+// Read lazily (a function, not a module const captured at import) so the CLI's --dev/--prod
+// profile can pin the namespace via process.env BEFORE registration/verification run. Default =
+// alloyium; a2a-launch.sh (and the dev profile below) set A2A_PUBKEY_KEY_PREFIX explicitly.
+const pubkeyPrefix = (): string => process.env.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:'
+const DEFAULT_SUBJECT_PREFIX = normalizeA2ASubjectPrefix(process.env.A2A_SUBJECT_PREFIX ?? DEFAULT_A2A_SUBJECT_PREFIX)
 const ID_RE = /^[a-z0-9-]{1,64}$/
 const b64 = (u8: Uint8Array): string => Buffer.from(u8).toString('base64')
 const unb64 = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, 'base64'))
@@ -74,7 +82,7 @@ export const nkeyPublicOf = (seed: string): string => fromSeed(new TextEncoder()
 export class PubkeyConflict extends Error {}
 
 export async function registerPubkey(redis: RedisClient, id: string, pubB64: string, force = false): Promise<'created' | 'exists' | 'forced'> {
-  const key = PUBKEY_PREFIX + id
+  const key = pubkeyPrefix() + id
   if (force) { await redis.set(key, pubB64); return 'forced' }
   const res = await redis.send('SET', [key, pubB64, 'NX'])
   if (res) return 'created'
@@ -89,18 +97,19 @@ export async function registerPubkey(redis: RedisClient, id: string, pubB64: str
 // this agent's bridge needs for its OWN stream. A broad `$JS.API.>` would let a
 // compromised A2A nkey manage/purge other streams (e.g. RAMP_ALERTS); these are
 // limited to `<stream>` so it can't touch anything else.
-export function natsUserBlock(id: string, nkeyPublic: string, stream = 'ALLOYIUM_A2A'): string {
+export function natsUserBlock(id: string, nkeyPublic: string, stream = 'ALLOYIUM_A2A', subjectPrefix = DEFAULT_SUBJECT_PREFIX): string {
+  subjectPrefix = normalizeA2ASubjectPrefix(subjectPrefix)
   return `    # a2a agent: ${id}\n` +
     `    { nkey: ${nkeyPublic}, permissions: {\n` +
     `        publish: { allow: [\n` +
-    `          "alloyium.a2a.>",\n` +
+    `          "${subjectPrefix}>",\n` +
     `          "$JS.API.STREAM.INFO.${stream}", "$JS.API.STREAM.CREATE.${stream}",\n` +
     `          "$JS.API.CONSUMER.CREATE.${stream}.>", "$JS.API.CONSUMER.DURABLE.CREATE.${stream}.>",\n` +
     `          "$JS.API.CONSUMER.INFO.${stream}.>", "$JS.API.CONSUMER.DELETE.${stream}.>",\n` +
     `          "$JS.API.CONSUMER.MSG.NEXT.${stream}.>",\n` +
     `          "$JS.ACK.${stream}.>"\n` +
     `        ] }\n` +
-    `        subscribe: { allow: ["alloyium.a2a.>", "_INBOX.>"] }\n` +
+    `        subscribe: { allow: ["${subjectPrefix}>", "_INBOX.>"] }\n` +
     `    }}`
 }
 export function natsAuthSnippet(userBlocks: string[]): string {
@@ -109,7 +118,7 @@ export function natsAuthSnippet(userBlocks: string[]): string {
 
 // ── files ───────────────────────────────────────────────────────────────────
 
-export function writeAgentFiles(dir: string, id: string, opts: { ed25519SeedB64: string; ed25519PubB64: string; nkeySeed?: string; transport: 'nkey' | 'none'; natsUrl?: string; redisUrl?: string; stream?: string }): { seedPath: string; pubPath: string; nkeyPath: string | null; envPath: string } {
+export function writeAgentFiles(dir: string, id: string, opts: { ed25519SeedB64: string; ed25519PubB64: string; nkeySeed?: string; transport: 'nkey' | 'none'; natsUrl?: string; redisUrl?: string; stream?: string; subjectPrefix?: string; deploymentEnv?: Record<string, string> }): { seedPath: string; pubPath: string; nkeyPath: string | null; envPath: string } {
   mkdirSync(dir, { recursive: true })
   const seedPath = resolve(join(dir, `${id}.seed`))
   const pubPath = resolve(join(dir, `${id}.pub`))
@@ -126,8 +135,17 @@ export function writeAgentFiles(dir: string, id: string, opts: { ed25519SeedB64:
   if (opts.transport === 'none') lines.push('A2A_TRANSPORT_AUTH=none') // anonymous NATS connect; signing stays ON
   else lines.push(`A2A_NKEY=${nkeyPath}`)
   if (opts.stream && opts.stream !== 'ALLOYIUM_A2A') lines.push(`A2A_STREAM=${opts.stream}`)
+  const subjectPrefix = normalizeA2ASubjectPrefix(opts.subjectPrefix ?? DEFAULT_SUBJECT_PREFIX)
+  if (subjectPrefix !== DEFAULT_A2A_SUBJECT_PREFIX) lines.push(`A2A_SUBJECT_PREFIX=${subjectPrefix}`)
   if (opts.natsUrl) lines.push(`NATS_URL=${opts.natsUrl}`)
   if (opts.redisUrl) lines.push(`REDIS_URL=${opts.redisUrl}`)
+  const existing = new Set(lines.map((line) => line.slice(0, line.indexOf('='))))
+  for (const [key, value] of Object.entries(opts.deploymentEnv ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || value.includes('\n') || value.includes('\r')) {
+      throw new Error(`invalid deployment environment field: ${key}`)
+    }
+    if (!existing.has(key)) lines.push(`${key}=${value}`)
+  }
   writeFileSync(envPath, lines.join('\n') + '\n', { mode: 0o600 })
   for (const p of [seedPath, envPath, ...(nkeyPath ? [nkeyPath] : [])]) chmodSync(p, 0o600) // vs umask
   return { seedPath, pubPath, nkeyPath, envPath }
@@ -139,7 +157,7 @@ export async function verifyRoundTrip(redis: RedisClient, id: string, seedB64: s
   const signKey = await importEd25519Seed(unb64(seedB64))
   const env: Envelope = { v: 1, id: 'onboard-verify', from: id, to: 'onboard-check', type: 'msg', ts: new Date().toISOString(), body: 'verify', alg: 'ed25519' }
   env.sig = await signEnvelope(env, 'ed25519', signKey)
-  const storedB64 = await redis.get(PUBKEY_PREFIX + id)
+  const storedB64 = await redis.get(pubkeyPrefix() + id)
   if (!storedB64) return false
   return verifyEnvelope(env, await importEd25519Pub(unb64(storedB64.trim())), 'ed25519')
 }
@@ -158,31 +176,32 @@ export type OnboardResult = {
   verified: boolean | null
 }
 
-export async function onboard(opts: { id: string; dir: string; redis: RedisClient; force?: boolean; verify?: boolean; natsUrl?: string; redisUrl?: string; stream?: string; transport?: 'nkey' | 'none' }): Promise<OnboardResult> {
+export async function onboard(opts: { id: string; dir: string; redis: RedisClient; force?: boolean; verify?: boolean; natsUrl?: string; redisUrl?: string; stream?: string; subjectPrefix?: string; transport?: 'nkey' | 'none'; deploymentEnv?: Record<string, string> }): Promise<OnboardResult> {
   if (!ID_RE.test(opts.id)) throw new Error(`invalid agent-id '${opts.id}' (must match ^[a-z0-9-]{1,64}$)`)
   const force = opts.force ?? false
   const stream = opts.stream ?? 'ALLOYIUM_A2A'
+  const subjectPrefix = normalizeA2ASubjectPrefix(opts.subjectPrefix ?? DEFAULT_SUBJECT_PREFIX)
   const transport = opts.transport ?? 'nkey'
   // Reuse existing key files for an idempotent re-onboard; --force rotates.
   const ed = await loadOrGenEd25519(opts.dir, opts.id, force)
   // transport='none' (Option A): no NATS identity at all — push-button, no server step.
   const nk = transport === 'nkey' ? loadOrGenNkey(opts.dir, opts.id, force) : undefined
   const pubkeyStatus = await registerPubkey(opts.redis, opts.id, ed.pubB64, force)
-  const files = writeAgentFiles(opts.dir, opts.id, { ed25519SeedB64: ed.seedB64, ed25519PubB64: ed.pubB64, nkeySeed: nk?.seed, transport, natsUrl: opts.natsUrl, redisUrl: opts.redisUrl, stream })
+  const files = writeAgentFiles(opts.dir, opts.id, { ed25519SeedB64: ed.seedB64, ed25519PubB64: ed.pubB64, nkeySeed: nk?.seed, transport, natsUrl: opts.natsUrl, redisUrl: opts.redisUrl, stream, subjectPrefix, deploymentEnv: opts.deploymentEnv })
   const verified = opts.verify === false ? null : await verifyRoundTrip(opts.redis, opts.id, ed.seedB64)
   const nkeyPublic = nk ? nkeyPublicOf(nk.seed) : null
   return {
     id: opts.id, pubkeyB64: ed.pubB64, nkeyPublic, pubkeyStatus, reusedKeys: ed.reused, transport, files,
-    natsUserBlock: nkeyPublic ? natsUserBlock(opts.id, nkeyPublic, stream) : null, verified,
+    natsUserBlock: nkeyPublic ? natsUserBlock(opts.id, nkeyPublic, stream, subjectPrefix) : null, verified,
   }
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 if (import.meta.main) {
-  const usage = 'usage: bun onboard.ts <agent-id> [--transport none|nkey] [--dir <out>] [--redis <url>] [--nats <url>] [--stream <name>] [--force] [--no-verify]'
-  const BOOL = new Set(['force', 'no-verify'])
-  const VALUE = new Set(['dir', 'redis', 'nats', 'stream', 'transport'])
+  const usage = 'usage: bun onboard.ts <agent-id> [--dev|--prod|--unmanaged] [--transport none|nkey] [--dir <out>] [--redis <url>] [--nats <url>] [--stream <name>] [--subject-prefix <prefix>] [--force] [--no-verify]'
+  const BOOL = new Set(['force', 'no-verify', 'prod', 'dev', 'unmanaged'])
+  const VALUE = new Set(['dir', 'redis', 'nats', 'stream', 'subject-prefix', 'transport'])
   // Parse option/value pairs first so a value can't be mistaken for the agent-id
   // (e.g. `--dir a2a scout-1` must NOT pick `a2a` as the id).
   const flags: Record<string, string | boolean> = {}
@@ -203,14 +222,35 @@ if (import.meta.main) {
   if (positionals.length !== 1) { console.error(`expected exactly one <agent-id>${positionals.length > 1 ? ` (got ${positionals.length}: ${positionals.join(', ')})` : ''}\n${usage}`); process.exit(2) }
   const id = positionals[0]
   const dir = (flags.dir as string) ?? './a2a'
-  const redisUrl = (flags.redis as string) ?? process.env.REDIS_URL ?? 'redis://redis:6379'
-  const natsUrl = (flags.nats as string) ?? process.env.NATS_URL ?? 'nats://nats:4222'
+  const profileCount = [flags.prod, flags.dev, flags.unmanaged].filter((value) => value === true).length
+  if (profileCount > 1) { console.error(`--dev, --prod, and --unmanaged are mutually exclusive\n${usage}`); process.exit(2) }
+  const unmanaged = flags.unmanaged === true
+  let deploymentEnv: Record<string, string> | undefined
+  if (!unmanaged) {
+    // Apply CLI overrides before resolving the contract so an endpoint-only or
+    // namespace-only override is rejected as a split deployment, never silently mixed.
+    if (flags.redis) process.env.REDIS_URL = String(flags.redis)
+    if (flags.nats) process.env.NATS_URL = String(flags.nats)
+    if (flags.stream) process.env.A2A_STREAM = String(flags.stream)
+    if (flags['subject-prefix']) process.env.A2A_SUBJECT_PREFIX = String(flags['subject-prefix'])
+    const deploymentId: AlloyiumDeploymentId = flags.prod === true ? 'prod' : 'dev'
+    try {
+      deploymentEnv = materializeDeploymentEnv(process.env, { deploymentId, enforceProdHold: true })
+      Object.assign(process.env, deploymentEnv)
+    } catch (error) {
+      console.error(`deployment contract refused onboarding: ${error instanceof Error ? error.message : String(error)}`)
+      process.exit(2)
+    }
+  }
+  const redisUrl = (flags.redis as string) ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
+  const natsUrl = (flags.nats as string) ?? process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
   const stream = (flags.stream as string) ?? process.env.A2A_STREAM ?? 'ALLOYIUM_A2A'
+  const subjectPrefix = normalizeA2ASubjectPrefix((flags['subject-prefix'] as string) ?? process.env.A2A_SUBJECT_PREFIX ?? DEFAULT_A2A_SUBJECT_PREFIX)
   const transport = ((flags.transport as string) ?? 'nkey') as 'nkey' | 'none'
   if (transport !== 'nkey' && transport !== 'none') { console.error(`--transport must be 'none' or 'nkey'\n${usage}`); process.exit(2) }
   const redis = new RedisClient(redisUrl)
   try {
-    const r = await onboard({ id, dir, redis, force: flags.force === true, verify: flags['no-verify'] !== true, natsUrl, redisUrl, stream, transport })
+    const r = await onboard({ id, dir, redis, force: flags.force === true, verify: flags['no-verify'] !== true, natsUrl, redisUrl, stream, subjectPrefix, transport, deploymentEnv })
     console.log(`\n✓ onboarded a2a agent '${r.id}'${r.reusedKeys ? ' (reused existing keys)' : ''}  [transport: ${r.transport}]`)
     console.log(`  ed25519 pubkey : ${r.pubkeyB64}  (Redis: ${r.pubkeyStatus})`)
     console.log(`  env            : ${r.files.envPath}`)

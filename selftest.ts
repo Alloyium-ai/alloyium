@@ -5,8 +5,8 @@
 import { connect, type NatsConnection } from 'nats'
 import { RedisClient } from 'bun'
 
-const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
+const NATS_URL = process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
 const TEST_KEY = 'alloyium:selftest'
 const enc = (o: unknown) => new TextEncoder().encode(JSON.stringify(o))
 
@@ -16,7 +16,7 @@ process.env.CONTROL_SUBJECT = 'alloyium.channels.selftest.control'
 
 const specs = [
   { subject: 'alloyium.channels.selftest', mode: 'core' },
-  { subject: 'alloyium.channels.selftest.js', mode: 'jetstream', stream: 'CLAUDE_SELFTEST', durable: 'claude-selftest-consumer', filter_subject: 'alloyium.channels.selftest.js' },
+  { subject: 'alloyium.channels.selftest.js', mode: 'jetstream', stream: 'ALLOYIUM_SELFTEST', durable: 'alloyium-selftest-consumer', filter_subject: 'alloyium.channels.selftest.js' },
 ]
 
 let nc: NatsConnection | undefined
@@ -25,7 +25,7 @@ const redis = new RedisClient(REDIS_URL)
 async function cleanup() {
   try { await new RedisClient(REDIS_URL).del(TEST_KEY) } catch {}
   try {
-    if (nc) { const jsm = await nc.jetstreamManager(); await jsm.streams.delete('CLAUDE_SELFTEST') }
+    if (nc) { const jsm = await nc.jetstreamManager(); await jsm.streams.delete('ALLOYIUM_SELFTEST') }
   } catch {}
   try { await nc?.drain() } catch {}
 }
@@ -34,7 +34,7 @@ try {
   await redis.set(TEST_KEY, JSON.stringify(specs))
   nc = await connect({ servers: NATS_URL, name: 'alloyium-selftest' })
   const jsm = await nc.jetstreamManager()
-  try { await jsm.streams.add({ name: 'CLAUDE_SELFTEST', subjects: ['alloyium.channels.selftest.js'] }) } catch {}
+  try { await jsm.streams.add({ name: 'ALLOYIUM_SELFTEST', subjects: ['alloyium.channels.selftest.js'] }) } catch {}
 
   const received: Array<{ subject: string; mode: string; content: string }> = []
   const { NatsChannel } = await import('./nats-channel.ts')
