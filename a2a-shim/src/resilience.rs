@@ -1,5 +1,8 @@
 use tokio::time::Duration;
 
+const INBOX_WAIT_DEFAULT_TIMEOUT_MS: i64 = 300_000;
+const INBOX_WAIT_MAX_TIMEOUT_MS: i64 = 600_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u32);
 
@@ -26,5 +29,82 @@ pub fn timeout_budget(method: &str, normal: Duration, long: Duration) -> Duratio
         long
     } else {
         normal
+    }
+}
+
+pub fn inbox_wait_budget(
+    action: &str,
+    timeout_ms: Option<i64>,
+    grace: Duration,
+    max: Duration,
+) -> Option<Duration> {
+    if action != "wait" {
+        return None;
+    }
+
+    let timeout_ms = timeout_ms.unwrap_or(INBOX_WAIT_DEFAULT_TIMEOUT_MS);
+    if !(1..=INBOX_WAIT_MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return None;
+    }
+
+    let timeout = Duration::from_millis(timeout_ms as u64);
+    Some(timeout.saturating_add(grace).min(max))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inbox_wait_budget;
+    use tokio::time::Duration;
+
+    #[test]
+    fn inbox_wait_budget_uses_requested_timeout_plus_grace() {
+        assert_eq!(
+            inbox_wait_budget(
+                "wait",
+                Some(150_000),
+                Duration::from_millis(5_000),
+                Duration::from_millis(605_000),
+            ),
+            Some(Duration::from_millis(155_000))
+        );
+    }
+
+    #[test]
+    fn inbox_wait_budget_defaults_missing_timeout() {
+        assert_eq!(
+            inbox_wait_budget(
+                "wait",
+                None,
+                Duration::from_millis(5_000),
+                Duration::from_millis(605_000),
+            ),
+            Some(Duration::from_millis(305_000))
+        );
+    }
+
+    #[test]
+    fn inbox_wait_budget_rejects_invalid_or_non_wait_inputs() {
+        let grace = Duration::from_millis(5_000);
+        let max = Duration::from_millis(605_000);
+
+        assert_eq!(inbox_wait_budget("wait", Some(600_001), grace, max), None);
+        assert_eq!(inbox_wait_budget("wait", Some(0), grace, max), None);
+        assert_eq!(inbox_wait_budget("wait", Some(-1), grace, max), None);
+        assert_eq!(inbox_wait_budget("list", Some(150_000), grace, max), None);
+        assert_eq!(inbox_wait_budget("read", None, grace, max), None);
+        assert_eq!(inbox_wait_budget("ack", None, grace, max), None);
+    }
+
+    #[test]
+    fn inbox_wait_budget_clamps_to_max() {
+        assert_eq!(
+            inbox_wait_budget(
+                "wait",
+                Some(600_000),
+                Duration::from_millis(5_000),
+                Duration::from_millis(602_000),
+            ),
+            Some(Duration::from_millis(602_000))
+        );
     }
 }

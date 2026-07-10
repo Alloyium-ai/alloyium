@@ -183,6 +183,25 @@ pub fn peek_id_method(body: &[u8]) -> (Option<serde_json::Value>, Option<String>
     (id, method)
 }
 
+pub fn peek_tool_call(body: &[u8]) -> Option<(String, serde_json::Value)> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    if value.get("method").and_then(serde_json::Value::as_str) != Some("tools/call") {
+        return None;
+    }
+
+    let params = value.get("params")?;
+    let name = params
+        .get("name")
+        .and_then(serde_json::Value::as_str)?
+        .to_owned();
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    Some((name, arguments))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StdinGate {
     open: bool,
@@ -205,5 +224,41 @@ impl StdinGate {
 impl Default for StdinGate {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peek_tool_call;
+    use serde_json::json;
+
+    #[test]
+    fn peek_tool_call_returns_name_and_arguments() {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "a2a-inbox-messages",
+                "arguments": { "action": "wait", "timeout_ms": 150000 }
+            }
+        }))
+        .unwrap();
+
+        let (name, arguments) = peek_tool_call(&body).expect("tools/call");
+        assert_eq!(name, "a2a-inbox-messages");
+        assert_eq!(arguments["action"], json!("wait"));
+        assert_eq!(arguments["timeout_ms"], json!(150000));
+    }
+
+    #[test]
+    fn peek_tool_call_ignores_other_shapes() {
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let notification = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let malformed = br#"{"jsonrpc":"2.0","id":1"#;
+
+        assert!(peek_tool_call(initialize).is_none());
+        assert!(peek_tool_call(notification).is_none());
+        assert!(peek_tool_call(malformed).is_none());
     }
 }

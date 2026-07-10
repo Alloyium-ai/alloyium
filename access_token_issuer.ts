@@ -1,0 +1,897 @@
+import { RedisClient } from 'bun'
+import { readFileSync } from 'node:fs'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { importEd25519Pub, importEd25519Seed, signCanonical } from './a2a-channel.ts'
+
+type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
+
+export type AccessDecisionReason =
+  | 'allowed'
+  | 'bad_request'
+  | 'unknown_agent'
+  | 'invalid_signature'
+  | 'nonce_replay'
+  | 'request_expired'
+  | 'request_future_skew'
+  | 'ttl_too_long'
+  | 'scope_denied'
+  | 'upstream_scope_unavailable'
+  | 'issuer_unavailable'
+
+export type AccessIssuerRequest = {
+  agent_id: string
+  requested_scope: string
+  nonce: string
+  issued_at: string
+  expiry: string
+  signature: string
+}
+
+export type AccessIssueAuditRecord = {
+  ts: string
+  agent_id: string
+  requested_scope: string
+  decision: 'allow' | 'deny'
+  reason: AccessDecisionReason
+  lease_id?: string
+  ttl_sec?: number
+  lifecycle?: AccessLeaseLifecycle
+  revocable?: boolean
+  request_hash: string
+  nonce_hash?: string
+  runtime_id?: string
+}
+
+export type AccessLeaseRecord = {
+  lease_id: string
+  agent_id: string
+  scope: string
+  issued_at: string
+  expires_at: string
+  ttl_sec: number
+  lifecycle: AccessLeaseLifecycle
+  revocable: boolean
+  delivery: 'brokered'
+}
+
+export type AccessPolicyAgentEntry =
+  | string[]
+  | {
+      scopes?: string[]
+      max_ttl_sec?: number
+    }
+
+export type AccessLeaseLifecycle = 'brokered'
+
+export type AccessPolicy = {
+  defaults?: {
+    max_ttl_sec?: number
+  }
+  agents?: Record<string, AccessPolicyAgentEntry>
+  roles?: Record<string, AccessPolicyAgentEntry>
+  agent_roles?: Record<string, string[]>
+  launcher?: {
+    enabled?: boolean
+    allowed_creators?: string[]
+    allowed_scopes?: string[]
+    max_ttl_sec?: number
+  }
+}
+
+export interface AccessIdentityRegistry {
+  getPublicKey(agentId: string): Promise<Uint8Array | null>
+}
+
+export interface AccessIssuerStore {
+  consumeNonce(agentId: string, nonceHash: string, retainUntilMs: number): Promise<'ok' | 'replay'>
+  writeAudit(record: AccessIssueAuditRecord): Promise<void>
+  storeLease(record: AccessLeaseRecord): Promise<void>
+}
+
+export type AccessLauncherGrant = {
+  agent_id: string
+  created_by?: string
+  role?: string
+  role_scopes?: string[]
+}
+
+export interface AccessLauncherGrantRegistry {
+  getGrant(agentId: string): Promise<AccessLauncherGrant | null>
+}
+
+export interface AccessTokenIssuerOpts {
+  registry: AccessIdentityRegistry
+  store: AccessIssuerStore
+  launcherGrants?: AccessLauncherGrantRegistry
+  policy?: AccessPolicy
+  nowMs?: () => number
+  genLeaseId?: () => string
+  runtimeId?: string
+  maxFutureSkewSec?: number
+}
+
+export interface AccessTokenIssuerToolsOpts {
+  issuer?: AccessTokenIssuer
+  redis?: RedisLike
+  policy?: AccessPolicy
+  policyJson?: string
+  policyFile?: string
+  runtimeId?: string
+  agentId?: string
+  externalSign?: (canonical: string) => Promise<string>
+  signingKeyPath?: string
+  nowMs?: () => number
+  defaultTtlSec?: number
+}
+
+type RedisLike = {
+  get(key: string): Promise<string | null>
+  send(cmd: string, args: string[]): Promise<any>
+}
+
+const DEFAULT_MAX_TTL_SEC = 900
+const DEFAULT_MAX_FUTURE_SKEW_SEC = 60
+const DEFAULT_REDIS_TIMEOUT_MS = 2500
+const DEFAULT_NONCE_RETENTION_MS = 15 * 60 * 1000
+const AGENT_ID_RE = /^[a-z0-9-]{1,64}$/
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/
+const POLICY_SCOPE_MAX = 512
+const enc = new TextEncoder()
+
+export const ACCESS_TOKEN_REQUEST_DOMAIN = 'a2a-token-request:v1'
+const REQUEST_CANONICAL_KEYS = ['agent_id', 'expiry', 'issued_at', 'nonce', 'requested_scope'] as const
+
+export function canonicalAccessIssuerRequest(req: Pick<AccessIssuerRequest, typeof REQUEST_CANONICAL_KEYS[number]>): string {
+  return [
+    ACCESS_TOKEN_REQUEST_DOMAIN,
+    req.agent_id,
+    req.expiry,
+    req.issued_at,
+    req.nonce,
+    req.requested_scope,
+  ].map(escField).join('|')
+}
+
+export function accessIssuerRequestHash(canonicalRequest: string): string {
+  return sha256Hex(canonicalRequest)
+}
+
+export function accessIssuerNonceHash(agentId: string, nonce: string): string {
+  return sha256Hex(`${agentId}\0${nonce}`)
+}
+
+export function sanitizeScopeForAudit(scope: string): string {
+  if (scope.startsWith('vault:path:') && scope.endsWith(':read')) return 'vault:path:[redacted]:read'
+  return scope
+}
+
+export function isAllowedAccessScope(scope: string): boolean {
+  return validateRequestedScope(scope).ok
+}
+
+export function scopeMatchesPolicy(pattern: string, requestedScope: string): boolean {
+  if (!pattern || pattern.length > POLICY_SCOPE_MAX) return false
+  if (!isAllowedPolicyPattern(pattern)) return false
+  let body: string
+  if (pattern.endsWith(':*')) {
+    // A trailing `:*` is a whole-domain wildcard: it spans every remaining colon segment
+    // of the scope (e.g. `forgejo:repo:X:*` -> read | pr:create | pr:review | branch:push:...;
+    // `taskboard:*` -> any taskboard verb). Interior `*` stay single-segment `[^:]*`.
+    // pr:merge still matches here but is hard-denied at every decision surface below.
+    body = escapeRegExp(pattern.slice(0, -1)).replace(/\\\*/g, '[^:]*') + '.*'
+  } else {
+    body = escapeRegExp(pattern).replace(/\\\*/g, '[^:]*')
+  }
+  return new RegExp(`^${body}$`).test(requestedScope)
+}
+
+export class RedisA2AIdentityRegistry implements AccessIdentityRegistry {
+  constructor(
+    private readonly redis: RedisLike,
+    private readonly keyPrefix = process.env.A2A_PUBKEY_KEY_PREFIX ?? 'alloyium:a2a:pubkey:',
+    private readonly timeoutMs = Number(process.env.REDIS_TIMEOUT_MS ?? DEFAULT_REDIS_TIMEOUT_MS),
+  ) {}
+
+  async getPublicKey(agentId: string): Promise<Uint8Array | null> {
+    const raw = await redisTimeout(this.redis.get(this.keyPrefix + agentId), this.timeoutMs, 'redis.get(pubkey)')
+    if (!raw) return null
+    const pub = new Uint8Array(Buffer.from(raw.trim(), 'base64'))
+    return pub.length === 32 ? pub : null
+  }
+}
+
+export class RedisAccessIssuerStore implements AccessIssuerStore {
+  constructor(
+    private readonly redis: RedisLike,
+    private readonly opts: {
+      noncePrefix?: string
+      auditKey?: string
+      leasePrefix?: string
+      timeoutMs?: number
+    } = {},
+  ) {}
+
+  async consumeNonce(agentId: string, nonceHash: string, retainUntilMs: number): Promise<'ok' | 'replay'> {
+    const ttlSec = Math.max(1, Math.ceil((retainUntilMs - Date.now()) / 1000))
+    const key = `${this.opts.noncePrefix ?? 'alloyium:a2a:access:nonce:'}${agentId}:${nonceHash}`
+    const res = await this.send('SET', [key, '1', 'NX', 'EX', String(ttlSec)])
+    return res ? 'ok' : 'replay'
+  }
+
+  async writeAudit(record: AccessIssueAuditRecord): Promise<void> {
+    const key = this.opts.auditKey ?? 'alloyium:a2a:access:audit'
+    await this.send('LPUSH', [key, JSON.stringify(record)])
+    await this.send('LTRIM', [key, '0', '9999']).catch(() => {})
+  }
+
+  async storeLease(record: AccessLeaseRecord): Promise<void> {
+    const key = `${this.opts.leasePrefix ?? 'alloyium:a2a:access:lease:'}${record.lease_id}`
+    await this.send('SET', [key, JSON.stringify(record), 'EX', String(Math.max(1, record.ttl_sec))])
+  }
+
+  private send(cmd: string, args: string[]): Promise<any> {
+    return redisTimeout(this.redis.send(cmd, args), this.opts.timeoutMs ?? DEFAULT_REDIS_TIMEOUT_MS, `redis.${cmd}`)
+  }
+}
+
+export class RedisLauncherGrantRegistry implements AccessLauncherGrantRegistry {
+  constructor(
+    private readonly redis: RedisLike,
+    private readonly keyPrefix = process.env.A2A_LAUNCHER_KEY_PREFIX ?? 'claude-channels:a2a:launcher:',
+    private readonly timeoutMs = Number(process.env.REDIS_TIMEOUT_MS ?? DEFAULT_REDIS_TIMEOUT_MS),
+  ) {}
+
+  async getGrant(agentId: string): Promise<AccessLauncherGrant | null> {
+    const raw = await redisTimeout(this.redis.get(`${this.keyPrefix}agent:${agentId}`), this.timeoutMs, 'redis.get(launcher-grant)')
+    if (!raw) return null
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return null
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const record = parsed as Record<string, unknown>
+    if (record.agent_id !== agentId) return null
+    return {
+      agent_id: agentId,
+      created_by: typeof record.created_by === 'string' ? record.created_by : undefined,
+      role: typeof record.role === 'string' ? record.role : undefined,
+      role_scopes: Array.isArray(record.role_scopes)
+        ? record.role_scopes.filter((scope): scope is string => typeof scope === 'string')
+        : [],
+    }
+  }
+}
+
+export class AccessTokenIssuer {
+  private readonly nowMs: () => number
+  private readonly genLeaseId: () => string
+  private readonly runtimeId?: string
+  private readonly maxFutureSkewSec: number
+
+  constructor(private readonly opts: AccessTokenIssuerOpts) {
+    this.nowMs = opts.nowMs ?? Date.now
+    this.genLeaseId = opts.genLeaseId ?? randomUUID
+    this.runtimeId = opts.runtimeId
+    this.maxFutureSkewSec = opts.maxFutureSkewSec ?? DEFAULT_MAX_FUTURE_SKEW_SEC
+  }
+
+  async issue(raw: Record<string, any>): Promise<Record<string, any>> {
+    const parsed = parseRequest(raw)
+    if (!parsed.ok) return this.errorWithoutAudit(parsed.reason)
+    const req = parsed.req
+    const canonical = canonicalAccessIssuerRequest(req)
+    const requestHash = accessIssuerRequestHash(canonical)
+    const nonceHash = accessIssuerNonceHash(req.agent_id, req.nonce)
+    const auditBase = {
+      ts: new Date(this.nowMs()).toISOString(),
+      agent_id: req.agent_id,
+      requested_scope: sanitizeScopeForAudit(req.requested_scope),
+      request_hash: requestHash,
+      nonce_hash: nonceHash,
+      ...(this.runtimeId ? { runtime_id: this.runtimeId } : {}),
+    }
+
+    let publicKey: Uint8Array | null
+    try {
+      publicKey = await this.opts.registry.getPublicKey(req.agent_id)
+    } catch {
+      return await this.deny(auditBase, 'issuer_unavailable')
+    }
+    if (!publicKey) return await this.deny(auditBase, 'unknown_agent')
+
+    const signature = decodeBase64Url(req.signature)
+    if (!signature || signature.length !== 64) return await this.deny(auditBase, 'invalid_signature')
+    let verified = false
+    try {
+      const key = await importEd25519Pub(publicKey)
+      verified = await crypto.subtle.verify({ name: 'Ed25519' }, key, signature, enc.encode(canonical))
+    } catch {
+      verified = false
+    }
+    if (!verified) return await this.deny(auditBase, 'invalid_signature')
+
+    const issuedAtMs = Date.parse(req.issued_at)
+    const expiryMs = Date.parse(req.expiry)
+    const retainUntilMs = Math.max(expiryMs || 0, this.nowMs() + DEFAULT_NONCE_RETENTION_MS)
+    try {
+      const nonce = await this.opts.store.consumeNonce(req.agent_id, nonceHash, retainUntilMs)
+      if (nonce === 'replay') return await this.deny(auditBase, 'nonce_replay')
+    } catch {
+      return await this.deny(auditBase, 'issuer_unavailable')
+    }
+
+    const timeReason = this.validateTime(issuedAtMs, expiryMs)
+    if (timeReason) return await this.deny(auditBase, timeReason)
+
+    const scopeValidation = validateRequestedScope(req.requested_scope)
+    if (!scopeValidation.ok) return await this.deny(auditBase, 'scope_denied')
+    if (isForgejoMergeScope(req.requested_scope)) return await this.deny(auditBase, 'scope_denied')
+
+    const requestedTtlSec = Math.ceil((expiryMs - issuedAtMs) / 1000)
+    const policy = await evaluatePolicy(this.opts.policy ?? {}, req.agent_id, req.requested_scope, requestedTtlSec, this.opts.launcherGrants)
+    if (!policy.ok) return await this.deny(auditBase, policy.reason)
+
+    const ttlSec = Math.max(1, Math.ceil((expiryMs - this.nowMs()) / 1000))
+    const leaseId = this.genLeaseId()
+    const expiresAt = new Date(expiryMs).toISOString()
+    const lifecycle: AccessLeaseLifecycle = 'brokered'
+    const lease: AccessLeaseRecord = {
+      lease_id: leaseId,
+      agent_id: req.agent_id,
+      scope: req.requested_scope,
+      issued_at: new Date(this.nowMs()).toISOString(),
+      expires_at: expiresAt,
+      ttl_sec: ttlSec,
+      lifecycle,
+      revocable: false,
+      delivery: 'brokered',
+    }
+
+    try {
+      await this.opts.store.storeLease(lease)
+      await this.opts.store.writeAudit({
+        ...auditBase,
+        decision: 'allow',
+        reason: 'allowed',
+        lease_id: leaseId,
+        ttl_sec: ttlSec,
+        lifecycle,
+        revocable: false,
+      })
+    } catch {
+      return { ok: false, error: 'issuer_unavailable' }
+    }
+
+    return {
+      ok: true,
+      lease_id: leaseId,
+      scope: req.requested_scope,
+      expires_at: expiresAt,
+      lifecycle,
+      revocable: false,
+      granted_ttl_seconds: ttlSec,
+      expires_at_meaning: 'issuer lease bookkeeping only; downstream enforcement depends on the brokered scope',
+      token_ref: `lease:${leaseId}`,
+      delivery: 'brokered',
+    }
+  }
+
+  private validateTime(issuedAtMs: number, expiryMs: number): AccessDecisionReason | null {
+    const now = this.nowMs()
+    if (!Number.isFinite(issuedAtMs) || !Number.isFinite(expiryMs) || expiryMs <= issuedAtMs) return 'request_expired'
+    if (expiryMs <= now) return 'request_expired'
+    if (issuedAtMs > now + this.maxFutureSkewSec * 1000) return 'request_future_skew'
+    return null
+  }
+
+  private async deny(
+    auditBase: Omit<AccessIssueAuditRecord, 'decision' | 'reason'>,
+    reason: AccessDecisionReason,
+  ): Promise<Record<string, any>> {
+    try {
+      await this.opts.store.writeAudit({ ...auditBase, decision: 'deny', reason })
+    } catch {
+      return { ok: false, error: 'issuer_unavailable' }
+    }
+    return { ok: false, error: reason }
+  }
+
+  private errorWithoutAudit(reason: AccessDecisionReason): Record<string, any> {
+    return { ok: false, error: reason }
+  }
+}
+
+export class AccessTokenIssuerTools {
+  private readonly issuer: AccessTokenIssuer
+  private readonly agentId?: string
+  private readonly externalSign?: (canonical: string) => Promise<string>
+  private readonly signingKeyPath?: string
+  private readonly nowMs: () => number
+  private readonly defaultTtlSec: number
+
+  static readonly TOOL_NAMES = ['a2a_issue_scoped_token'] as const
+
+  static readonly INSTRUCTIONS =
+    ' You also have a signed access-token issuer tool: a2a_issue_scoped_token ' +
+    'can be called with just requested_scope (and optional ttl_sec) by real-time ' +
+    'A2A sessions; the host signer fills the current agent id, nonce, timestamps, ' +
+    'and ed25519 signature. It also accepts a fully signed manual request. The issuer ' +
+    'verifies signatures against the A2A public identity registry, ' +
+    'enforces deny-by-default scope policy, rejects nonce replay and stale/skewed ' +
+    'requests, and returns only a short-lived brokered lease reference. It never ' +
+    'logs or returns raw credential material. Use exact scoped names such as ' +
+    'taskboard:project:13:read, taskboard:project:13:epic:create, taskboard:task:10719:comment, ' +
+    'taskboard:task:10719:update, taskboard:task:10719:dependencies:read, ' +
+    'taskboard:epic:10050:update, taskboard:epic:10050:comment, taskboard:projects:list, ' +
+    'taskboard:projects:create, taskboard:review-request:12:verdict, ' +
+    'forgejo:repo:atcsecure/claude-channels:read, forgejo:org:atcsecure:repo:create, ' +
+    'forgejo:user:atcsecure:repo:create, forgejo:admin-user:atcsecure:repo:create, ' +
+    'or vault:path:team/example:read; broad scopes such as taskboard:read are not valid.'
+
+  constructor(opts: AccessTokenIssuerToolsOpts = {}) {
+    this.agentId = opts.agentId ?? process.env.A2A_AGENT_ID
+    this.externalSign = opts.externalSign
+    this.signingKeyPath = opts.signingKeyPath ?? process.env.A2A_SIGNING_KEY
+    this.nowMs = opts.nowMs ?? Date.now
+    this.defaultTtlSec = normalizeTtlSec(opts.defaultTtlSec ?? process.env.A2A_ACCESS_DEFAULT_TTL_SEC, 600) ?? 600
+    if (opts.issuer) {
+      this.issuer = opts.issuer
+      return
+    }
+    const redis = opts.redis ?? new RedisClient(process.env.REDIS_URL ?? 'redis://redis:6379')
+    const policy = opts.policy ?? loadPolicy(opts)
+    this.issuer = new AccessTokenIssuer({
+      registry: new RedisA2AIdentityRegistry(redis),
+      store: new RedisAccessIssuerStore(redis),
+      launcherGrants: new RedisLauncherGrantRegistry(redis),
+      policy,
+      runtimeId: opts.runtimeId ?? process.env.A2A_AGENT_ID,
+      nowMs: opts.nowMs,
+    })
+  }
+
+  handles(name: string): boolean {
+    return (AccessTokenIssuerTools.TOOL_NAMES as readonly string[]).includes(name)
+  }
+
+  listTools(): any[] {
+    return [
+      {
+        name: 'a2a_issue_scoped_token',
+        description:
+          'Issue a short-lived brokered lease for taskboard, Forgejo, or Vault after ' +
+          'verifying an ed25519 signature over the canonical request payload against ' +
+          'the A2A public identity registry. General Forgejo merge leases are refused; ' +
+          'merge remains a review-gated host/broker action. Deny-by-default; audits ' +
+          'decisions without raw token values.',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            agent_id: { type: 'string', description: 'Registered A2A agent id. Optional for auto-signed current-session requests.' },
+            requested_scope: { type: 'string', description: 'Requested taskboard, Forgejo, or Vault scope, for example taskboard:project:13:read, taskboard:task:10719:comment, taskboard:projects:list, or forgejo:repo:atcsecure/claude-channels:read.' },
+            nonce: { type: 'string', description: 'Base64url random nonce, at least 128 bits.' },
+            issued_at: { type: 'string', description: 'Request issue time as ISO-8601.' },
+            expiry: { type: 'string', description: 'Request/lease expiry as ISO-8601.' },
+            ttl_sec: {
+              type: 'integer',
+              minimum: 1,
+              maximum: 86400,
+              description: 'Optional auto-signed lease TTL in seconds. Default is 600; policy may enforce a lower maximum.',
+            },
+            signature: {
+              type: 'string',
+              description: 'Base64url ed25519 signature over the domain-separated canonical payload. Optional when auto-signing current-session requests.',
+            },
+          },
+          required: ['requested_scope'],
+        },
+      },
+    ]
+  }
+
+  async callTool(name: string, args: Record<string, any> = {}): Promise<ToolResult> {
+    try {
+      switch (name) {
+        case 'a2a_issue_scoped_token':
+          return this.result(await this.issueScopedToken(args), false)
+        default:
+          return this.result({ ok: false, error: 'unknown_tool', detail: name }, true)
+      }
+    } catch {
+      return this.result({ ok: false, error: 'issuer_unavailable' }, true)
+    }
+  }
+
+  private result(obj: unknown, forceError = false): ToolResult {
+    const isError = forceError || (typeof obj === 'object' && obj !== null && (obj as any).ok === false)
+    return { content: [{ type: 'text', text: JSON.stringify(obj) }], ...(isError ? { isError: true } : {}) }
+  }
+
+  private async issueScopedToken(args: Record<string, any>): Promise<Record<string, any>> {
+    if (hasCompleteManualRequest(args)) return this.issuer.issue(args)
+    if (hasPartialManualRequest(args)) {
+      return {
+        ok: false,
+        error: 'bad_request',
+        detail: 'manual signed requests must include agent_id, requested_scope, nonce, issued_at, expiry, and signature',
+      }
+    }
+
+    const requestedScope = str(args.requested_scope)
+    if (!requestedScope || requestedScope.length > POLICY_SCOPE_MAX) return { ok: false, error: 'bad_request' }
+
+    const explicitAgentId = str(args.agent_id)
+    const agentId = explicitAgentId || this.agentId || ''
+    if (!AGENT_ID_RE.test(agentId)) return { ok: false, error: 'signer_unavailable', detail: 'missing current A2A agent id' }
+    if (explicitAgentId && this.agentId && explicitAgentId !== this.agentId) {
+      return { ok: false, error: 'agent_id_mismatch', detail: 'auto-signed requests can only use the current A2A identity' }
+    }
+
+    const ttlSec = normalizeTtlSec(args.ttl_sec, this.defaultTtlSec)
+    if (!ttlSec) return { ok: false, error: 'bad_request', detail: 'ttl_sec must be an integer between 1 and 86400' }
+
+    const now = this.nowMs()
+    const req = {
+      agent_id: agentId,
+      requested_scope: requestedScope,
+      nonce: randomBytes(16).toString('base64url'),
+      issued_at: new Date(now).toISOString(),
+      expiry: new Date(now + ttlSec * 1000).toISOString(),
+    }
+    const signature = await this.signAccessRequest(req)
+    if (!signature) {
+      return {
+        ok: false,
+        error: 'signer_unavailable',
+        detail: 'current session has no external signer or A2A_SIGNING_KEY for auto-signed access requests',
+      }
+    }
+    return this.issuer.issue({ ...req, signature })
+  }
+
+  private async signAccessRequest(req: Pick<AccessIssuerRequest, typeof REQUEST_CANONICAL_KEYS[number]>): Promise<string | null> {
+    const canonical = canonicalAccessIssuerRequest(req)
+    if (this.externalSign) return normalizeSignatureString(await this.externalSign(canonical))
+    if (!this.signingKeyPath) return null
+    const seed = parseSeed(readFileSync(this.signingKeyPath))
+    const key = await importEd25519Seed(seed)
+    return normalizeSignatureString(await signCanonical('ed25519', key, canonical))
+  }
+}
+
+function hasCompleteManualRequest(args: Record<string, any>): boolean {
+  return ['agent_id', 'requested_scope', 'nonce', 'issued_at', 'expiry', 'signature'].every((k) => typeof args[k] === 'string' && args[k])
+}
+
+function hasPartialManualRequest(args: Record<string, any>): boolean {
+  const manualKeys = ['nonce', 'issued_at', 'expiry', 'signature']
+  return manualKeys.some((k) => args[k] !== undefined)
+}
+
+function parseRequest(raw: Record<string, any>): { ok: true; req: AccessIssuerRequest } | { ok: false; reason: AccessDecisionReason } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'bad_request' }
+  const req: AccessIssuerRequest = {
+    agent_id: str(raw.agent_id),
+    requested_scope: str(raw.requested_scope),
+    nonce: str(raw.nonce),
+    issued_at: str(raw.issued_at),
+    expiry: str(raw.expiry),
+    signature: str(raw.signature),
+  }
+  if (!AGENT_ID_RE.test(req.agent_id)) return { ok: false, reason: 'bad_request' }
+  if (!req.requested_scope || req.requested_scope.length > POLICY_SCOPE_MAX) return { ok: false, reason: 'bad_request' }
+  if (!validNonce(req.nonce)) return { ok: false, reason: 'bad_request' }
+  if (!Number.isFinite(Date.parse(req.issued_at)) || !Number.isFinite(Date.parse(req.expiry))) return { ok: false, reason: 'bad_request' }
+  if (!BASE64URL_RE.test(req.signature)) return { ok: false, reason: 'bad_request' }
+  return { ok: true, req }
+}
+
+// Exported so the CI access canary can assert per-agent capability reachability against the
+// SAME decision the issuer enforces (direct-entry + role union). Finding 5: this now mirrors the
+// grammar + merge gates issue() applies at :329-330 BEFORE evaluatePolicy, so evaluatePolicy ==
+// issue()'s decision and a canary can never get a false ALLOW for a scope the issuer would deny.
+export async function evaluatePolicy(policy: AccessPolicy, agentId: string, scope: string, requestedTtlSec: number, launcherGrants?: AccessLauncherGrantRegistry): Promise<{ ok: true } | { ok: false; reason: AccessDecisionReason }> {
+  // Grammar gate: reject any scope the issuer's validateRequestedScope would reject (issue() at
+  // :329). Redundant when called from issue() (already validated) but load-bearing for CI callers.
+  if (!validateRequestedScope(scope).ok) return { ok: false, reason: 'scope_denied' }
+  // pr:merge is never grantable through policy — it is a review-gated host/broker action,
+  // hard-denied before any allow path (mirrors the issuer-level deny at issue()).
+  if (isForgejoMergeScope(scope)) return { ok: false, reason: 'scope_denied' }
+  const entries = policyEntriesForAgent(policy, agentId)
+  if (!entries.length) return evaluateLauncherPolicy(policy, agentId, scope, requestedTtlSec, launcherGrants)
+
+  let matchedScope = false
+  for (const entry of entries) {
+    const scopes = entryScopes(entry)
+    if (!scopes.some((pattern) => scopeMatchesPolicy(String(pattern), scope))) continue
+    matchedScope = true
+    if (requestedTtlSec <= entryMaxTtlSec(policy, entry)) return { ok: true }
+  }
+  return { ok: false, reason: matchedScope ? 'ttl_too_long' : 'scope_denied' }
+}
+
+// Pure scope decision for a launcher-grant worker (one with no direct `agents` entry): the
+// worker's launch grant must be created by an allowed creator, and the requested scope must
+// match BOTH the worker's grantable role patterns AND launcher.allowed_scopes.
+//
+// Findings 4 & 6(a): the grantable role patterns are derived SOLELY from the resolved role
+// (your role = your full domain). When the grant names a `role` present in `roles`, the domain
+// comes from that role's server-side `scopes` and NEVER from the caller-supplied
+// `grant.role_scopes` — so a creator cannot inflate a launched worker beyond its role
+// (per-role isolation is actually enforced, not merely asserted). policy.roles[role] is thus the
+// SINGLE source of truth (the launcher persists a top-level `role`; role_scopes remains only a
+// legacy/roleless fallback). pr:merge and any grammar-invalid scope are hard-denied here,
+// matching the issuer/policy layers. Exported so the launched-worker canary can assert
+// grantability deterministically without live Redis/issuer; evaluateLauncherPolicy delegates here.
+export function launcherGrantAllowsScope(
+  launcher: AccessPolicy['launcher'],
+  grant: AccessLauncherGrant | null,
+  agentId: string,
+  scope: string,
+  roles?: AccessPolicy['roles'],
+): boolean {
+  if (!launcher?.enabled) return false
+  // Finding 5: mirror issue()'s enforced grammar + merge gates so the CI decision == the
+  // enforced one (issue() applies these at :329-330 before ever reaching the launcher path).
+  if (!validateRequestedScope(scope).ok) return false
+  if (isForgejoMergeScope(scope)) return false
+  const allowedCreators = safeAgentIdSet(launcher.allowed_creators)
+  if (!allowedCreators.size) return false
+  const allowedScopePatterns = safePolicyPatterns(launcher.allowed_scopes)
+  if (!allowedScopePatterns.length) return false
+  if (!grant || grant.agent_id !== agentId || !grant.created_by || !allowedCreators.has(grant.created_by)) return false
+  // Findings 4 & 6(a): a role-carrying grant is scoped SOLELY by its role's policy scopes
+  // (caller-supplied role_scopes are ignored — they cannot widen the domain). Only a roleless
+  // (legacy) grant falls back to the recorded role_scopes.
+  const roleEntry = roles && typeof grant.role === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(grant.role) ? roles[grant.role] : undefined
+  const rolePatterns = roleEntry ? safePolicyPatterns(entryScopes(roleEntry)) : safePolicyPatterns(grant.role_scopes)
+  const roleMatched = rolePatterns.some((pattern) => scopeMatchesPolicy(pattern, scope))
+  const policyMatched = allowedScopePatterns.some((pattern) => scopeMatchesPolicy(pattern, scope))
+  return roleMatched && policyMatched
+}
+
+async function evaluateLauncherPolicy(policy: AccessPolicy, agentId: string, scope: string, requestedTtlSec: number, launcherGrants?: AccessLauncherGrantRegistry): Promise<{ ok: true } | { ok: false; reason: AccessDecisionReason }> {
+  const launcher = policy.launcher
+  if (!launcher?.enabled || !launcherGrants) return { ok: false, reason: 'scope_denied' }
+  const allowedCreators = safeAgentIdSet(launcher.allowed_creators)
+  if (!allowedCreators.size) return { ok: false, reason: 'scope_denied' }
+  const allowedScopePatterns = safePolicyPatterns(launcher.allowed_scopes)
+  if (!allowedScopePatterns.length) return { ok: false, reason: 'scope_denied' }
+
+  let grant: AccessLauncherGrant | null
+  try {
+    grant = await launcherGrants.getGrant(agentId)
+  } catch {
+    return { ok: false, reason: 'issuer_unavailable' }
+  }
+  if (!launcherGrantAllowsScope(launcher, grant, agentId, scope, policy.roles)) return { ok: false, reason: 'scope_denied' }
+
+  const maxTtl = Math.max(1, Number(launcher.max_ttl_sec ?? policy.defaults?.max_ttl_sec ?? DEFAULT_MAX_TTL_SEC) || DEFAULT_MAX_TTL_SEC)
+  return requestedTtlSec <= maxTtl ? { ok: true } : { ok: false, reason: 'ttl_too_long' }
+}
+
+function policyEntriesForAgent(policy: AccessPolicy, agentId: string): AccessPolicyAgentEntry[] {
+  const entries: AccessPolicyAgentEntry[] = []
+  const direct = policy.agents?.[agentId]
+  if (direct) entries.push(direct)
+  const roleNames = Array.isArray(policy.agent_roles?.[agentId]) ? policy.agent_roles![agentId] : []
+  for (const roleName of roleNames) {
+    if (!/^[A-Za-z0-9_.-]{1,64}$/.test(String(roleName))) continue
+    const role = policy.roles?.[String(roleName)]
+    if (role) entries.push(role)
+  }
+  return entries
+}
+
+function entryScopes(entry: AccessPolicyAgentEntry): string[] {
+  return Array.isArray(entry) ? entry : Array.isArray(entry.scopes) ? entry.scopes : []
+}
+
+function entryMaxTtlSec(policy: AccessPolicy, entry: AccessPolicyAgentEntry): number {
+  const raw = Array.isArray(entry) ? undefined : entry.max_ttl_sec
+  return Math.max(1, Number(raw ?? policy.defaults?.max_ttl_sec ?? DEFAULT_MAX_TTL_SEC) || DEFAULT_MAX_TTL_SEC)
+}
+
+function safeAgentIdSet(values: unknown): Set<string> {
+  const out = new Set<string>()
+  if (!Array.isArray(values)) return out
+  for (const value of values) {
+    if (typeof value === 'string' && AGENT_ID_RE.test(value)) out.add(value)
+  }
+  return out
+}
+
+function safePolicyPatterns(values: unknown): string[] {
+  if (!Array.isArray(values)) return []
+  return values
+    .filter((value): value is string => typeof value === 'string')
+    .filter((value) => value.length <= POLICY_SCOPE_MAX && isAllowedPolicyPattern(value))
+}
+
+function validateRequestedScope(scope: string): { ok: true } | { ok: false } {
+  if (scope.length > POLICY_SCOPE_MAX || /[\s\0]/.test(scope)) return { ok: false }
+
+  const taskProjects = /^taskboard:projects:(list|create)$/.exec(scope)
+  if (taskProjects) return { ok: true }
+  const taskProject = /^taskboard:project:(\d+):(read|epic:create|task:create)$/.exec(scope)
+  if (taskProject) return { ok: true }
+  const taskTask = /^taskboard:task:(\d+):(read|comment|update|move|review-request|dependency:create|dependencies:read)$/.exec(scope)
+  if (taskTask) return { ok: true }
+  const taskEpic = /^taskboard:epic:(\d+):(update|comment)$/.exec(scope)
+  if (taskEpic) return { ok: true }
+  const taskReview = /^taskboard:review-request:(\d+):verdict$/.exec(scope)
+  if (taskReview) return { ok: true }
+
+  const forgejo = /^forgejo:repo:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+):(read|pr:(?:create|review|merge)|branch:push:(.+))$/.exec(scope)
+  if (forgejo) {
+    const branch = forgejo[3]
+    return !branch || validBranchName(branch) ? { ok: true } : { ok: false }
+  }
+  const forgejoOrg = /^forgejo:org:([A-Za-z0-9_.-]+):repo:create$/.exec(scope)
+  if (forgejoOrg) return { ok: true }
+  const forgejoUser = /^forgejo:(?:user|admin-user):([A-Za-z0-9_.-]+):repo:create$/.exec(scope)
+  if (forgejoUser) return { ok: true }
+
+  const vault = /^vault:path:([^:]+):read$/.exec(scope)
+  if (vault) return validLogicalPath(vault[1]) ? { ok: true } : { ok: false }
+
+  return { ok: false }
+}
+
+function isForgejoMergeScope(scope: string): boolean {
+  return /^forgejo:repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:pr:merge$/.test(scope)
+}
+
+// Domain-wildcard prefixes: a policy pattern ending in `:*` grants a whole domain when the
+// text up to and including its last `:` matches one of these recognized prefixes. This lets a
+// role express "full access to a domain" (e.g. `taskboard:*`, `taskboard:task:*:*`,
+// `forgejo:repo:atcsecure/claude-channels:*`) without hand-enumerating every verb, even though
+// the `*`->`1` concrete probe below would not be a full valid scope.
+const DOMAIN_WILDCARD_PREFIXES: RegExp[] = [
+  /^taskboard:$/,
+  /^taskboard:projects:$/,
+  /^taskboard:project:(?:\d+|\*):$/,
+  /^taskboard:task:(?:\d+|\*):$/,
+  /^taskboard:epic:(?:\d+|\*):$/,
+  /^taskboard:review-request:(?:\d+|\*):$/,
+  // The repo OWNER must be FULLY concrete (no `*` anywhere in the owner segment): a concrete-org
+  // wildcard like `atcsecure/*` is fine, but a bare (`*/*`) or partial (`a*/*`) owner — which spans
+  // multiple orgs — is not (Finding 1). A `*` in the REPO segment stays allowed.
+  /^forgejo:repo:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.*-]+:$/,
+  // The vault logical-path ROOT segment (up to the first `/`) must be FULLY concrete (no `*`):
+  // `agents/developer/*` is fine, but a bare (`*`) or partial (`a*`) root segment — which spans
+  // sibling path roots — is not (Finding 1). A `*` in a later path segment stays allowed.
+  /^vault:path:[^:*\/]+(?:\/[^:]*)?:$/,
+]
+
+function isDomainWildcardPattern(pattern: string): boolean {
+  if (!pattern.endsWith(':*')) return false
+  const prefix = pattern.slice(0, -1) // keep the trailing ':', drop the '*'
+  return DOMAIN_WILDCARD_PREFIXES.some((re) => re.test(prefix))
+}
+
+// Finding 1: a `*` may be a bounded interior wildcard, but the identity/namespace ROOT of a
+// sensitive domain must be FULLY CONCRETE — any `*` there collapses isolation. The root must
+// contain NO `*` at all: not a bare `*` (`vault:path:*:read`, `forgejo:repo:*/*:...`) nor a
+// partial one (`vault:path:a*:read`, `forgejo:repo:a*/*:...`), both of which fan a single grant
+// across sibling path roots / multiple orgs. A concrete-root prefix wildcard stays valid — the
+// `*` just has to live past the root (`vault:path:agents/developer/*:read`, `forgejo:repo:atcsecure/*:read`).
+function hasBareWildcardRoot(pattern: string): boolean {
+  // vault logical-path ROOT segment (up to the first `/` or `:`) contains a `*`
+  if (/^vault:path:[^:\/]*\*/.test(pattern)) return true
+  // forgejo repo OWNER segment (up to the first `/`) contains a `*`
+  if (/^forgejo:repo:[^\/]*\*[^\/]*\//.test(pattern)) return true
+  return false
+}
+
+function isAllowedPolicyPattern(pattern: string): boolean {
+  if (hasBareWildcardRoot(pattern)) return false
+  if (isDomainWildcardPattern(pattern)) return true
+  const probe = pattern.replace(/\*/g, '1')
+  return validateRequestedScope(probe).ok
+}
+
+function validBranchName(branch: string): boolean {
+  if (!branch || branch.length > 160) return false
+  if (branch.includes('..') || branch.includes('//') || branch.startsWith('/') || branch.endsWith('/')) return false
+  if (branch.startsWith('.') || branch.endsWith('.') || branch.endsWith('.lock')) return false
+  if (/[~^:?*[\]\\\s\0]/.test(branch)) return false
+  return true
+}
+
+function validLogicalPath(path: string): boolean {
+  if (!path || path.length > 240) return false
+  if (path.includes('..') || path.includes('//') || path.startsWith('/') || path.endsWith('/')) return false
+  return /^[A-Za-z0-9_./=-]+$/.test(path)
+}
+
+function validNonce(nonce: string): boolean {
+  const decoded = decodeBase64Url(nonce)
+  return !!decoded && decoded.length >= 16 && decoded.length <= 96
+}
+
+function loadPolicy(opts: AccessTokenIssuerToolsOpts): AccessPolicy {
+  const raw = opts.policyJson ?? process.env.A2A_ACCESS_POLICY_JSON
+  if (raw && raw.trim()) return parsePolicy(raw)
+  const file = opts.policyFile ?? process.env.A2A_ACCESS_POLICY_FILE
+  if (file && file.trim()) return parsePolicy(readFileSync(file, 'utf8'))
+  return { defaults: { max_ttl_sec: DEFAULT_MAX_TTL_SEC }, agents: {} }
+}
+
+function parsePolicy(raw: string): AccessPolicy {
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { agents: {} }
+    return parsed as AccessPolicy
+  } catch {
+    return { agents: {} }
+  }
+}
+
+function decodeBase64Url(s: string): Uint8Array | null {
+  if (!s || !BASE64URL_RE.test(s)) return null
+  const base64 = s.replace(/-/g, '+').replace(/_/g, '/')
+  const rem = base64.length % 4
+  if (rem === 1) return null
+  try {
+    return new Uint8Array(Buffer.from(base64 + '='.repeat((4 - rem) % 4), 'base64'))
+  } catch {
+    return null
+  }
+}
+
+function normalizeSignatureString(signature: string): string | null {
+  const raw = String(signature ?? '').trim()
+  if (!raw) return null
+  let decoded: Uint8Array | null = null
+  if (BASE64URL_RE.test(raw)) decoded = decodeBase64Url(raw)
+  if (!decoded) {
+    try {
+      decoded = new Uint8Array(Buffer.from(raw, 'base64'))
+    } catch {
+      decoded = null
+    }
+  }
+  if (!decoded || decoded.length !== 64) return null
+  return Buffer.from(decoded).toString('base64url')
+}
+
+function parseSeed(buf: Uint8Array): Uint8Array {
+  if (buf.length === 32) return new Uint8Array(buf)
+  const s = Buffer.from(buf).toString('utf8').trim()
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return new Uint8Array(Buffer.from(s, 'hex'))
+  return new Uint8Array(Buffer.from(s, 'base64'))
+}
+
+function normalizeTtlSec(value: unknown, fallback: number): number | null {
+  const raw = value == null || value === '' ? fallback : Number(value)
+  if (!Number.isInteger(raw) || raw < 1 || raw > 86400) return null
+  return raw
+}
+
+function sha256Hex(s: string): string {
+  return createHash('sha256').update(s).digest('hex')
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function escField(s: string): string {
+  return String(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
+}
+
+function str(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
+function redisTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<T>((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+  })
+  return Promise.race([p, timeout]).finally(() => { if (t) clearTimeout(t) })
+}

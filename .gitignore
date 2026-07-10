@@ -1,21 +1,37 @@
+# dependencies
 node_modules/
+
+# A2A onboarding material — per-deployment secrets (*.seed, *.nk are 0600) and
+# generated env/config. Regenerate with `bun run onboard <id>`. Never commit.
+a2a/
+*.a2a.env
+*.seed
+*.nk
+
+# eval run artifacts
+evals/results/
+
+# logs / runtime
+logs/
+*.log
+/node_modules
 .env
 .env.*
 !.env.example
-logs/
-*.log
-# runtime state created by `docker compose up` (default bind-mount targets)
-data/
-secrets/
-# agent keys/identities minted by `bun run onboard` — NEVER commit
-a2a/
-a2a-host/
-*.seed
-*.nk
-*.a2a.env
-a2a-inbox.sqlite3*
-a2a-shim/target/
+!.env.sample
+.cache/
+coverage/
 dist/
 build/
 *.tsbuildinfo
-.DS_Store
+
+# Claude local runtime state. Keep tracked prompt/agent markdown under
+# .claude/agents/, but do not commit scheduler locks.
+.claude/*.lock
+.claude/**/*.lock
+a2a-inbox.sqlite3
+*.sqlite3*
+
+# Compose/runtime state and launcher worktrees. These may contain Redis data,
+# generated identities, credentials, and full source checkouts; never commit.
+/data/

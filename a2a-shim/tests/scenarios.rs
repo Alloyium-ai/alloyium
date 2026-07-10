@@ -86,6 +86,8 @@ impl Harness {
         env::set_var("A2A_CONNECT_TIMEOUT_MS", "150");
         env::set_var("A2A_RECONNECT_MIN_MS", "20");
         env::set_var("A2A_RECONNECT_MAX_MS", "80");
+        env::set_var("A2A_INBOX_WAIT_GRACE_MS", "5000");
+        env::set_var("A2A_INBOX_WAIT_MAX_MS", "605000");
 
         // scenario_B1 drives the hung-core→reconnect path via missed pongs.
         // 1000ms (→ ~2s liveness with MISSED_PONG_LIMIT=2) detects the hung core
@@ -377,10 +379,16 @@ async fn scenario_10c_duplicate_notif_id_sends_delivered_without_double_write() 
     write_mcp_json(&mut core, &notif).await;
     let first = read_lsp_json(&mut h.claude_stdout).await;
     assert_eq!(first["params"]["body"], json!("only once"));
-    assert_eq!(read_ctrl_t(&mut core, "delivered").await["notifId"], json!("n-dup"));
+    assert_eq!(
+        read_ctrl_t(&mut core, "delivered").await["notifId"],
+        json!("n-dup")
+    );
 
     write_mcp_json(&mut core, &notif).await;
-    assert_eq!(read_ctrl_t(&mut core, "delivered").await["notifId"], json!("n-dup"));
+    assert_eq!(
+        read_ctrl_t(&mut core, "delivered").await["notifId"],
+        json!("n-dup")
+    );
     assert_no_lsp(&mut h.claude_stdout, Duration::from_millis(250)).await;
 
     h.stop().await;
@@ -403,7 +411,10 @@ async fn scenario_10d_topic_notif_id_does_not_poison_direct_dedupe() {
     write_mcp_json(&mut core, &topic).await;
 
     let topic_stdout = read_lsp_json(&mut h.claude_stdout).await;
-    assert_eq!(topic_stdout["params"]["body"], json!("topic poison attempt"));
+    assert_eq!(
+        topic_stdout["params"]["body"],
+        json!("topic poison attempt")
+    );
     assert_no_frame(&mut core, Duration::from_millis(250)).await;
 
     let direct = json!({
@@ -417,8 +428,14 @@ async fn scenario_10d_topic_notif_id_does_not_poison_direct_dedupe() {
     write_mcp_json(&mut core, &direct).await;
 
     let direct_stdout = read_lsp_json(&mut h.claude_stdout).await;
-    assert_eq!(direct_stdout["params"]["body"], json!("direct must survive"));
-    assert_eq!(read_ctrl_t(&mut core, "delivered").await["notifId"], json!("same-id"));
+    assert_eq!(
+        direct_stdout["params"]["body"],
+        json!("direct must survive")
+    );
+    assert_eq!(
+        read_ctrl_t(&mut core, "delivered").await["notifId"],
+        json!("same-id")
+    );
 
     h.stop().await;
 }
@@ -598,6 +615,100 @@ async fn scenario_b2_timeout_then_late_reply_dropped() {
     .await;
 
     assert_no_lsp(&mut h.claude_stdout, Duration::from_millis(400)).await;
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn scenario_inbox_wait_survives_normal_budget() {
+    let mut h = Harness::start("scenario-inbox-wait-survives-normal").await;
+    let (mut core, _) = accept_handshake(&h.listener, 1, 0x62).await;
+
+    complete_initialize(&mut h, &mut core, 1).await;
+
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 71,
+        "method": "tools/call",
+        "params": {
+            "name": "a2a-inbox-messages",
+            "arguments": { "action": "wait", "timeout_ms": 150000 }
+        }
+    });
+    write_lsp_json(&mut h.claude_stdin, &call).await;
+
+    let call_frame = read_mcp_method(&mut core, "tools/call").await;
+    assert_eq!(frame_json(&call_frame)["id"], json!(71));
+
+    assert_no_lsp(&mut h.claude_stdout, Duration::from_millis(600)).await;
+
+    write_mcp_json(
+        &mut core,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 71,
+            "result": { "timed_out": true }
+        }),
+    )
+    .await;
+
+    let stdout = read_lsp_json(&mut h.claude_stdout).await;
+    assert_eq!(stdout["id"], json!(71));
+    assert_eq!(stdout["result"]["timed_out"], json!(true));
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn scenario_inbox_list_still_times_out_normally() {
+    let mut h = Harness::start("scenario-inbox-list-normal-timeout").await;
+    let (mut core, _) = accept_handshake(&h.listener, 1, 0x63).await;
+
+    complete_initialize(&mut h, &mut core, 1).await;
+
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 72,
+        "method": "tools/call",
+        "params": {
+            "name": "a2a-inbox-messages",
+            "arguments": { "action": "list", "timeout_ms": 150000 }
+        }
+    });
+    write_lsp_json(&mut h.claude_stdin, &call).await;
+
+    let call_frame = read_mcp_method(&mut core, "tools/call").await;
+    assert_eq!(frame_json(&call_frame)["id"], json!(72));
+
+    let stdout = read_lsp_json(&mut h.claude_stdout).await;
+    assert_core_timeout_error(&stdout, 72);
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn scenario_inbox_wait_invalid_timeout_times_out_normally() {
+    let mut h = Harness::start("scenario-inbox-wait-invalid-timeout").await;
+    let (mut core, _) = accept_handshake(&h.listener, 1, 0x64).await;
+
+    complete_initialize(&mut h, &mut core, 1).await;
+
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 73,
+        "method": "tools/call",
+        "params": {
+            "name": "a2a-inbox-messages",
+            "arguments": { "action": "wait", "timeout_ms": 999999999 }
+        }
+    });
+    write_lsp_json(&mut h.claude_stdin, &call).await;
+
+    let call_frame = read_mcp_method(&mut core, "tools/call").await;
+    assert_eq!(frame_json(&call_frame)["id"], json!(73));
+
+    let stdout = read_lsp_json(&mut h.claude_stdout).await;
+    assert_core_timeout_error(&stdout, 73);
 
     h.stop().await;
 }

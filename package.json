@@ -1,15 +1,13 @@
 {
-  "name": "alloyium",
+  "name": "claude-channels",
   "version": "0.1.0",
-  "license": "AGPL-3.0-or-later",
   "scripts": {
     "start": "bun ./webhook.ts",
+    "core": "bun ./a2a_core.ts",
     "test": "bun test",
     "test:gate": "A2A_TEST_REQUIRE_BUS=1 bun test",
     "selftest": "bun run selftest.ts",
-    "onboard": "bun ./onboard.ts",
-    "taskboard:bridge": "bun ./taskboard_event_bridge.ts",
-    "taskboard:dispatcher": "bun ./taskboard_event_dispatcher.ts"
+    "onboard": "bun ./onboard.ts"
   },
   "dependencies": {
     "@langchain/core": "^1.2.0",
@@ -17,8 +15,9 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "langchain": "^1.5.0",
     "nats": "^2.29.3",
-    "nkeys.js": "1.1.0",
+    "nkeys.js": "^1.1.0",
     "playwright": "^1.60.0",
+    "yaml": "^2.9.0",
     "zod": "^4.4.3"
   }
 }

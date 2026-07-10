@@ -46,10 +46,7 @@ pub async fn ping(sock: &str) -> Result<(), Box<dyn Error>> {
 
 fn unix_ms_or_0() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => match i64::try_from(duration.as_millis()) {
-            Ok(ms) => ms,
-            Err(_) => 0,
-        },
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or_default(),
         Err(_) => 0,
     }
 }

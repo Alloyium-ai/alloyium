@@ -1,4 +1,4 @@
-// NATS → agent channel bridge.
+// NATS → Claude-Code channel bridge.
 //
 // Subscribes to NATS subjects (core-NATS and JetStream durable consumers) and
 // forwards each message into the session via the injected `inject()` callback.
@@ -19,10 +19,10 @@ import {
 import { RedisClient } from 'bun'
 
 // ── config (env-overridable; defaults match docs/ops/nats_message_catalog.md) ──
-const NATS_URL = process.env.NATS_URL ?? 'nats://nats:4222'
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://redis:6379'
-const SUBS_KEY = process.env.SUBS_KEY ?? 'alloyium:subscriptions'
-const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'alloyium.channels.control'
+const NATS_URL = process.env.NATS_URL ?? 'nats://127.0.0.1:4222'
+const REDIS_URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
+const SUBS_KEY = process.env.SUBS_KEY ?? 'claude-channels:subscriptions'
+const CONTROL_SUBJECT = process.env.CONTROL_SUBJECT ?? 'claude.channels.control'
 const REDIS_TIMEOUT_MS = Number(process.env.REDIS_TIMEOUT_MS ?? 2500)
 const COUNTERS_MS = Number(process.env.COUNTERS_INTERVAL_MS ?? 60_000)
 const SELFHEAL_MS = Number(process.env.SELFHEAL_INTERVAL_MS ?? 30_000)
@@ -85,24 +85,18 @@ export type SubSpec = {
   attrs?: Record<string, string>
 }
 
-// Default advisory subscriptions — EMPTY out of the box. This bridge ships with no
-// product-specific subjects: seed an initial set via the NATS_DEFAULT_SUBS env var
-// (a JSON array of SubSpec). Defaults are written into Redis only when the key is
-// genuinely ABSENT (first run); thereafter edit the Redis key (or publish to the
-// control subject) to change the live set without a redeploy. Prefer sparse,
-// human-meaningful Tier-A subjects (and throttle any high-volume feed) so the
-// advisory plane never floods the context window.
-export function parseDefaultSubs(raw: string | undefined): SubSpec[] {
-  if (!raw || !raw.trim()) return []
-  try {
-    const data = JSON.parse(raw)
-    return Array.isArray(data) ? (data as SubSpec[]) : []
-  } catch {
-    return []
-  }
-}
-
-export const DEFAULT_SUBS: SubSpec[] = parseDefaultSubs(process.env.NATS_DEFAULT_SUBS)
+// Tier-A alert subjects — sparse, human-meaningful, no flood risk. Seeded into
+// Redis only when the key is genuinely ABSENT (first run). Edit the Redis key (or
+// publish to the control subject) to change the live set without a redeploy.
+export const DEFAULT_SUBS: SubSpec[] = [
+  { subject: 'polymarket.ramp.alert', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'claude-channels-ramp', filter_subject: 'polymarket.ramp.alert' },
+  { subject: 'ramp.v4.velo', mode: 'jetstream', stream: 'RAMP_ALERTS', durable: 'claude-channels-velo', filter_subject: 'ramp.v4.velo' },
+  { subject: 'polymarket.alpha.alarm', mode: 'core' },
+  { subject: 'polymarket.alpha.deep_underdog_dip', mode: 'core' },
+  { subject: 'polymarket.dip_alert.*', mode: 'core' }, // .tier1 + .push
+  { subject: 'polymarket.alpha.live_line_discovery', mode: 'core' },
+  { subject: 'mlb.score_grid.persistence.*', mode: 'core' }, // .alert + .success
+]
 
 // Stable identity for diffing. Intentionally ignores throttle/attrs/filter so a
 // spec EDIT keeps the same id; reload() detects edits via specChanged() and
@@ -167,11 +161,11 @@ export function validateSpecs(specs: SubSpec[]): { valid: SubSpec[]; errors: str
       errors.push(`malformed spec: ${JSON.stringify(s)}`)
       continue
     }
-    // S2: the alloyium.a2a.* namespace is owned by the A2A bus (a2a-channel.ts),
+    // S2: A2A namespaces are owned by the A2A bus (a2a-channel.ts),
     // which has its own attr contract. The read-only advisory plane must never
     // bind there, or the two feeds' <channel> attributes would blur.
-    if (s.subject.startsWith('alloyium.a2a.')) {
-      errors.push(`alloyium.a2a.* is A2A-bus-owned, not an advisory subject: ${s.subject}`)
+    if (s.subject.startsWith('claude.a2a.') || s.subject.startsWith('alloyium.a2a.')) {
+      errors.push(`A2A namespace is bus-owned, not an advisory subject: ${s.subject}`)
       continue
     }
     if (s.mode === 'jetstream') {
@@ -259,7 +253,7 @@ export class NatsChannel {
     // nats.js handles reconnects internally once connected.
     for (;;) {
       try {
-        this.nc = await connect({ servers: this.natsUrl, name: 'alloyium', reconnect: true, maxReconnectAttempts: -1 })
+        this.nc = await connect({ servers: this.natsUrl, name: 'claude-channels', reconnect: true, maxReconnectAttempts: -1 })
         break
       } catch (e) {
         log('warn', 'nats_connect_failed', { ...errFields(e), retry_in_s: 5 })

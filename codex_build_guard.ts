@@ -59,11 +59,9 @@ export interface BuildGuardResult {
   changedFiles: string[]
 }
 
-/** Default protected-path denylist for build workers. This is a neutral example
- *  set flagging common sensitive-infrastructure file names; override it per call
- *  via BuildGuardOpts.protectedDenyPatterns to match your own protected paths. */
+/** Default D4 protected-path denylist for build workers. */
 export const DEFAULT_PROTECTED_DENY_PATTERNS: BuildGuardPattern[] = [
-  /(^|\/)(secrets|credentials|admin|keystore|signing)([-_.\/]|$)/i,
+  /(^|\/)(capital|fire|executor|sizing|gate|watchlist)([-_.\/]|$)/i,
   /\.seed$/i,
   /(^|\/)a2a([-_.\/]|$)/i,
   /(^|\/)\.env(\.|$)/i,

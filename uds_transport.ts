@@ -4,6 +4,58 @@ import type { CtrlRequestId, FrameWriter, PendingMap } from "./uds_frame.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+const DEFAULT_DRAIN_TIMEOUT_MS = Math.max(1, Number(process.env.A2A_UDS_DRAIN_TIMEOUT_MS ?? 30_000) || 30_000);
+
+export class UdsDrainTimeoutError extends Error {
+  readonly code = "UDS_DRAIN_TIMEOUT";
+
+  constructor(readonly timeoutMs: number) {
+    super(`writer.drain timed out after ${timeoutMs}ms`);
+    this.name = "UdsDrainTimeoutError";
+  }
+}
+
+function normalizeTimeoutMs(value: number | undefined): number {
+  if (value == null) return DEFAULT_DRAIN_TIMEOUT_MS;
+  if (!Number.isFinite(value) || value < 1) throw new RangeError("drainTimeoutMs must be a positive finite number");
+  return Math.trunc(value);
+}
+
+async function drainWithTimeout(
+  writer: FrameWriter,
+  timeoutMs: number,
+  onEvent?: (event: string, fields?: Record<string, unknown>) => void,
+  onDrainTimeout?: (error: UdsDrainTimeoutError) => void,
+): Promise<void> {
+  const startedAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      writer.drain(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new UdsDrainTimeoutError(timeoutMs)), timeoutMs);
+      }),
+    ]);
+    onEvent?.("a2a_delivery_drain_complete", { drain_ms: Date.now() - startedAt, drain_timeout_ms: timeoutMs });
+  } catch (error) {
+    if (error instanceof UdsDrainTimeoutError) {
+      try {
+        writer.close(error);
+      } catch {
+        // The timeout remains the caller-visible failure; close is best effort.
+      }
+      try {
+        onDrainTimeout?.(error);
+      } catch {
+        // The timeout remains the caller-visible failure; teardown callback is best effort.
+      }
+      onEvent?.("a2a_delivery_drain_timeout", { drain_ms: Date.now() - startedAt, drain_timeout_ms: timeoutMs });
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
@@ -25,8 +77,13 @@ export class UdsServerTransport implements Transport {
   onerror?: (error: Error) => void;
 
   private closed = false;
+  private readonly drainTimeoutMs: number;
+  private readonly onDrainTimeout?: (error: UdsDrainTimeoutError) => void;
 
-  constructor(private readonly writer: FrameWriter) {}
+  constructor(private readonly writer: FrameWriter, opts: { drainTimeoutMs?: number; onDrainTimeout?: (error: UdsDrainTimeoutError) => void } = {}) {
+    this.drainTimeoutMs = normalizeTimeoutMs(opts.drainTimeoutMs);
+    this.onDrainTimeout = opts.onDrainTimeout;
+  }
 
   async start(): Promise<void> {
     return;
@@ -35,7 +92,7 @@ export class UdsServerTransport implements Transport {
   async send(message: JSONRPCMessage, options?: any): Promise<void> {
     void options;
     this.writer.enqueueMcp(enc.encode(JSON.stringify(message)));
-    await this.writer.drain();
+    await drainWithTimeout(this.writer, this.drainTimeoutMs, undefined, this.onDrainTimeout);
   }
 
   async close(): Promise<void> {
@@ -68,7 +125,14 @@ export function makeUdsInject(
     epoch: number;
     timeoutMs: number;
     maxInflight: number;
+    drainTimeoutMs?: number;
     onEvent?: (event: string, fields?: Record<string, unknown>) => void;
+    onDrainTimeout?: (error: UdsDrainTimeoutError) => void;
+  },
+  flush?: {
+    drainTimeoutMs?: number;
+    onEvent?: (event: string, fields?: Record<string, unknown>) => void;
+    onDrainTimeout?: (error: UdsDrainTimeoutError) => void;
   },
 ): (notif: unknown) => Promise<void> {
   // ph2 compatibility: without delivery options this resolves after the frame flushes
@@ -77,6 +141,8 @@ export function makeUdsInject(
   return async (notif: unknown): Promise<void> => {
     const notifId = directNotifId(notif);
     const waitForDelivery = !!delivery && notifId !== undefined;
+    const drainOpts = delivery ?? flush;
+    const drainTimeoutMs = normalizeTimeoutMs(drainOpts?.drainTimeoutMs);
     let delivered: Promise<DeliveryReply> | undefined;
 
     if (waitForDelivery) {
@@ -90,7 +156,7 @@ export function makeUdsInject(
 
     try {
       writer.enqueueMcp(enc.encode(JSON.stringify(notif)));
-      await writer.drain();
+      await drainWithTimeout(writer, drainTimeoutMs, drainOpts?.onEvent, drainOpts?.onDrainTimeout);
       if (!delivered) return;
       await delivered;
       delivery!.onEvent?.("a2a_delivery_ack_received", { notifId, epoch: delivery!.epoch });

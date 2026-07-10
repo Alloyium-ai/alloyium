@@ -1,7 +1,10 @@
 import type { RedisClient } from 'bun'
 import { Buffer } from 'node:buffer'
 import { randomUUID } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 import { importEd25519Pub } from './a2a-channel.ts'
+import { normalizeFeatureList, normalizePeerAppMetadata, type PeerAppMetadata } from './peer_protocol.ts'
+import { canonicalAlloyiumHostId, type DeploymentContract } from './deployment_contract.ts'
 
 export interface HelloResult {
   ok: boolean
@@ -10,6 +13,13 @@ export interface HelloResult {
   epoch?: number
   toolOnly?: boolean
   deliveryCapable?: boolean
+  protocolVersion?: string
+  protoFeatures?: string[]
+  app?: PeerAppMetadata
+  inboxDbPath?: string
+  deploymentId?: string
+  busId?: string
+  hostId?: string
   errCode?: string
 }
 
@@ -19,9 +29,9 @@ const DEFAULT_HELLO_TIMEOUT_MS = 5_000
 const KEY_CACHE_TTL_MS = 60_000
 const MAX_CACHE_KEYS = 4096
 
-const PUBKEY_PREFIX = 'alloyium:a2a:pubkey:'
-const PRESENCE_PREFIX = 'alloyium:a2a:presence:'
-const EPOCH_PREFIX = 'alloyium:a2a:org:core-epoch:'
+const PUBKEY_PREFIX = process.env.A2A_PUBKEY_KEY_PREFIX ?? 'claude-channels:a2a:pubkey:'
+const PRESENCE_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
+const EPOCH_PREFIX = process.env.A2A_CORE_EPOCH_KEY_PREFIX ?? 'claude-channels:a2a:org:core-epoch:'
 
 const PRESENCE_RECLAIM_SCRIPT =
   "local v=redis.call('GET',KEYS[1]); " +
@@ -53,7 +63,34 @@ function validCaps(v: unknown): v is string[] | undefined {
   return v === undefined || (Array.isArray(v) && v.length <= 16 && v.every((c) => typeof c === 'string' && c.length > 0 && c.length <= 64))
 }
 
-function validHello(v: unknown): v is { agentId: string; host: string; pid: number; subsKey: string; toolOnly?: boolean; caps?: string[] } {
+function validProto(v: unknown): v is { protocol_version?: string; features?: string[]; app?: unknown; a2a?: { min?: number; max?: number } } | undefined {
+  if (v === undefined) return true
+  if (!isObj(v)) return false
+  if (v.protocol_version !== undefined && (typeof v.protocol_version !== 'string' || v.protocol_version.length > 64)) return false
+  if (v.features !== undefined && normalizeFeatureList(v.features) == null) return false
+  if (v.app !== undefined && normalizePeerAppMetadata(v.app) == null) return false
+  if (v.a2a !== undefined) {
+    if (!isObj(v.a2a)) return false
+    const min = v.a2a.min
+    const max = v.a2a.max
+    if (min !== undefined && (!Number.isInteger(min) || min < 1 || min > 99)) return false
+    if (max !== undefined && (!Number.isInteger(max) || max < 1 || max > 99)) return false
+    if (typeof min === 'number' && typeof max === 'number' && max < min) return false
+  }
+  return true
+}
+
+function validInboxDbPath(v: unknown, toolOnly: unknown): v is string | undefined {
+  if (v === undefined) return true
+  return toolOnly === true &&
+    typeof v === 'string' &&
+    v.length > 0 &&
+    v.length <= 1024 &&
+    !/[\0\r\n]/.test(v) &&
+    isAbsolute(v)
+}
+
+function validHello(v: unknown): v is { agentId: string; host: string; pid: number; subsKey: string; deploymentId?: string; busId?: string; hostId?: string; toolOnly?: boolean; inboxDbPath?: string; caps?: string[]; proto?: { protocol_version?: string; features?: string[]; app?: unknown; a2a?: { min?: number; max?: number } } } {
   if (!isObj(v)) return false
   return v.t === 'hello' &&
     v.v === 1 &&
@@ -67,8 +104,13 @@ function validHello(v: unknown): v is { agentId: string; host: string; pid: numb
     v.pid <= 2 ** 31 &&
     typeof v.subsKey === 'string' &&
     v.subsKey.length <= 256 &&
+    (v.deploymentId === undefined || (typeof v.deploymentId === 'string' && v.deploymentId.length <= 32)) &&
+    (v.busId === undefined || (typeof v.busId === 'string' && v.busId.length <= 128)) &&
+    (v.hostId === undefined || (typeof v.hostId === 'string' && v.hostId.length <= 64)) &&
     (v.toolOnly === undefined || typeof v.toolOnly === 'boolean') &&
-    validCaps(v.caps)
+    validInboxDbPath(v.inboxDbPath, v.toolOnly) &&
+    validCaps(v.caps) &&
+    validProto(v.proto)
 }
 
 function validAuth(v: unknown): v is { alg: 'ed25519'; sig: string } {
@@ -139,6 +181,7 @@ export async function runHello(opts: {
   helloTimeoutMs?: number
   peerUid?: number
   expectedUid?: number
+  deploymentContract?: Pick<DeploymentContract, 'deploymentId' | 'busId' | 'hostId'>
 }): Promise<HelloResult> {
   const heartbeatMs = opts.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
   const helloTimeoutMs = opts.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS
@@ -173,6 +216,23 @@ export async function runHello(opts: {
     if (!validHello(hello)) {
       clear()
       return fail('bad_hello')
+    }
+    // A ping only proves that some core owns the socket. The authenticated hello carries the
+    // deployment/bus/physical-host tuple and is rejected before any Redis presence/epoch write
+    // when it does not match the core that accepted the UDS connection.
+    if (opts.deploymentContract) {
+      if (hello.deploymentId !== opts.deploymentContract.deploymentId) {
+        clear()
+        return fail('deployment_mismatch')
+      }
+      if (hello.busId !== opts.deploymentContract.busId) {
+        clear()
+        return fail('bus_mismatch')
+      }
+      if (!hello.hostId || canonicalAlloyiumHostId(hello.hostId) !== opts.deploymentContract.hostId) {
+        clear()
+        return fail('host_mismatch')
+      }
     }
 
     const nonceBytes = new Uint8Array(opts.randomBytes(32))
@@ -231,6 +291,13 @@ export async function runHello(opts: {
       epoch,
       toolOnly: hello.toolOnly === true,
       deliveryCapable: hello.caps?.includes('delivered') === true,
+      protocolVersion: hello.proto?.protocol_version,
+      protoFeatures: normalizeFeatureList(hello.proto?.features ?? []) ?? [],
+      app: normalizePeerAppMetadata(hello.proto?.app) ?? undefined,
+      inboxDbPath: hello.inboxDbPath,
+      deploymentId: hello.deploymentId,
+      busId: hello.busId,
+      hostId: hello.hostId ? canonicalAlloyiumHostId(hello.hostId) : undefined,
     }
   } catch (e) {
     clear()

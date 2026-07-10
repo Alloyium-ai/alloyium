@@ -1,4 +1,4 @@
-// Faithful copy of a2a-channel.ts presence (token-guarded SET NX EX + Lua heartbeat/release). Future DRY: converge A2AChannel + a2a-core onto this module.
+// Faithful copy of a2a-channel.ts presence (token-guarded SET NX EX + Lua heartbeat/release). Future DRY: converge A2AChannel + a2a-core onto this module post-gameday.
 //
 // DUP-LIFECYCLE (folds the SLICE-3.2 gate, Opus P0/P1 + GPT-5.5 P1): a2a-channel ABORTS start and
 // scheduleRetry()s on a non-'ok' claim; a naive port that just "warn+continue, no retry" reintroduces
@@ -19,9 +19,15 @@ export type PresenceClaimerOpts = {
   ttlS?: number
   heartbeatMs?: number
   now?: () => number
+  deployment?: {
+    deployment_id: string
+    bus_id: string
+    host_id: string
+    contract_fingerprint: string
+  }
 }
 
-const DEFAULT_KEY_PREFIX = 'alloyium:a2a:presence:'
+const DEFAULT_KEY_PREFIX = process.env.A2A_PRESENCE_KEY_PREFIX ?? 'claude-channels:a2a:presence:'
 const DEFAULT_TTL_S = 90
 const DEFAULT_HEARTBEAT_MS = 30_000
 const MIN_TTL_S = 5
@@ -61,6 +67,7 @@ export class PresenceClaimer {
   private lastOwnedAt: number // ms of last CONFIRMED ownership (claim win / heartbeat refresh) — drives TTL-aware ownership expiry
   private maintainTimer?: ReturnType<typeof setInterval>
   private started: boolean
+  private deployment?: PresenceClaimerOpts['deployment']
 
   constructor(redis: RedisClient, opts: PresenceClaimerOpts) {
     this.redis = redis
@@ -76,6 +83,7 @@ export class PresenceClaimer {
     this.owned = false
     this.lastOwnedAt = 0
     this.started = false
+    this.deployment = opts.deployment
 
     if (!this.agentId) throw new Error('PresenceClaimer requires agentId')
     if (!Number.isFinite(this.ttlS) || this.ttlS < MIN_TTL_S) throw new Error(`PresenceClaimer ttlS must be >= ${MIN_TTL_S}`)
@@ -171,7 +179,7 @@ export class PresenceClaimer {
   }
 
   private value(lastSeen: string): string {
-    return JSON.stringify({ token: this.instanceToken, host: this.host, started_at: this.startedAt, last_seen: lastSeen })
+    return JSON.stringify({ token: this.instanceToken, host: this.host, started_at: this.startedAt, last_seen: lastSeen, ...(this.deployment ?? {}) })
   }
 
   // Token-guarded refresh of last_seen + TTL only while WE own the key. On a non-1 reply we LOST the key

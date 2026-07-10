@@ -5,7 +5,7 @@
 // (convergence design §5.1 / review #24).
 //
 // ENVELOPE MODEL (SLICE 3.1, locked with dev-pm thread `beat-schema-boundary`): beats/status ride
-// the A2A ENVELOPE layer — the wire payload on alloyium.a2a.topic.agent-{beat,status} is a SIGNED a2a
+// the A2A ENVELOPE layer — the wire payload on claude.a2a.topic.agent-{beat,status} is a SIGNED a2a
 // Envelope whose `body` is the JSON AgentBeat/AgentStatus; dev-pm's detector runs the standard
 // verifyInbound over canonical(envelope) and reads env.body. So:
 //   - relayBeatBytes RELAYS the signed envelope bytes UNCHANGED (validate-as-envelope, forward raw →
@@ -18,7 +18,7 @@
 import { type NatsConnection } from 'nats'
 import { hostname } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { assertA2ASubject, signEnvelope, isValidInbound, type Envelope, type SigAlg, type SignKey } from './a2a-channel.ts'
+import { DEFAULT_A2A_SUBJECT_PREFIX, assertA2ASubject, normalizeA2ASubjectPrefix, signEnvelope, isValidInbound, type Envelope, type SigAlg, type SignKey } from './a2a-channel.ts'
 import {
   type AgentBeat, type AgentStatus, type AgentState,
   buildBeat, buildStatus, isValidBeat, isValidStatus, beatSubject, statusSubject, BEAT_TOPIC, STATUS_TOPIC,
@@ -47,7 +47,7 @@ export type CoreState = { state?: AgentState; sessions?: number; phase?: string;
 export type CoreSigner = { agentId: string; alg: SigAlg; signKey: SignKey }
 
 export type StatusPlaneOpts = {
-  prefix?: string        // mirrors A2AChannel.prefix (test isolation); default 'alloyium.a2a.'
+  prefix?: string        // mirrors A2AChannel.prefix; default 'claude.a2a.'.
   host?: string
   bootId?: string
   coreBeatMs?: number    // core's own beat/status cadence (default 30s); 0 disables the timer
@@ -72,11 +72,11 @@ export class StatusPlane {
   private counters = { beats_relayed: 0, status_published: 0, core_beats: 0, dropped: 0 }
 
   constructor(private readonly nc: NatsConnection, opts: StatusPlaneOpts = {}) {
-    const prefix = opts.prefix ?? 'alloyium.a2a.'
+    const prefix = normalizeA2ASubjectPrefix(opts.prefix ?? process.env.A2A_SUBJECT_PREFIX ?? DEFAULT_A2A_SUBJECT_PREFIX)
     this.beatSub = beatSubject(prefix)
     this.statusSub = statusSubject(prefix)
     // Confinement: assert the plane subjects against the SAME audited allowlist A2AChannel uses, so
-    // the planes are provably inside alloyium.a2a.> + deny-prefix-backstopped and a custom/misconfigured
+    // the planes are provably inside claude.a2a.> + deny-prefix-backstopped and a custom/misconfigured
     // prefix can never publish off-namespace (the planes nc.publish directly).
     assertA2ASubject(this.beatSub, prefix)
     assertA2ASubject(this.statusSub, prefix)

@@ -2,6 +2,45 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtrlProtoRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtrlAppImage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtrlApp {
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<CtrlAppImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtrlProto {
+    pub protocol_version: String,
+    pub a2a: CtrlProtoRange,
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<CtrlApp>,
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -15,10 +54,28 @@ pub enum Ctrl {
         pid: u32,
         #[serde(rename = "subsKey")]
         subs_key: String,
+        #[serde(
+            rename = "deploymentId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        deployment_id: Option<String>,
+        #[serde(rename = "busId", default, skip_serializing_if = "Option::is_none")]
+        bus_id: Option<String>,
+        #[serde(rename = "hostId", default, skip_serializing_if = "Option::is_none")]
+        host_id: Option<String>,
         #[serde(rename = "toolOnly", default, skip_serializing_if = "is_false")]
         tool_only: bool,
+        #[serde(
+            rename = "inboxDbPath",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        inbox_db_path: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         caps: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proto: Option<CtrlProto>,
     },
 
     #[serde(rename = "challenge")]

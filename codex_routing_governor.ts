@@ -15,16 +15,16 @@ export interface BuildRouteTask {
   fit?: 'codex_strong' | 'claude_strong' | 'either'
   /** True when the task touches protected paths that Model B must not own. */
   touchesProtectedPaths?: boolean
-  /** True when the task is peak-critical and should keep Claude headroom. */
-  peakCritical?: boolean
+  /** True when the task is gameday-critical and should keep Claude headroom. */
+  gamedayCritical?: boolean
 }
 
 /** Live pressure signals supplied by dev-pm. */
 export interface BuildRouteSignals {
   /** Deterministic clock in epoch milliseconds. */
   now: number
-  /** Whether the operator-defined peak-load window is active. */
-  peakWindow: boolean
+  /** Whether the operator-defined gameday window is active. */
+  gamedayWindow: boolean
   /** Recent Anthropic 429/shed rate, 0..1. */
   anthropic429Rate: number
   /** Codex primary budget used percent. */
@@ -77,7 +77,7 @@ export interface GovernorCfg {
   baseBackoffMs: number
   /** Maximum advisory backoff emitted on queue decisions. */
   maxBackoffMs: number
-  /** Roles that reserve Claude headroom and route to Claude before peak-window spillover. */
+  /** Roles that reserve Claude headroom and route to Claude before gameday spillover. */
   claudeReserveRoles: string[]
 }
 
@@ -99,7 +99,7 @@ export const DEFAULT_GOVERNOR_CFG: GovernorCfg = {
  *
  * ORDER implemented:
  * reserved/orchestrator roles -> Claude; protected paths -> Claude plus human;
- * peak-window non-critical spillover -> Codex; Anthropic 429 pressure -> Codex if
+ * gameday non-critical spillover -> Codex; Anthropic 429 pressure -> Codex if
  * Codex is healthy; Codex pressure -> Claude or queue; both pressured -> queue;
  * codex_strong fit -> Codex; otherwise Claude. Breakers and hysteresis prevent
  * single-threshold flip-flopping.
@@ -165,8 +165,8 @@ export function routeBuild(
     return select('queue', 'both-pressured', { backoff_ms: backoffMs(state, c) })
   }
 
-  if (signals.peakWindow && !task.peakCritical) {
-    return select('codex', 'peak-noncritical-spillover')
+  if (signals.gamedayWindow && !task.gamedayCritical) {
+    return select('codex', 'gameday-noncritical-spillover')
   }
 
   if (state.anthropic429High) {

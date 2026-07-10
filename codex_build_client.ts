@@ -13,6 +13,7 @@
 import { randomUUID } from 'node:crypto'
 import { buildClaimCheckedInput, type BlobRedis, type WrapFn } from './output_transport.ts'
 import { isCwdRegistered, registerCwd, unregisterCwd, type BuildAuthzRedis } from './codex_build_authz.ts'
+import { deploymentContractRequired } from './deployment_contract.ts'
 
 /** Default A2A request-body cap used when dev-pm is building a job without an A2AChannel instance. */
 export const CODEX_BUILD_INPUT_BODY_CAP_BYTES = Number(process.env.A2A_MAX_SEND_BYTES ?? 8192)
@@ -24,7 +25,7 @@ export const CODEX_BUILD_CWD_TTL_S = Number(process.env.CODEX_BUILD_CWD_TTL_S ??
 export interface BuildClientRedis extends BuildAuthzRedis, BlobRedis {}
 
 /** Sandbox modes accepted by codex-build-gw for build jobs. */
-export type BuildSandbox = 'workspace-write' | 'read-only'
+export type BuildSandbox = 'workspace-write' | 'danger-full-access' | 'read-only'
 
 /** Options used to build a codex.job.request.v1 body for the dedicated build gateway. */
 export interface BuildJobOpts {
@@ -36,14 +37,20 @@ export interface BuildJobOpts {
   cwdRealpath: string
   /** Full build prompt. Large prompts are stored as Redis blobs and referenced by input_ref. */
   promptText: string
-  /** Requested Codex sandbox. Defaults to workspace-write for Model-B build jobs. */
+  /** Requested Codex sandbox. Defaults to danger-full-access for Model-B build jobs. */
   sandbox?: BuildSandbox
-  /** Bounded cwd registry TTL in seconds for workspace-write dispatches. Defaults to one hour. */
+  /** Bounded cwd registry TTL in seconds for write-capable dispatches. Defaults to one hour. */
   cwdTtlS?: number
   /** Admission budget ceiling sent to codex-build-gw. Defaults to 92 percent primary used. */
   budgetMaxPct?: number
   /** Optional lossy streaming topic that dev-pm may join before dispatch. */
   streamTopic?: string
+  /**
+   * #10746: the dispatching broker's own agent id, stamped as reply_to so the launched build worker
+   * routes its terminal replies back to the broker (dev-pm) rather than the transport `from`. Defaults
+   * from env (A2A_AGENT_ID) when unset; omit reply_to entirely when neither is available (back-compat).
+   */
+  replyTo?: string
 }
 
 /** Built job id plus the JSON body dev-pm should send via its own a2a_send tool. */
@@ -93,10 +100,10 @@ export interface ParsedBuildResult {
 /**
  * Build a codex.job.request.v1 body for dev-pm to send.
  *
- * workspace-write jobs register cwd authz first, verify the registration, and
- * keep that bounded write window open for the dispatched build. If construction
- * throws after registration, the cwd is unregistered in a finally block. read-only
- * jobs never register the cwd and therefore never open write eligibility.
+ * Write-capable jobs register cwd authz first, verify the registration, and keep
+ * that bounded write window open for the dispatched build. If construction throws
+ * after registration, the cwd is unregistered in a finally block. read-only jobs
+ * never register the cwd and therefore never open write eligibility.
  */
 export async function buildBuildJob(redis: BuildClientRedis, opts: BuildJobOpts): Promise<BuiltBuildJob> {
   if (!opts.threadKey.trim()) throw new Error('buildBuildJob: threadKey is required')
@@ -104,10 +111,17 @@ export async function buildBuildJob(redis: BuildClientRedis, opts: BuildJobOpts)
   if (!opts.promptText.trim()) throw new Error('buildBuildJob: promptText is required')
 
   const jobId = opts.jobId ?? `codex-build-${randomUUID()}`
-  const sandbox = opts.sandbox ?? 'workspace-write'
+  const managed = deploymentContractRequired(process.env)
+  if (managed && process.env.ALLOYIUM_WORKER_POLICY_ID?.trim() !== 'dev-yolo-gpu-v1') {
+    throw new Error('buildBuildJob: managed worker policy id must be dev-yolo-gpu-v1')
+  }
+  if (managed && opts.sandbox != null && opts.sandbox !== 'danger-full-access') {
+    throw new Error('buildBuildJob: managed worker sandbox downgrade rejected')
+  }
+  const sandbox = managed ? 'danger-full-access' : (opts.sandbox ?? 'danger-full-access')
   const budgetMax = opts.budgetMaxPct ?? 92
   const cwdTtlS = opts.cwdTtlS ?? CODEX_BUILD_CWD_TTL_S
-  const registerForWrite = sandbox === 'workspace-write'
+  const registerForWrite = sandbox === 'workspace-write' || sandbox === 'danger-full-access'
   let unregisterOnFailure = false
 
   try {
@@ -121,10 +135,12 @@ export async function buildBuildJob(redis: BuildClientRedis, opts: BuildJobOpts)
       }
     }
 
+    const replyTo = opts.replyTo ?? (process.env.A2A_AGENT_ID || undefined)
     const wrap: WrapFn = (text, extra) => ({
       schema: 'codex.job.request.v1',
       job_id: jobId,
       thread_key: opts.threadKey,
+      ...(replyTo ? { reply_to: replyTo } : {}),
       sandbox,
       cwd: opts.cwdRealpath,
       approval_policy: 'never',
