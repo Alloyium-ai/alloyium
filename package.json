@@ -7,7 +7,10 @@
     "test": "bun test",
     "test:gate": "A2A_TEST_REQUIRE_BUS=1 bun test",
     "selftest": "bun run selftest.ts",
-    "onboard": "bun ./onboard.ts"
+    "onboard": "bun ./onboard.ts",
+    "demo": "bun ./scripts/demo-fleet.ts --once",
+    "demo:fleet": "bun ./scripts/demo-fleet.ts --serve",
+    "demo:status": "bun ./scripts/demo-fleet.ts --status"
   },
   "dependencies": {
     "@langchain/core": "^1.2.0",

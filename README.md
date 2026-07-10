@@ -31,6 +31,28 @@ REDIS_URL=redis://127.0.0.1:6379
 Generated identity material such as `a2a/*.seed`, `*.a2a.env`, and local
 runtime databases must stay out of source control.
 
+## Quick Demo Fleet
+
+With Docker and Bun installed, this starts a local Redis/NATS bus, generates
+throwaway demo identities, and runs a signed PM -> team -> fusion-panel workflow:
+
+```bash
+make init
+make demo
+```
+
+To leave the local fleet running for manual A2A experiments:
+
+```bash
+make fleet-up
+```
+
+The demo peers are `pm`, `engineer`, `reviewer`, `researcher`, and
+`fusion-panel`. They publish normal A2A presence and feature metadata in an
+isolated demo namespace. Check live peers with `make fleet-status`, stop the
+demo bus with `make fleet-down`, and remove generated demo state with
+`make demo-clean`.
+
 ## Development
 
 Install dependencies:
